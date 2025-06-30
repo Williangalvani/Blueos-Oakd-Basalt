@@ -11,6 +11,7 @@ Usage examples:
   python basalt.py --vehicle-ip 192.168.1.100        # Remote BlueOS on LAN
   python basalt.py --ip blueos.local                  # Using hostname
   python basalt.py --ip 192.168.1.100 --port 6041    # Custom port
+  python basalt.py --fps 30 --camera-angle 45        # Custom FPS and camera angle
 """
 
 import signal
@@ -26,8 +27,13 @@ def parse_args():
                        default='127.0.0.1',
                        help='IP address of the vehicle/BlueOS instance (default: 127.0.0.1)')
     parser.add_argument('--fps',
+                       type=int,
                        default=60,
                        help='FPS of the camera (default: 60)')
+    parser.add_argument('--camera-angle',
+                       type=float,
+                       default=0.0,
+                       help='Camera angle in degrees (0 = forward, 45 = 45° down, etc.)')
     return parser.parse_args()
 
 # Parse command line arguments
@@ -35,6 +41,8 @@ args = parse_args()
 
 print(f"🚀 Starting BlueOS OAK-D Basalt VIO")
 print(f"📡 Vehicle IP: {args.vehicle_ip}")
+print(f"📷 Camera FPS: {args.fps}")
+print(f"📐 Camera Angle: {args.camera_angle}°")
 
 print(f"🌐 WebSocket URL: ws://{args.vehicle_ip}/mavlink2rest/ws/mavlink?filter=SEND_ONLY")
 
@@ -52,7 +60,7 @@ with dai.Pipeline() as p:
 
     # Create MAVLink publisher instead of RerunNode
     mavlink_url = f"ws://{args.vehicle_ip}/mavlink2rest/ws/mavlink?filter=SEND_ONLY"
-    mavlink_publisher = MavlinkNode(mavlink_host=mavlink_url)
+    mavlink_publisher = MavlinkNode(mavlink_host=mavlink_url, camera_angle=args.camera_angle)
     imu.enableIMUSensor([dai.IMUSensor.ACCELEROMETER_RAW, dai.IMUSensor.GYROSCOPE_RAW], 200)
     imu.setBatchReportThreshold(1)
     imu.setMaxBatchReports(10)

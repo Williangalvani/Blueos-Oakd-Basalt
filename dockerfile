@@ -16,6 +16,8 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install -r /app/requirements.txt
 
 COPY app /app
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
 LABEL version="0.0.1"
 
@@ -62,4 +64,9 @@ LABEL links='{\
     }'
 LABEL requirements="core >= 1.1"
 
-CMD ["python", "/app/basalt.py", "--fps", "10", "--vehicle-ip", "docker.host.internal"]
+# Environment variables with defaults
+ENV FPS=10
+ENV CAMERA_ANGLE=0.0
+ENV VEHICLE_IP=docker.host.internal
+
+ENTRYPOINT ["/app/entrypoint.sh"]
