@@ -1,0 +1,8 @@
+depthai==3.0.0rc2
+gevent==25.5.1
+greenlet==3.2.3
+loguru==0.7.3
+numpy>=2.0,<3.0
+websocket-client==1.8.0
+zope.event==5.1
+zope.interface==7.2
