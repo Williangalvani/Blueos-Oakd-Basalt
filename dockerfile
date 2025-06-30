@@ -21,26 +21,17 @@ RUN chmod +x /app/entrypoint.sh
 
 LABEL version="0.0.1"
 
-ARG IMAGE_NAME=OAKD_VINS
+ARG IMAGE_NAME=OAKD_BASALT
 
 LABEL permissions='\
 {\
-  "ExposedPorts": {\
-    "8000/tcp": {}\
-  },\
   "HostConfig": {\
+    "NetworkMode": "host",\
     "Binds":["/dev/:/dev/"],\
     "DeviceCgroupRules": [\
       "c 189:* rmw"\
     ],\
-    "ExtraHosts": ["host.docker.internal:host-gateway"],\
-    "PortBindings": {\
-      "8000/tcp": [\
-        {\
-          "HostPort": ""\
-        }\
-      ]\
-    }\
+    "Env": ["VEHICLE_IP=127.0.0.1","FPS=10","CAMERA_ANGLE=0.0"],\
   }\
 }'
 
@@ -58,15 +49,15 @@ LABEL company='{\
     }'
 LABEL type="device-integration"
 
-LABEL readme='https://raw.githubusercontent.com/williangalvani/Blueos-oakd-vins/{tag}/README.md'
+LABEL readme='https://raw.githubusercontent.com/williangalvani/Blueos-Oakd-Basalt/{tag}/README.md'
 LABEL links='{\
-        "source": "https://github.com/williangalvani/Blueos-oakd-vins"\
+        "source": "https://github.com/williangalvani/Blueos-Oakd-Basalt"\
     }'
 LABEL requirements="core >= 1.1"
 
 # Environment variables with defaults
 ENV FPS=10
 ENV CAMERA_ANGLE=0.0
-ENV VEHICLE_IP=docker.host.internal
+ENV VEHICLE_IP=127.0.0.1
 
 ENTRYPOINT ["/app/entrypoint.sh"]
