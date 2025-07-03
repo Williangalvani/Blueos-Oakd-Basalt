@@ -12,6 +12,7 @@ class MavlinkNode(dai.node.ThreadedHostNode):
     def __init__(self, mavlink_host="ws://127.0.0.1:6040/mavlink2rest/ws/mavlink?filter=SEND_ONLY", vehicle_id=1, component_id=195, camera_angle=0.0):
         dai.node.ThreadedHostNode.__init__(self)
         self.inputTrans = dai.Node.Input(self)
+        self.inputQuality = dai.Node.Input(self)
         # self.inputImg = dai.Node.Input(self)
         
         self.mavlink_host = mavlink_host
@@ -373,11 +374,11 @@ class MavlinkNode(dai.node.ThreadedHostNode):
                     
                     # Send pose data via MAVLink
                     #self.send_vision_position_estimate(translation, quaternion, timestamp_us)
-                    self.send_att_pos_mocap(translation, quaternion, timestamp_us)
+                    # self.send_att_pos_mocap(translation, quaternion, timestamp_us)
                     
                     # Send velocity and position delta data if available
-                    if world_velocity is not None:
-                        self.send_vision_speed_estimate(world_velocity, timestamp_us)
+                    # if world_velocity is not None:
+                    #     self.send_vision_speed_estimate(world_velocity, timestamp_us)
                     
                     if body_position_delta is not None and time_delta_us is not None:
                         self.send_vision_position_delta(body_position_delta, time_delta_us, timestamp_us)
@@ -387,6 +388,10 @@ class MavlinkNode(dai.node.ThreadedHostNode):
                     # else:
                     #     logger.debug(f"Sent pose: pos=({translation.x:.3f}, {translation.y:.3f}, {translation.z:.3f}), "
                     #                f"quat=({quaternion.qw:.3f}, {quaternion.qx:.3f}, {quaternion.qy:.3f}, {quaternion.qz:.3f}) [no velocity yet]")
+                
+                quality_data = self.inputQuality.get()
+                if quality_data is not None:
+                    print(quality_data)
                 
                 # Small delay to avoid overwhelming the system
                 time.sleep(0.01)

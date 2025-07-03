@@ -2,15 +2,24 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-RUN apt update && apt install -y git cmake build-essential curl make libudev-dev libusb-1.0-0-dev
+RUN apt update && apt install -y  --no-install-recommends git cmake build-essential curl make libudev-dev libusb-1.0-0-dev wget && rm -rf /var/lib/apt/lists/*
+
+COPY install_ttyd.sh .
+
+RUN ./install_ttyd.sh
 
 
-# RUN git clone --branch develop https://github.com/luxonis/depthai-core
-# RUN cd depthai-core && git submodule update --init --recursive
+# Install Python dependencies first (needed for building)
+RUN pip install numpy==2.3.1
 
-# RUN cd depthai-core && cmake -S . -B build
-# RUN cd depthai-core && cmake --build build --parallel $(nproc)
-RUN python3 -m pip install --extra-index-url https://artifacts.luxonis.com/artifactory/luxonis-python-release-local/ depthai==3.0.0rc2
+# for bulding
+RUN apt update && apt install -y pkg-config zip libboost-dev libopencv-dev && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --recursive --branch metrics https://github.com/williangalvani/depthai-core
+
+RUN cd depthai-core && cmake -S . -B build -DDEPTHAI_BUILD_PYTHON=ON
+RUN cd depthai-core && cmake --build build --parallel $(nproc)
+
 
 COPY requirements.txt /app/requirements.txt
 RUN pip install -r /app/requirements.txt
