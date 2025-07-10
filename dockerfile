@@ -13,13 +13,12 @@ RUN ./install_ttyd.sh
 RUN pip install numpy==2.3.1
 
 # for bulding
-RUN apt update && apt install -y pkg-config zip libboost-dev libopencv-dev && rm -rf /var/lib/apt/lists/*
+RUN apt update && apt install -y pkg-config zip libboost-dev libopencv-dev tmux && rm -rf /var/lib/apt/lists/*
 
 RUN git clone --recursive --branch metrics https://github.com/williangalvani/depthai-core
 
 RUN cd depthai-core && cmake -S . -B build -DDEPTHAI_BUILD_PYTHON=ON
 RUN cd depthai-core && cmake --build build --parallel $(nproc)
-
 
 COPY requirements.txt /app/requirements.txt
 RUN pip install -r /app/requirements.txt
@@ -69,4 +68,4 @@ ENV FPS=10
 ENV CAMERA_ANGLE=0.0
 ENV VEHICLE_IP=127.0.0.1
 
-ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["/app/entrypoint.sh"]

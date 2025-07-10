@@ -71,7 +71,11 @@ with dai.Pipeline() as p:
     imu.out.link(odom.imu)
     # Link outputs to MAVLink publisher instead of rerun viewer
     # odom.passthrough.link(mavlink_publisher.inputImg)
-    odom.transform.link(mavlink_publisher.inputTrans)
+    #odom.quality.link(mavlink_publisher.inputQuality)
+    #quality = odom.quality.createOutputQueue(maxSize=8, blocking=False)
     p.start()
     while p.isRunning():
+        #quality_data = quality.get()
+        #if quality_data is not None:
+        #    print(quality_data)
         time.sleep(0.01)
