@@ -9,7 +9,7 @@ from loguru import logger
 
 
 class MavlinkNode(dai.node.ThreadedHostNode):
-    def __init__(self, mavlink_host="ws://127.0.0.1:6040/mavlink2rest/ws/mavlink?filter=SEND_ONLY", vehicle_id=1, component_id=195, camera_angle=0.0):
+    def __init__(self, mavlink_host="ws://127.0.0.1:6040/mavlink2rest/ws/mavlink?filter=SEND_ONLY", vehicle_id=1, component_id=195, camera_angle=0.0, quality_rate=1.0):
         dai.node.ThreadedHostNode.__init__(self)
         self.inputTrans = dai.Node.Input(self)
         self.inputQuality = dai.Node.Input(self)
@@ -19,6 +19,11 @@ class MavlinkNode(dai.node.ThreadedHostNode):
         self.vehicle_id = vehicle_id
         self.component_id = component_id  # Using component ID 195 (MAV_COMP_ID_VISUAL_INERTIAL_ODOMETRY)
         self.camera_angle = camera_angle  # Camera angle in degrees (0 = forward, 45 = 45° down)
+        self.quality_rate = quality_rate  # Rate limit for quality messages (Hz)
+        
+        # Quality message rate limiting
+        self.last_quality_time = 0.0
+        self.quality_interval = 1.0 / quality_rate if quality_rate > 0 else float('inf')
         
         # Create camera rotation transformation if needed
         self.camera_rotation_matrix = None
@@ -182,6 +187,56 @@ class MavlinkNode(dai.node.ThreadedHostNode):
         }
         
         return self.send_mavlink_message_ws("VISION_POSITION_DELTA", message_data)
+    
+    def send_named_value_float(self, name, value, timestamp_us):
+        """
+        Send NAMED_VALUE_FLOAT message with quality metrics
+        """
+        message_data = {
+            "time_boot_ms": timestamp_us // 1000,  # Convert microseconds to milliseconds
+            "name": name,
+            "value": value
+        }
+        
+        return self.send_mavlink_message_ws("NAMED_VALUE_FLOAT", message_data)
+    
+    def send_quality_metrics(self, quality_data, timestamp_us):
+        """
+        Send VIO quality metrics as NAMED_VALUE_FLOAT messages
+        """
+        current_time = time.time()
+        
+        # Rate limit quality messages
+        if current_time - self.last_quality_time < self.quality_interval:
+            return True
+        
+        self.last_quality_time = current_time
+        
+        # Send tracking quality (0.0 to 1.0)
+        self.send_named_value_float("VIO_TRACKING_QUALITY", quality_data.avgTrackingQuality, timestamp_us)
+        
+        # Send number of tracked features (normalized to 0-1 range, assuming max 1000 features)
+        total_features = sum(quality_data.numTrackedFeatures) if quality_data.numTrackedFeatures else 0
+        normalized_features = min(total_features / 1000.0, 1.0)  # Normalize to 0-1
+        self.send_named_value_float("VIO_TRACKED_FEATURES", normalized_features, timestamp_us)
+        
+        # Send number of landmarks (normalized to 0-1 range, assuming max 10000 landmarks)
+        normalized_landmarks = min(quality_data.numLandmarks / 10000.0, 1.0)
+        self.send_named_value_float("VIO_LANDMARKS", normalized_landmarks, timestamp_us)
+        
+        # Send processing time in seconds
+        processing_time_sec = quality_data.processingTimeMs / 1000.0
+        self.send_named_value_float("VIO_PROCESSING_TIME", processing_time_sec, timestamp_us)
+        
+        # Send tracking status (1.0 if tracking, 0.0 if lost)
+        tracking_status = 1.0 if quality_data.isTracking else 0.0
+        self.send_named_value_float("VIO_TRACKING_STATUS", tracking_status, timestamp_us)
+        
+        logger.debug(f"Sent quality metrics: tracking_quality={quality_data.avgTrackingQuality:.3f}, "
+                    f"features={normalized_features:.3f}, landmarks={normalized_landmarks:.3f}, "
+                    f"processing_time={processing_time_sec:.3f}s, tracking_status={tracking_status}")
+        
+        return True
     
     def quaternion_to_rotation_matrix(self, q):
         """
@@ -389,9 +444,10 @@ class MavlinkNode(dai.node.ThreadedHostNode):
                     #     logger.debug(f"Sent pose: pos=({translation.x:.3f}, {translation.y:.3f}, {translation.z:.3f}), "
                     #                f"quat=({quaternion.qw:.3f}, {quaternion.qx:.3f}, {quaternion.qy:.3f}, {quaternion.qz:.3f}) [no velocity yet]")
                 
-                # quality_data = self.inputQuality.get()
-                # if quality_data is not None:
-                #     print(quality_data)
+                # Get quality data
+                quality_data = self.inputQuality.tryGet()
+                if quality_data is not None:
+                    self.send_quality_metrics(quality_data, timestamp_us)
                 
                 # Small delay to avoid overwhelming the system
                 time.sleep(0.01)
@@ -432,6 +488,9 @@ def main():
     parser.add_argument('--camera-angle', 
                        type=float, default=0.0,
                        help='Camera angle in degrees (0 = forward, 45 = 45° down, etc.)')
+    parser.add_argument('--quality-rate', 
+                       type=float, default=1.0,
+                       help='Rate limit for quality messages in Hz (default: 1.0)')
     
     args = parser.parse_args()
     
@@ -440,7 +499,8 @@ def main():
         mavlink_host=args.mavlink_host,
         vehicle_id=args.vehicle_id,
         component_id=args.component_id,
-        camera_angle=args.camera_angle
+        camera_angle=args.camera_angle,
+        quality_rate=args.quality_rate
     )
     
     try:
