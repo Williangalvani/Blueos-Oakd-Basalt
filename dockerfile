@@ -1,4 +1,11 @@
-FROM python:3.12-slim
+FROM debian:trixie-slim
+
+# Install Python and other dependencies
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    python3-venv \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -7,21 +14,28 @@ RUN apt update && apt install -y  --no-install-recommends git cmake build-essent
 COPY install_ttyd.sh .
 
 RUN ./install_ttyd.sh
+# for building
+RUN apt update && apt install -y pkg-config zip libboost-dev python3-dev python3-numpy libssl3 openssl linux-libc-dev libopencv-dev tmux gdb nano && rm -rf /var/lib/apt/lists/*
+RUN export PYTHONPATH=/app/depthai-core/build/bindings/python
+RUN echo "bataata"
+COPY depthai-core /app/depthai-core
 
 
-# Install Python dependencies first (needed for building)
-RUN pip install numpy==2.3.1
+RUN cd depthai-core && cmake -S . -B build -DDEPTHAI_BUILD_PYTHON=ON -DDEPTHAI_BASALT_SUPPORT=ON || echo "Failed to configure CMake"
+RUN cd depthai-core && ./build/vcpkg/vcpkg install --x-feature=basalt
+RUN cd depthai-core && ./build/vcpkg/vcpkg list
+RUN cd depthai-core && cmake -S . -B build \
+    -DCMAKE_PREFIX_PATH=/app/depthai-core/vcpkg_installed/x64-linux \
+    -DDEPTHAI_BUILD_PYTHON=ON \
+    -DDEPTHAI_BASALT_SUPPORT=ON || echo "Failed to configure CMake"
+RUN cd depthai-core && cmake --build build --parallel 5
 
-# for bulding
-RUN apt update && apt install -y pkg-config zip libboost-dev libopencv-dev tmux && rm -rf /var/lib/apt/lists/*
-
-RUN git clone --recursive --branch metrics https://github.com/williangalvani/depthai-core
-
-RUN cd depthai-core && cmake -S . -B build -DDEPTHAI_BUILD_PYTHON=ON
-RUN cd depthai-core && cmake --build build --parallel $(nproc)
+# Create and activate virtual environment
+RUN python3 -m venv /app/venv
+ENV PATH="/app/venv/bin:$PATH"
 
 COPY requirements.txt /app/requirements.txt
-RUN pip install -r /app/requirements.txt
+RUN /app/venv/bin/pip install -r /app/requirements.txt
 
 COPY app /app
 COPY entrypoint.sh /app/entrypoint.sh
