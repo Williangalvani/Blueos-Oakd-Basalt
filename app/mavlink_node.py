@@ -11,9 +11,14 @@ from loguru import logger
 class MavlinkNode(dai.node.ThreadedHostNode):
     def __init__(self, mavlink_host="ws://127.0.0.1:6040/mavlink2rest/ws/mavlink?filter=SEND_ONLY", vehicle_id=1, component_id=195, camera_angle=0.0, quality_rate=1.0):
         dai.node.ThreadedHostNode.__init__(self)
-        self.inputTrans = dai.Node.Input(self)
-        self.inputQuality = dai.Node.Input(self)
-        # self.inputImg = dai.Node.Input(self)
+        self.inputTrans = self.createInput()
+        self.inputQuality = self.createInput()
+        # self.inputImg = self.createInput()
+        
+        # Set possible datatypes for inputs
+        self.inputTrans.setPossibleDatatypes([dai.Node.DatatypeHierarchy(dai.DatatypeEnum.TransformData, True)])
+        self.inputQuality.setPossibleDatatypes([dai.Node.DatatypeHierarchy(dai.DatatypeEnum.VIOQualityData, True)])
+        # self.inputImg.setPossibleDatatypes([dai.Node.DatatypeHierarchy(dai.DatatypeEnum.ImgFrame, True)])
         
         self.mavlink_host = mavlink_host
         self.vehicle_id = vehicle_id

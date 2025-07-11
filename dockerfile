@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-RUN apt update && apt install -y  --no-install-recommends git cmake build-essential curl make libudev-dev libusb-1.0-0-dev wget && rm -rf /var/lib/apt/lists/*
+RUN apt update && apt install -y  --no-install-recommends git nginx cmake build-essential curl make libudev-dev libusb-1.0-0-dev wget && rm -rf /var/lib/apt/lists/*
 
 COPY install_ttyd.sh .
 
@@ -28,8 +28,7 @@ RUN cd depthai-core && cmake -S . -B build \
     -DCMAKE_PREFIX_PATH=/app/depthai-core/vcpkg_installed/x64-linux \
     -DDEPTHAI_BUILD_PYTHON=ON \
     -DDEPTHAI_BASALT_SUPPORT=ON || echo "Failed to configure CMake"
-RUN cd depthai-core && cmake --build build --parallel 5
-
+RUN cd depthai-core && cmake --build build --parallel $(nproc)
 # Create and activate virtual environment
 RUN python3 -m venv /app/venv
 ENV PATH="/app/venv/bin:$PATH"
