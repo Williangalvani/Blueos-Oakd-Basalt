@@ -354,7 +354,7 @@ class MavlinkNode(dai.node.ThreadedHostNode):
         if not self.create_websocket_connection():
             logger.error("Failed to establish WebSocket connection, exiting")
             return
-        
+        logger.info("WebSocket connection established")
         while self.isRunning() and self._running:
             try:
                 # Get transform data
@@ -389,9 +389,9 @@ class MavlinkNode(dai.node.ThreadedHostNode):
                     #     logger.debug(f"Sent pose: pos=({translation.x:.3f}, {translation.y:.3f}, {translation.z:.3f}), "
                     #                f"quat=({quaternion.qw:.3f}, {quaternion.qx:.3f}, {quaternion.qy:.3f}, {quaternion.qz:.3f}) [no velocity yet]")
                 
-                quality_data = self.inputQuality.get()
-                if quality_data is not None:
-                    print(quality_data)
+                # quality_data = self.inputQuality.get()
+                # if quality_data is not None:
+                #     print(quality_data)
                 
                 # Small delay to avoid overwhelming the system
                 time.sleep(0.01)
