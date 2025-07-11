@@ -73,10 +73,25 @@ with dai.Pipeline() as p:
     odom.transform.link(mavlink_publisher.inputTrans)
     # odom.passthrough.link(mavlink_publisher.inputImg)
     # odom.quality.link(mavlink_publisher.inputQuality)
-    # quality = odom.quality.createOutputQueue(maxSize=8, blocking=False)
+    quality = odom.quality.createOutputQueue(maxSize=8, blocking=False)
     p.start()
     while p.isRunning():
-        # quality_data = quality.get()
-        # if quality_data is not None:
-        #    print(quality_data)
+        quality_data = quality.tryGet()
+        if quality_data is not None:
+            print(f"Timestamp: {quality_data.getTimestamp()}")
+            print(f"Tracking Status: {'TRACKING' if quality_data.isTracking else 'LOST'}")
+            print(f"Active 3D Points: {quality_data.numActivePoints}")
+            print(f"Landmarks in Map: {quality_data.numLandmarks}")
+            print(f"Total Observations: {quality_data.numObservations}")
+            print(f"Keyframes: {quality_data.numKeyframes}")
+            print(f"States: {quality_data.numStates}")
+            print(f"Avg Tracking Quality: {quality_data.avgTrackingQuality:.2%}")
+            print(f"Processing Time: {quality_data.processingTimeMs:.1f}ms")
+            
+            if quality_data.numTrackedFeatures:
+                print(f"Tracked Features per Camera: {quality_data.numTrackedFeatures}")
+                total_features = sum(quality_data.numTrackedFeatures)
+                print(f"Total Tracked Features: {total_features}")
+            
+            print("-" * 50)
         time.sleep(0.01)
