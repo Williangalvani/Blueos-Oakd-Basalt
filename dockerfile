@@ -21,14 +21,23 @@ RUN echo "bataata"
 COPY depthai-core /app/depthai-core
 
 
-RUN cd depthai-core && cmake -S . -B build -DDEPTHAI_BUILD_PYTHON=ON -DDEPTHAI_BASALT_SUPPORT=ON || echo "Failed to configure CMake"
-RUN cd depthai-core && ./build/vcpkg/vcpkg install --x-feature=basalt
-RUN cd depthai-core && ./build/vcpkg/vcpkg list
-RUN cd depthai-core && cmake -S . -B build \
-    -DCMAKE_PREFIX_PATH=/app/depthai-core/vcpkg_installed/x64-linux \
+# Configure cmake with basalt support
+# Use BuildKit cache mounts for vcpkg cache persistence
+# Note: basalt feature already includes opencv4 with default-features:false (no ffmpeg)
+RUN --mount=type=cache,target=/root/.cache/vcpkg \
+    cd depthai-core && cmake -S . -B build \
     -DDEPTHAI_BUILD_PYTHON=ON \
-    -DDEPTHAI_BASALT_SUPPORT=ON || echo "Failed to configure CMake"
-RUN cd depthai-core && cmake --build build --parallel $(nproc)
+    -DDEPTHAI_BASALT_SUPPORT=ON \
+    -DDEPTHAI_OPENCV_SUPPORT=ON \
+    -DVCPKG_MANIFEST_FEATURES="basalt;python-bindings;usb;backward" \
+    || echo "Failed to configure CMake"
+
+RUN ls .
+
+# Use cache mount for ccache as well
+RUN --mount=type=cache,target=/root/.cache/vcpkg \
+    --mount=type=cache,target=/root/.ccache \
+    cd depthai-core && cmake --build build --parallel $(nproc)
 # Create and activate virtual environment
 RUN python3 -m venv /app/venv
 ENV PATH="/app/venv/bin:$PATH"
