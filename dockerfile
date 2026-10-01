@@ -1,37 +1,18 @@
 # =============================================================================
-# STAGE 1: Builder - compile depthai with basalt support
+# Runtime image - uses pre-built builder image for fast iteration
+# 
+# First, build the builder image ONCE (takes ~1hr):
+#   docker build -f dockerfile.builder -t blueos-oakd-basalt-builder .
+#
+# Then build runtime image quickly:
+#   docker build -t blueos-oakd-basalt .
 # =============================================================================
-FROM debian:trixie-slim AS builder
+ARG BUILDER_IMAGE=blueos-oakd-basalt-builder
 
-WORKDIR /app
-
-# Install build dependencies in one layer
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    git cmake build-essential curl make wget \
-    pkg-config zip \
-    libudev-dev libusb-1.0-0-dev \
-    libboost-dev python3-dev python3-numpy \
-    libssl3 openssl linux-libc-dev libopencv-dev \
-    python3 python3-pip python3-venv \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy and build depthai-core with basalt support
-COPY depthai-core /app/depthai-core
-
-RUN --mount=type=cache,target=/root/.cache/vcpkg \
-    cd depthai-core && cmake -S . -B build \
-    -DDEPTHAI_BUILD_PYTHON=ON \
-    -DDEPTHAI_BASALT_SUPPORT=ON \
-    -DDEPTHAI_OPENCV_SUPPORT=ON \
-    -DVCPKG_MANIFEST_FEATURES="basalt;python-bindings;usb;backward" \
-    -DCMAKE_BUILD_TYPE=Release
-
-RUN --mount=type=cache,target=/root/.cache/vcpkg \
-    --mount=type=cache,target=/root/.ccache \
-    cd depthai-core && cmake --build build --parallel $(nproc)
+FROM ${BUILDER_IMAGE} AS builder
 
 # =============================================================================
-# STAGE 2: Runtime - minimal image with only runtime dependencies
+# Runtime stage - minimal image
 # =============================================================================
 FROM debian:trixie-slim
 
@@ -41,7 +22,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv \
     libusb-1.0-0 libudev1 \
-    libopencv-core406t64 libopencv-imgproc406t64 libopencv-imgcodecs406t64 \
+    libopencv-core410 libopencv-imgproc410 libopencv-imgcodecs410 \
     libboost-filesystem1.83.0 libboost-program-options1.83.0 \
     tmux \
     ca-certificates \
