@@ -3,7 +3,6 @@
 # Function to handle shutdown
 cleanup() {
     echo "Shutting down services..."
-    pkill nginx
     pkill ttyd
     tmux kill-server
     exit 0
@@ -37,17 +36,13 @@ tmux new-session -d -s basalt-vio
 # Send the command to run the Python script in the tmux session
 tmux send-keys -t basalt-vio:0.0 "cd /app && source /app/venv/bin/activate && PYTHONPATH=/app/depthai-core/build/bindings/python python basalt.py --fps $FPS --camera-angle $CAMERA_ANGLE --vehicle-ip $VEHICLE_IP" C-m
 
-# Start nginx in the background
-nginx -c /etc/nginx/nginx.conf &
-nginx_pid=$!
-
-# Start ttyd server on port 7681 (nginx will proxy from 8000 to 7681)
-ttyd -p 7681 tmux attach-session -t basalt-vio &
+# Start ttyd server directly on port 8000 (no nginx needed with host networking)
+ttyd -p 8000 tmux attach-session -t basalt-vio &
 ttyd_pid=$!
 
 echo "✅ Basalt VIO started in tmux session 'basalt-vio'"
 echo "📋 Access the terminal at: http://localhost:8000"
 echo "📋 To detach from session: Ctrl+B, then D"
 
-# Wait for both processes
-wait $nginx_pid $ttyd_pid 
+# Wait for ttyd process
+wait $ttyd_pid 

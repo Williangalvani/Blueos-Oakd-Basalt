@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-RUN apt update && apt install -y  --no-install-recommends git nginx cmake build-essential curl make libudev-dev libusb-1.0-0-dev wget && rm -rf /var/lib/apt/lists/*
+RUN apt update && apt install -y  --no-install-recommends git cmake build-essential curl make libudev-dev libusb-1.0-0-dev wget && rm -rf /var/lib/apt/lists/*
 
 COPY install_ttyd.sh .
 
