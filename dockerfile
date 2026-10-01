@@ -61,7 +61,7 @@ LABEL permissions='\
     "DeviceCgroupRules": [\
       "c 189:* rmw"\
     ],\
-    "Env": ["VEHICLE_IP=127.0.0.1","FPS=10","CAMERA_ANGLE=0.0"],\
+    "Env": ["VEHICLE_IP=127.0.0.1","FPS=10","CAMERA_ANGLE=0.0"]\
   }\
 }'
 
