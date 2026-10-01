@@ -24,7 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libusb-1.0-0 libudev1 \
     libopencv-core410 libopencv-imgproc410 libopencv-imgcodecs410 \
     libboost-filesystem1.83.0 libboost-program-options1.83.0 \
-    tmux \
+    tmux wget \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
