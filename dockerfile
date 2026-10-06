@@ -55,24 +55,26 @@ RUN chmod +x /app/entrypoint.sh
 # Labels
 LABEL version="0.0.1"
 LABEL permissions='{\
+  "ExposedPorts": {"9847/tcp": {}},\
   "HostConfig": {\
     "NetworkMode": "host",\
     "Binds":["/dev/:/dev/"],\
     "DeviceCgroupRules": [\
       "c 189:* rmw"\
     ],\
-    "Env": ["VEHICLE_IP=127.0.0.1","FPS=10","CAMERA_ANGLE=0.0"]\
+    "Env": ["VEHICLE_IP=127.0.0.1","FPS=3","CAMERA_ANGLE=0.0"]\
   }\
 }'
 LABEL authors='[{"name": "Willian Galvani", "email": "willian@bluerobotics.com"}]'
 LABEL company='{"about": "", "name": "Blue Robotics", "email": "support@bluerobotics.com"}'
 LABEL type="device-integration"
+LABEL webpage='http://\{\{HOST\}\}:9847'
 LABEL readme='https://raw.githubusercontent.com/williangalvani/Blueos-Oakd-Basalt/{tag}/README.md'
 LABEL links='{"source": "https://github.com/williangalvani/Blueos-Oakd-Basalt"}'
 LABEL requirements="core >= 1.1"
 
 # Environment variables
-ENV FPS=10
+ENV FPS=3
 ENV CAMERA_ANGLE=0.0
 ENV VEHICLE_IP=127.0.0.1
 

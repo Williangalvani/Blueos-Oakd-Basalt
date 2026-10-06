@@ -36,8 +36,8 @@ def parse_args():
                        help='IP address of the vehicle/BlueOS instance (default: 127.0.0.1)')
     parser.add_argument('--fps',
                        type=int,
-                       default=60,
-                       help='FPS of the camera (default: 60)')
+                       default=3,
+                       help='FPS of the camera (default: 3)')
     parser.add_argument('--camera-angle',
                        type=float,
                        default=0.0,
@@ -63,13 +63,23 @@ print(f"🌐 WebSocket URL: ws://{args.vehicle_ip}/mavlink2rest/ws/mavlink?filte
 
 with dai.Pipeline() as p:
     fps = float(args.fps)
-    width = 640
-    height = 400
+    width = 320
+    height = 200
     # Define sources and outputs
     left = p.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B, sensorFps=fps)
     right = p.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C, sensorFps=fps)
     imu = p.create(dai.node.IMU)
     odom = p.create(dai.node.BasaltVIO)
+    
+    # Configure VIO for lower CPU usage on Pi
+    odom.vioConfig.optical_flow_detection_grid_size = 80  # Fewer features (default 50)
+    odom.vioConfig.optical_flow_max_iterations = 3        # Fewer iterations (default 5)
+    odom.vioConfig.optical_flow_levels = 2                # Fewer pyramid levels (default 3)
+    odom.vioConfig.vio_max_states = 2                     # Fewer states (default 3)
+    odom.vioConfig.vio_max_kfs = 4                        # Fewer keyframes (default 7)
+    odom.vioConfig.vio_max_iterations = 3                 # Fewer optimization iterations
+    odom.vioConfig.optical_flow_skip_frames = 1           # Process every frame
+    print("⚡ VIO configured for low-CPU mode")
 
     # Create MAVLink publisher instead of RerunNode
     mavlink_url = f"ws://{args.vehicle_ip}/mavlink2rest/ws/mavlink?filter=SEND_ONLY"

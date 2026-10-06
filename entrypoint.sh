@@ -13,7 +13,7 @@ trap cleanup SIGTERM SIGINT
 
 PYTHONPATH=/app/depthai-core/build/bindings/python
 # Default values
-DEFAULT_FPS=10
+DEFAULT_FPS=3
 DEFAULT_CAMERA_ANGLE=0.0
 DEFAULT_VEHICLE_IP="docker.host.internal"
 
@@ -36,12 +36,12 @@ tmux new-session -d -s basalt-vio
 # Send the command to run the Python script in the tmux session
 tmux send-keys -t basalt-vio:0.0 "cd /app && source /app/venv/bin/activate && PYTHONPATH=/app/depthai-core/build/bindings/python python basalt.py --fps $FPS --camera-angle $CAMERA_ANGLE --vehicle-ip $VEHICLE_IP" C-m
 
-# Start ttyd server directly on port 8000 (no nginx needed with host networking)
-ttyd -p 8000 tmux attach-session -t basalt-vio &
+# Start ttyd server directly on port 9847 (no nginx needed with host networking)
+ttyd -p 9847 tmux attach-session -t basalt-vio &
 ttyd_pid=$!
 
 echo "✅ Basalt VIO started in tmux session 'basalt-vio'"
-echo "📋 Access the terminal at: http://localhost:8000"
+echo "📋 Access the terminal at: http://localhost:9847"
 echo "📋 To detach from session: Ctrl+B, then D"
 
 # Wait for ttyd process
