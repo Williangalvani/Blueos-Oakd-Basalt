@@ -27,6 +27,7 @@ import time
 import argparse
 import depthai as dai
 from mavlink_node import MavlinkNode
+from autopilot_params import AutopilotParams
 
 def parse_args():
     """Parse command line arguments"""
@@ -58,6 +59,8 @@ print(f"📐 Camera Angle: {args.camera_angle}°")
 print(f"📊 Quality Rate: {args.quality_rate} Hz")
 
 print(f"🌐 WebSocket URL: ws://{args.vehicle_ip}/mavlink2rest/ws/mavlink?filter=SEND_ONLY")
+
+AutopilotParams(args.vehicle_ip).configure_visual_odometry()
 
 # Create pipeline
 

@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libusb-1.0-0 libudev1 \
     libopencv-core410 libopencv-imgproc410 libopencv-imgcodecs410 \
     libboost-filesystem1.83.0 libboost-program-options1.83.0 \
+    libgomp1 \
     tmux wget \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -35,8 +36,12 @@ RUN ./install_ttyd.sh && rm install_ttyd.sh
 # Copy built depthai Python bindings from builder
 COPY --from=builder /app/depthai-core/build/bindings/python /app/depthai-python
 
-# Copy any required shared libraries that were built
-COPY --from=builder /app/depthai-core/build/libdepthai*.so* /usr/local/lib/
+# Copy ALL shared libraries from the build (depthai, etc.)
+COPY --from=builder /app/depthai-core/build/*.so* /usr/local/lib/
+# Copy vcpkg-built shared libraries (rtabmap, pcl, etc.)
+COPY --from=builder /app/depthai-core/build/vcpkg_installed/arm64-linux/lib/*.so* /usr/local/lib/
+# Copy FetchContent dependencies (dynamic_calibration, etc.)
+COPY --from=builder /app/depthai-core/build/_deps/dynamic_calibration-src/lib/*.so* /usr/local/lib/
 RUN ldconfig
 
 # Create virtual environment and install Python deps
@@ -53,22 +58,21 @@ COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 # Labels
-LABEL version="0.0.1"
+LABEL version="0.0.2"
 LABEL permissions='{\
-  "ExposedPorts": {"9847/tcp": {}},\
+  "ExposedPorts": {"8080/tcp": {}},\
   "HostConfig": {\
     "NetworkMode": "host",\
-    "Binds":["/dev/:/dev/"],\
+    "Binds":["/dev/:/dev/", "/usr/blueos/extensions/oakd-vio:/app/data"],\
     "DeviceCgroupRules": [\
       "c 189:* rmw"\
-    ],\
-    "Env": ["VEHICLE_IP=127.0.0.1","FPS=3","CAMERA_ANGLE=0.0"]\
+    ]\
   }\
 }'
 LABEL authors='[{"name": "Willian Galvani", "email": "willian@bluerobotics.com"}]'
 LABEL company='{"about": "", "name": "Blue Robotics", "email": "support@bluerobotics.com"}'
 LABEL type="device-integration"
-LABEL webpage='http://\{\{HOST\}\}:9847'
+LABEL webpage='http://\{\{HOST\}\}:8080'
 LABEL readme='https://raw.githubusercontent.com/williangalvani/Blueos-Oakd-Basalt/{tag}/README.md'
 LABEL links='{"source": "https://github.com/williangalvani/Blueos-Oakd-Basalt"}'
 LABEL requirements="core >= 1.1"
