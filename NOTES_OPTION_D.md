@@ -88,10 +88,15 @@ python /app/pnp_vio.py --fps 15 --width 640 --height 400 --num-features 300 --ve
 7. **mavlink2rest message format:** check that `NAMED_VALUE_FLOAT` with a char-list name and `VISION_POSITION_DELTA` are accepted. Check `/mavlink2rest/mavlink/vehicles/1/components/195/messages/...`.
 8. **ArduSub's response to `confidence`:** check how ArduPilot uses it (the quality threshold in `AP_VisualOdom`), and tune the formula or `--min-inliers`.
 9. **Underwater behaviour:** low texture, backscatter and refraction (the in-air calibration makes depth scale wrong behind a flat port).
+10. **Two OpenCVs in one process:** the image installs `opencv-python-headless` from PyPI (4.14 abi3 aarch64 wheel with numpy 2.x on trixie's Python 3.13), while the depthai bindings link the system/vcpkg OpenCV. The wheel bundles its own renamed libraries, so they shouldn't clash. Still, check that `import depthai, cv2` works in the container and that the first PnP frames solve.
 
-## Open issues and notes for the existing code (not changed here)
+## Running it in the extension
 
-- `MavlinkNode.send_named_value_float` sends `name` as a plain string longer than 10 chars (`VIO_TRACKING_STATUS`). It sets `time_boot_ms` to epoch milliseconds, which overflows the `uint32` field. mavlink2rest may reject both, so check whether those metrics arrive at all.
+Select *PnP* as the algorithm on the configuration page (or POST `"algorithm": "pnp"` to `/api/config`). `main.py` then starts `python -u /app/pnp_vio.py` with the FPS, camera angle, resolution, vehicle IP, quality rate and *PnP Features* settings. Output is unbuffered and goes to the container log. At startup the log shows the device name, IMU and USB speed. Every 10 s it prints fps, ok/total, mean/max processing time, mean features, mean inliers, failure reasons and the chip temperature.
+
+## Open issues and notes for the existing code
+
+- Fixed since: `MavlinkNode.send_named_value_float` used to send names longer than 10 chars as plain strings and epoch milliseconds as `time_boot_ms`, which overflowed `uint32`. It now uses the short names `VIO_QUAL`/`VIO_FEAT`/`VIO_LMKS`/`VIO_PROC`/`VIO_TRACK`, NUL-padded char lists, and milliseconds since process start.
 - `rtabmap_vio.py` in the other checkout sets `initialConfig.FeatureMaintainer.minimumDistanceBetweenFeatures = 49`. That assigns an attribute on the nested *class*, not on the config, so it has no effect. The config's fields aren't exposed in the Python bindings; use `setFeatureMaintainer(...)` instead.
 - The gyro prior isn't used to pre-filter matches before RANSAC. With the EPnP kernel, the initial guess mostly matters for the final LM refine; the gyro's main job is the gate.
 - Accelerometer data is collected but unused. Metric scale comes from stereo depth.

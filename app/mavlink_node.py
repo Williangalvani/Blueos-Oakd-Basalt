@@ -7,6 +7,8 @@ import argparse
 import math
 from loguru import logger
 
+from mavlink_sender import NAMED_VALUE_FLOAT_NAME_LEN
+
 
 class MavlinkNode(dai.node.ThreadedHostNode):
     def __init__(self, mavlink_host="ws://127.0.0.1:6040/mavlink2rest/ws/mavlink?filter=SEND_ONLY", vehicle_id=1, component_id=195, camera_angle=0.0, quality_rate=1.0):
@@ -48,6 +50,8 @@ class MavlinkNode(dai.node.ThreadedHostNode):
         
         # Track if we're running
         self._running = False
+        # Reference for NAMED_VALUE_FLOAT.time_boot_ms (uint32, epoch milliseconds would overflow)
+        self._start_time = time.monotonic()
         
     def create_websocket_connection(self):
         """
@@ -193,14 +197,18 @@ class MavlinkNode(dai.node.ThreadedHostNode):
         
         return self.send_mavlink_message_ws("VISION_POSITION_DELTA", message_data)
     
-    def send_named_value_float(self, name, value, timestamp_us):
+    def send_named_value_float(self, name, value, timestamp_us=None):
         """
         Send NAMED_VALUE_FLOAT message with quality metrics
+        name is char[10] in MAVLink, sent as a NUL-padded list of chars like MavlinkSender does
         """
+        if len(name) > NAMED_VALUE_FLOAT_NAME_LEN:
+            logger.warning(f"NAMED_VALUE_FLOAT name {name!r} truncated to {NAMED_VALUE_FLOAT_NAME_LEN} chars")
+        padded = name[:NAMED_VALUE_FLOAT_NAME_LEN].ljust(NAMED_VALUE_FLOAT_NAME_LEN, "\u0000")
         message_data = {
-            "time_boot_ms": timestamp_us // 1000,  # Convert microseconds to milliseconds
-            "name": name,
-            "value": value
+            "time_boot_ms": int((time.monotonic() - self._start_time) * 1000) & 0xFFFFFFFF,
+            "name": list(padded),
+            "value": float(value)
         }
         
         return self.send_mavlink_message_ws("NAMED_VALUE_FLOAT", message_data)
@@ -218,24 +226,24 @@ class MavlinkNode(dai.node.ThreadedHostNode):
         self.last_quality_time = current_time
         
         # Send tracking quality (0.0 to 1.0)
-        self.send_named_value_float("VIO_TRACKING_QUALITY", quality_data.avgTrackingQuality, timestamp_us)
+        self.send_named_value_float("VIO_QUAL", quality_data.avgTrackingQuality, timestamp_us)
         
         # Send number of tracked features (normalized to 0-1 range, assuming max 1000 features)
         total_features = sum(quality_data.numTrackedFeatures) if quality_data.numTrackedFeatures else 0
         normalized_features = min(total_features / 1000.0, 1.0)  # Normalize to 0-1
-        self.send_named_value_float("VIO_TRACKED_FEATURES", normalized_features, timestamp_us)
+        self.send_named_value_float("VIO_FEAT", normalized_features, timestamp_us)
         
         # Send number of landmarks (normalized to 0-1 range, assuming max 10000 landmarks)
         normalized_landmarks = min(quality_data.numLandmarks / 10000.0, 1.0)
-        self.send_named_value_float("VIO_LANDMARKS", normalized_landmarks, timestamp_us)
+        self.send_named_value_float("VIO_LMKS", normalized_landmarks, timestamp_us)
         
         # Send processing time in seconds
         processing_time_sec = quality_data.processingTimeMs / 1000.0
-        self.send_named_value_float("VIO_PROCESSING_TIME", processing_time_sec, timestamp_us)
+        self.send_named_value_float("VIO_PROC", processing_time_sec, timestamp_us)
         
         # Send tracking status (1.0 if tracking, 0.0 if lost)
         tracking_status = 1.0 if quality_data.isTracking else 0.0
-        self.send_named_value_float("VIO_TRACKING_STATUS", tracking_status, timestamp_us)
+        self.send_named_value_float("VIO_TRACK", tracking_status, timestamp_us)
         
         logger.debug(f"Sent quality metrics: tracking_quality={quality_data.avgTrackingQuality:.3f}, "
                     f"features={normalized_features:.3f}, landmarks={normalized_landmarks:.3f}, "

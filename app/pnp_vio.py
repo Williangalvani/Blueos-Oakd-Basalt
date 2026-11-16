@@ -94,7 +94,8 @@ class GyroBuffer:
 
 
 class Stats:
-    def __init__(self):
+    def __init__(self, device=None):
+        self.device = device
         self.reset()
 
     def reset(self):
@@ -102,17 +103,27 @@ class Stats:
         self.frames = 0
         self.ok = 0
         self.proc_ms = []
+        self.features = []
         self.inliers = []
         self.reasons = Counter()
 
     def add(self, frame, proc_ms):
         self.frames += 1
         self.proc_ms.append(proc_ms)
+        self.features.append(frame.features)
         if frame.pose.ok:
             self.ok += 1
             self.inliers.append(frame.pose.inliers)
         else:
             self.reasons[frame.pose.reason] += 1
+
+    def chip_temperature(self):
+        if self.device is None:
+            return ""
+        try:
+            return f", chip {self.device.getChipTemperature().average:.1f}°C"
+        except Exception:
+            return ""
 
     def maybe_report(self):
         elapsed = time.monotonic() - self.start
@@ -123,10 +134,21 @@ class Stats:
             logger.info(
                 f"📊 {elapsed:.1f}s: {self.frames / elapsed:.1f} fps, ok {self.ok}/{self.frames}, "
                 f"proc mean {np.mean(self.proc_ms):.1f} ms max {np.max(self.proc_ms):.1f} ms, "
-                f"mean inliers {mean_inliers:.0f}, failures {dict(self.reasons)}")
+                f"mean features {np.mean(self.features):.0f}, mean inliers {mean_inliers:.0f}, "
+                f"failures {dict(self.reasons)}{self.chip_temperature()}")
         else:
-            logger.warning(f"📊 {elapsed:.1f}s: no frames received")
+            logger.warning(f"📊 {elapsed:.1f}s: no frames received{self.chip_temperature()}")
         self.reset()
+
+
+def log_device_info(device):
+    info = {}
+    for label, getter in (("name", "getDeviceName"), ("IMU", "getConnectedIMU"), ("USB", "getUsbSpeed")):
+        try:
+            info[label] = getattr(device, getter)()
+        except Exception as e:
+            info[label] = f"unavailable ({e})"
+    logger.info(f"Device: {info['name']}, IMU: {info['IMU']}, USB speed: {info['USB']}")
 
 
 def load_calibration(device, args):
@@ -217,10 +239,12 @@ def main():
 
     with dai.Pipeline() as p:
         sync_queue, imu_queue = build_pipeline(p, args)
-        intrinsics, R_cam_imu = load_calibration(p.getDefaultDevice(), args)
+        device = p.getDefaultDevice()
+        log_device_info(device)
+        intrinsics, R_cam_imu = load_calibration(device, args)
         odometry = PnPOdometry(intrinsics, params)
         gyro = GyroBuffer()
-        stats = Stats()
+        stats = Stats(device)
         tracking = None
         last_quality_time = 0.0
 

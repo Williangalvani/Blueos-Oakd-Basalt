@@ -5,6 +5,7 @@ cleanup() {
     echo "Shutting down services..."
     pkill -f "uvicorn"
     pkill -f "basalt_configurable"
+    pkill -f "pnp_vio"
     exit 0
 }
 

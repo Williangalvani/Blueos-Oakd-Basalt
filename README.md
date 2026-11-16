@@ -43,12 +43,19 @@ Reboot the autopilot for VISO_TYPE to take effect
 Messages are sent with component ID 195 (`MAV_COMP_ID_VISUAL_INERTIAL_ODOMETRY`) to `ws://<vehicle_ip>/mavlink2rest/ws/mavlink`.
 
 - `VISION_POSITION_DELTA`: position change since the previous frame, in the body frame (front-right-down), one per camera frame. `angle_delta` is not computed and is always zero.
-- `NAMED_VALUE_FLOAT`, rate-limited by the *Quality Rate* setting:
-  - `VIO_TRACKING_QUALITY`: average tracking quality, 0 to 1
-  - `VIO_TRACKED_FEATURES`: tracked features / 1000, capped at 1
-  - `VIO_LANDMARKS`: landmarks / 10000, capped at 1
-  - `VIO_PROCESSING_TIME`: processing time of the last frame, in seconds
-  - `VIO_TRACKING_STATUS`: 1 while tracking, 0 when lost
+- `NAMED_VALUE_FLOAT`, rate-limited by the *Quality Rate* setting (MAVLink limits names to 10 characters; `time_boot_ms` counts from the VIO process start):
+  - `VIO_QUAL`: average tracking quality, 0 to 1
+  - `VIO_FEAT`: tracked features / 1000, capped at 1
+  - `VIO_LMKS`: landmarks / 10000, capped at 1
+  - `VIO_PROC`: processing time of the last frame, in seconds
+  - `VIO_TRACK`: 1 while tracking, 0 when lost
+
+With the experimental **PnP** algorithm (see [NOTES_OPTION_D.md](NOTES_OPTION_D.md)), `VISION_POSITION_DELTA` also carries `angle_delta` and an inlier-based `confidence`, and the metrics are:
+  - `VIO_TRACK`: 1 while tracking, 0 when lost (also sent immediately on change)
+  - `VIO_FEAT`: number of features tracked on the camera (raw count)
+  - `VIO_INLIER`: PnP RANSAC inliers of the last frame
+  - `VIO_CONF`: confidence of the last frame, 0 to 100
+  - `VIO_PROCMS`: host processing time of the last frame, in milliseconds
 
 ## Configuration page
 
@@ -56,6 +63,7 @@ Open `http://<vehicle>:8080` (or the extension's entry in the BlueOS menu). Savi
 
 | Setting | Default | Notes |
 |---|---|---|
+| Algorithm | Basalt VIO | *Basalt VIO*, or the experimental *PnP* (on-device stereo depth and feature tracking, PnP on the host). |
 | FPS | 3 | Camera frame rate. The Raspberry Pi CPU is the limit; raise it slowly. |
 | Camera Angle (°) | 0 | Downward pitch of the camera. 0 = facing forward, 90 = facing down. |
 | Width × Height | 320 × 200 | Mono camera resolution fed to VIO. |
@@ -66,6 +74,7 @@ Open `http://<vehicle>:8080` (or the extension's entry in the BlueOS menu). Savi
 | Max States | 2 | Sliding window size. |
 | Max Keyframes | 4 | Keyframes kept in the optimization. |
 | VIO Iterations | 3 | Optimizer iterations per frame. |
+| PnP Features | 300 | PnP only: target number of features tracked on the camera. The Basalt settings above are ignored in PnP mode. |
 | Vehicle IP | 127.0.0.1 | Where mavlink2rest is reachable. The extension uses host networking, so the default works on the vehicle itself. |
 | Quality Rate (Hz) | 1 | Rate of the `NAMED_VALUE_FLOAT` quality messages. |
 

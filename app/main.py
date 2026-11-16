@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from typing import Optional
+from typing import Literal, Optional
 import uvicorn
 
 app = FastAPI(title="OAK-D VIO Configuration")
@@ -23,6 +23,7 @@ CONFIG_FILE = Path("/app/data/config.json")
 
 # Default configuration
 DEFAULT_CONFIG = {
+    "algorithm": "basalt",
     "fps": 3,
     "camera_angle": 0.0,
     "vehicle_ip": "127.0.0.1",
@@ -37,6 +38,8 @@ DEFAULT_CONFIG = {
     "vio_max_kfs": 4,
     "vio_max_iterations": 3,
     "optical_flow_skip_frames": 1,
+    # PnP (option D) parameters
+    "num_features": 300,
 }
 
 # VIO process handle
@@ -44,6 +47,7 @@ vio_process: Optional[subprocess.Popen] = None
 
 
 class VIOConfig(BaseModel):
+    algorithm: Literal["basalt", "pnp"] = "basalt"
     fps: int = 3
     camera_angle: float = 0.0
     vehicle_ip: str = "127.0.0.1"
@@ -57,6 +61,7 @@ class VIOConfig(BaseModel):
     vio_max_kfs: int = 4
     vio_max_iterations: int = 3
     optical_flow_skip_frames: int = 1
+    num_features: int = 300
 
 
 def load_config() -> dict:
@@ -88,32 +93,43 @@ def start_vio():
     stop_vio()
     
     # Build command with config
-    cmd = [
-        "python", "/app/basalt_configurable.py",
+    common_args = [
         "--fps", str(config["fps"]),
         "--camera-angle", str(config["camera_angle"]),
         "--vehicle-ip", config["vehicle_ip"],
         "--quality-rate", str(config["quality_rate"]),
         "--width", str(config["resolution_width"]),
         "--height", str(config["resolution_height"]),
-        "--grid-size", str(config["optical_flow_grid_size"]),
-        "--flow-iterations", str(config["optical_flow_max_iterations"]),
-        "--flow-levels", str(config["optical_flow_levels"]),
-        "--max-states", str(config["vio_max_states"]),
-        "--max-kfs", str(config["vio_max_kfs"]),
-        "--vio-iterations", str(config["vio_max_iterations"]),
-        "--skip-frames", str(config["optical_flow_skip_frames"]),
     ]
+    if config["algorithm"] == "pnp":
+        cmd = [
+            "python", "-u", "/app/pnp_vio.py",
+            *common_args,
+            "--num-features", str(config["num_features"]),
+        ]
+    else:
+        cmd = [
+            "python", "-u", "/app/basalt_configurable.py",
+            *common_args,
+            "--grid-size", str(config["optical_flow_grid_size"]),
+            "--flow-iterations", str(config["optical_flow_max_iterations"]),
+            "--flow-levels", str(config["optical_flow_levels"]),
+            "--max-states", str(config["vio_max_states"]),
+            "--max-kfs", str(config["vio_max_kfs"]),
+            "--vio-iterations", str(config["vio_max_iterations"]),
+            "--skip-frames", str(config["optical_flow_skip_frames"]),
+        ]
     
     env = os.environ.copy()
     env["PYTHONPATH"] = "/app/depthai-python"
+    env["PYTHONUNBUFFERED"] = "1"
     
     vio_process = subprocess.Popen(
         cmd,
         env=env,
         cwd="/app"
     )
-    print(f"Started VIO process with PID {vio_process.pid}")
+    print(f"Started {config['algorithm']} VIO process with PID {vio_process.pid}", flush=True)
 
 
 def stop_vio():
@@ -249,6 +265,14 @@ async def index():
             <h2>📷 Camera Settings</h2>
             <div class="grid">
                 <div class="field">
+                    <label>Algorithm</label>
+                    <select name="algorithm" data-value="{algorithm}">
+                        <option value="basalt">Basalt VIO</option>
+                        <option value="pnp">PnP (on-device stereo + tracking)</option>
+                    </select>
+                    <div class="hint">PnP ignores the Basalt tuning below</div>
+                </div>
+                <div class="field">
                     <label>FPS</label>
                     <input type="number" name="fps" value="{fps}" min="1" max="60">
                     <div class="hint">Lower = less CPU usage</div>
@@ -299,6 +323,11 @@ async def index():
                 <div class="field">
                     <label>VIO Iterations</label>
                     <input type="number" name="vio_max_iterations" value="{vio_max_iterations}" min="1" max="10">
+                </div>
+                <div class="field">
+                    <label>PnP Features</label>
+                    <input type="number" name="num_features" value="{num_features}" min="50" max="1000">
+                    <div class="hint">PnP only: features tracked on the camera</div>
                 </div>
             </div>
             
@@ -396,6 +425,11 @@ async def index():
                 showToast('Reset to defaults. Reloading...', 'success');
                 setTimeout(() => location.reload(), 1000);
             }
+        }
+        
+        // Templating only fills value attributes, so select the saved option here
+        for (const select of document.querySelectorAll('select[data-value]')) {
+            select.value = select.dataset.value;
         }
         
         // Update status every 5 seconds
