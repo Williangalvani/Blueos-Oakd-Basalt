@@ -6,15 +6,18 @@ BlueOS OAK-D VIO Extension - Web Configuration Interface
 import os
 import json
 import subprocess
-import signal
 from html import escape
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from typing import Literal, Optional
+from typing import Literal
 import uvicorn
+
+from vio_supervisor import VIOSupervisor
+
+WEB_PORT = 8095
 
 app = FastAPI(title="OAK-D VIO Configuration")
 
@@ -42,8 +45,6 @@ DEFAULT_CONFIG = {
     "num_features": 300,
 }
 
-# VIO process handle
-vio_process: Optional[subprocess.Popen] = None
 
 
 class VIOConfig(BaseModel):
@@ -83,14 +84,9 @@ def save_config(config: dict):
         json.dump(config, f, indent=2)
 
 
-def start_vio():
-    """Start the VIO process"""
-    global vio_process
-    
+def launch_vio() -> subprocess.Popen:
+    """Launch the VIO process for the saved configuration"""
     config = load_config()
-    
-    # Kill existing process if running
-    stop_vio()
     
     # Build command with config
     common_args = [
@@ -124,25 +120,28 @@ def start_vio():
     env["PYTHONPATH"] = "/app/depthai-python"
     env["PYTHONUNBUFFERED"] = "1"
     
-    vio_process = subprocess.Popen(
+    # stdout/stderr are inherited so VIO logs reach the container output
+    process = subprocess.Popen(
         cmd,
         env=env,
         cwd="/app"
     )
-    print(f"Started {config['algorithm']} VIO process with PID {vio_process.pid}", flush=True)
+    print(f"Started {config['algorithm']} VIO process with PID {process.pid}", flush=True)
+    return process
+
+
+# Restarts the VIO process if it exits without being stopped (e.g. a depthai segfault)
+supervisor = VIOSupervisor(launch_vio, log=lambda msg: print(msg, flush=True))
+
+
+def start_vio():
+    """(Re)start the VIO process"""
+    supervisor.start()
 
 
 def stop_vio():
-    """Stop the VIO process"""
-    global vio_process
-    if vio_process and vio_process.poll() is None:
-        vio_process.terminate()
-        try:
-            vio_process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            vio_process.kill()
-        print("Stopped VIO process")
-    vio_process = None
+    """Stop the VIO process without restarting it"""
+    supervisor.stop()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -368,9 +367,16 @@ async def index():
                 .then(data => {
                     const el = document.getElementById('status');
                     const text = document.getElementById('status-text');
+                    const restarts = data.restart_count
+                        ? ' · ' + data.restart_count + ' automatic restart(s), last exit code ' + data.last_exit_code
+                        : '';
                     if (data.running) {
                         el.className = 'status running';
-                        text.textContent = 'VIO Running (PID: ' + data.pid + ')';
+                        text.textContent = 'VIO Running (PID: ' + data.pid + ')' + restarts;
+                    } else if (data.restart_in !== null) {
+                        el.className = 'status stopped';
+                        text.textContent = 'VIO exited (code ' + data.last_exit_code + '), restarting in '
+                            + Math.ceil(data.restart_in) + ' s';
                     } else {
                         el.className = 'status stopped';
                         text.textContent = 'VIO Stopped';
@@ -462,11 +468,8 @@ async def set_config(config: VIOConfig):
 
 @app.get("/api/status")
 async def get_status():
-    """Get VIO process status"""
-    global vio_process
-    if vio_process and vio_process.poll() is None:
-        return {"running": True, "pid": vio_process.pid}
-    return {"running": False, "pid": None}
+    """Get VIO process status, including automatic restarts"""
+    return supervisor.status()
 
 
 @app.post("/api/start")
@@ -499,9 +502,9 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Stop VIO on server shutdown"""
-    stop_vio()
+    """Stop VIO and the supervisor thread on server shutdown"""
+    supervisor.shutdown()
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=WEB_PORT)

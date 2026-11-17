@@ -6,7 +6,7 @@ It uses the [depthai-core](https://github.com/luxonis/depthai-core) `BasaltVIO` 
 
 ## What it does on startup
 
-1. Starts a configuration web page on port **8080**.
+1. Starts a configuration web page on port **8095** (8080 is used by mavlink-server on BlueOS 1.4.x).
 2. Configures the autopilot's EKF to use visual odometry (see below).
 3. Starts the VIO pipeline with the saved settings and begins sending MAVLink.
 
@@ -59,7 +59,7 @@ With the experimental **PnP** algorithm (see [NOTES_OPTION_D.md](NOTES_OPTION_D.
 
 ## Configuration page
 
-Open `http://<vehicle>:8080` (or the extension's entry in the BlueOS menu). Saving restarts VIO with the new values. Settings are stored in `/usr/blueos/extensions/oakd-vio/config.json` on the vehicle, so they survive restarts and updates.
+Open `http://<vehicle>:8095` (or the extension's entry in the BlueOS menu). Saving restarts VIO with the new values. Settings are stored in `/usr/blueos/extensions/oakd-vio/config.json` on the vehicle, so they survive restarts and updates.
 
 | Setting | Default | Notes |
 |---|---|---|
@@ -104,7 +104,7 @@ In BlueOS, go to **Extensions → Installed → +** and fill in:
 
 ```json
 {
-  "ExposedPorts": {"8080/tcp": {}},
+  "ExposedPorts": {"8095/tcp": {}},
   "HostConfig": {
     "NetworkMode": "host",
     "Binds": ["/dev/:/dev/", "/usr/blueos/extensions/oakd-vio:/app/data"],
@@ -152,6 +152,8 @@ The image is built in two stages so that the slow part only runs once:
 | File | Purpose |
 |---|---|
 | `app/main.py` | Configuration web page and API; starts and stops the VIO process |
+| `app/vio_supervisor.py` | Restarts the VIO process with backoff when it exits unexpectedly |
+| `app/device_open.py` | Waits for the OAK-D and opens it, retrying with backoff |
 | `app/basalt_configurable.py` | The VIO pipeline: cameras, IMU, `BasaltVIO`, MAVLink output |
 | `app/autopilot_params.py` | Reads and sets the autopilot's EKF parameters through mavlink2rest |
 | `app/mavlink_node.py` | depthai host node that turns poses into MAVLink messages |
@@ -162,4 +164,5 @@ The image is built in two stages so that the slow part only runs once:
 
 - VIO runs on the Raspberry Pi CPU, which limits it to a few frames per second. The builder includes depthai's `RTABMapVIO` node, which can use feature tracking on the camera itself, but the pipeline does not use it yet.
 - `VISION_POSITION_DELTA` reports a fixed confidence of 100% and no rotation delta.
-- If the OAK-D isn't connected when the extension starts, the VIO process exits with `No available devices` and isn't retried. Plug the camera in and press **Start** on the configuration page, or restart the extension.
+- At startup the VIO process waits up to 30 s (`--device-timeout`) for the OAK-D to be discoverable and to open, retrying with backoff, and then exits with code 2. A PoE OAK-D can take many seconds to come back after the previous pipeline closed; opening it too early has been seen to segfault inside depthai.
+- If the VIO process exits without being stopped from the page (error, crash or segfault), `main.py` restarts it after 2 s, doubling up to 30 s; the delay resets after a run of 60 s. `/api/status` reports `restart_count`, `last_exit_code` (negative for a signal, e.g. -11 for SIGSEGV) and `restart_in`.

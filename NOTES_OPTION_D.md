@@ -9,7 +9,10 @@ Prototype on branch `option-d-pnp`. **Not run on hardware yet.**
 | `app/pnp_vio.py` | Entry point. Builds the depthai pipeline, runs the host loop, sends MAVLink. |
 | `app/pnp_odometry.py` | Pure pose math (numpy + OpenCV, no depthai): depth lookup, back-projection, gyro integration, PnP RANSAC, frame conversion, `PnPOdometry` state. |
 | `app/mavlink_sender.py` | depthai-free websocket sender for mavlink2rest (`VISION_POSITION_DELTA`, `NAMED_VALUE_FLOAT`). |
+| `app/device_open.py` | Waits for the device to be discoverable, then opens it, with backoff (shared with `basalt_configurable.py`). |
+| `app/vio_supervisor.py` | Used by `main.py`: restarts the VIO process with backoff after an unexpected exit. |
 | `app/tests/test_pnp_odometry.py` | pytest unit tests on synthetic scenes. |
+| `app/tests/test_device_open.py`, `app/tests/test_vio_supervisor.py` | Backoff and restart-policy tests (fake clock, and real subprocesses that exit or SIGSEGV). |
 
 `main.py` is not wired up. On this branch it has no algorithm selector, so adding one wasn't trivial. Run it by hand:
 ```bash
@@ -92,7 +95,16 @@ python /app/pnp_vio.py --fps 15 --width 640 --height 400 --num-features 300 --ve
 
 ## Running it in the extension
 
-Select *PnP* as the algorithm on the configuration page (or POST `"algorithm": "pnp"` to `/api/config`). `main.py` then starts `python -u /app/pnp_vio.py` with the FPS, camera angle, resolution, vehicle IP, quality rate and *PnP Features* settings. Output is unbuffered and goes to the container log. At startup the log shows the device name, IMU and USB speed. Every 10 s it prints fps, ok/total, mean/max processing time, mean features, mean inliers, failure reasons and the chip temperature.
+Select *PnP* as the algorithm on the configuration page (or POST `"algorithm": "pnp"` to `/api/config`). `main.py` then starts `python -u /app/pnp_vio.py` with the FPS, camera angle, resolution, vehicle IP, quality rate and *PnP Features* settings. Output is unbuffered and goes to the container log. The web UI is on port 8095 (8080 is taken by mavlink-server on BlueOS 1.4.x). At startup the log shows the device name, IMU and USB speed. Every 10 s it prints fps, ok/total, mean/max processing time, mean features, mean inliers, failure reasons and the chip temperature.
+
+## Device open and restarts
+
+Seen on an OAK-D-W-POE (2026-11-17): restarting `pnp_vio.py` about 1 s after the previous pipeline closed segfaulted inside depthai ("Address not mapped") before device info was printed. Restarting ~75 s later worked, and the open took ~9 s. Two layers handle this:
+
+- `device_open.py`: poll `dai.Device.getAllAvailableDevices()` with a backoff of 0.5 s doubling to 5 s, wait a 1 s settle delay after discovery, then `dai.Device(info)`. Open errors are retried in the same budget (`--device-timeout`, 30 s). When the budget runs out the script logs the reason and exits with code 2. The pipeline is then built with `dai.Pipeline(device)`.
+- `vio_supervisor.py`: a segfault can't be caught in Python, so `main.py` restarts any VIO exit it didn't ask for after 2 s, 4 s, ... up to 30 s. The delay resets after 60 s of stable running. Stop, Start and config changes don't trigger restarts. `/api/status` adds `restart_count`, `last_exit_code` and `restart_in`.
+
+Not checked on hardware: whether the 1 s settle delay is enough to avoid the segfault, or whether the supervisor's backoff ends up absorbing it.
 
 ## Open issues and notes for the existing code
 

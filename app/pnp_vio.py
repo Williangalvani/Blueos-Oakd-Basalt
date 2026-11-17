@@ -8,6 +8,7 @@ rotation prior (pnp_odometry.py), then sends VISION_POSITION_DELTA over MAVLink.
 """
 
 import argparse
+import sys
 import time
 from collections import Counter, deque
 from datetime import timedelta
@@ -17,6 +18,7 @@ import numpy as np
 from loguru import logger
 
 from autopilot_params import AutopilotParams
+from device_open import DEFAULT_TIMEOUT, DeviceOpenTimeout, open_oak_device
 from mavlink_sender import MavlinkSender
 from pnp_odometry import Intrinsics, PnPOdometry, PnPParams, camera_to_body_frd, integrate_gyro
 
@@ -57,6 +59,8 @@ def parse_args():
 
     parser.add_argument('--vehicle-ip', default='127.0.0.1')
     parser.add_argument('--quality-rate', type=float, default=1.0)
+    parser.add_argument('--device-timeout', type=float, default=DEFAULT_TIMEOUT,
+                        help='Seconds to keep waiting for the OAK device to be discoverable and open')
 
     return parser.parse_args()
 
@@ -237,9 +241,15 @@ def main():
     )
     quality_interval = 1.0 / args.quality_rate if args.quality_rate > 0 else float('inf')
 
-    with dai.Pipeline() as p:
+    try:
+        device = open_oak_device(args.device_timeout, log=logger.info)
+    except DeviceOpenTimeout as e:
+        logger.error(f"❌ {e}")
+        mavlink.close()
+        sys.exit(2)
+
+    with dai.Pipeline(device) as p:
         sync_queue, imu_queue = build_pipeline(p, args)
-        device = p.getDefaultDevice()
         log_device_info(device)
         intrinsics, R_cam_imu = load_calibration(device, args)
         odometry = PnPOdometry(intrinsics, params)

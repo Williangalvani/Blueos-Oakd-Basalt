@@ -15,8 +15,8 @@ trap cleanup SIGTERM SIGINT
 export PYTHONPATH=/app/depthai-python
 
 echo "🚀 Starting OAK-D VIO Extension"
-echo "📋 Web UI available at http://localhost:8080"
+echo "📋 Web UI available at http://localhost:8095"
 
 # Start the FastAPI web server
 cd /app
-/app/venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 8080
+/app/venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 8095

@@ -4,11 +4,13 @@ BlueOS OAK-D Basalt VIO with configurable parameters
 """
 
 import signal
+import sys
 import time
 import argparse
 import depthai as dai
 from mavlink_node import MavlinkNode
 from autopilot_params import AutopilotParams
+from device_open import DEFAULT_TIMEOUT, DeviceOpenTimeout, open_oak_device
 
 
 def parse_args():
@@ -33,6 +35,8 @@ def parse_args():
     # MAVLink settings
     parser.add_argument('--vehicle-ip', default='127.0.0.1')
     parser.add_argument('--quality-rate', type=float, default=1.0)
+    parser.add_argument('--device-timeout', type=float, default=DEFAULT_TIMEOUT,
+                        help='Seconds to keep waiting for the OAK device to be discoverable and open')
     
     return parser.parse_args()
 
@@ -48,7 +52,13 @@ def main():
 
     AutopilotParams(args.vehicle_ip).configure_visual_odometry()
     
-    with dai.Pipeline() as p:
+    try:
+        device = open_oak_device(args.device_timeout)
+    except DeviceOpenTimeout as e:
+        print(f"❌ {e}", flush=True)
+        sys.exit(2)
+
+    with dai.Pipeline(device) as p:
         # Define sources
         left = p.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B, sensorFps=float(args.fps))
         right = p.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C, sensorFps=float(args.fps))
