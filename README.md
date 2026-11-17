@@ -75,11 +75,38 @@ Open `http://<vehicle>:8095` (or the extension's entry in the BlueOS menu). Savi
 | Max Keyframes | 4 | Keyframes kept in the optimization. |
 | VIO Iterations | 3 | Optimizer iterations per frame. |
 | PnP Features | 300 | PnP only: target number of features tracked on the camera. The Basalt settings above are ignored in PnP mode. |
+| PnP Recovery After (frames) | 20 | PnP only: consecutive failed frames before [tracking recovery](#tracking-recovery-pnp); 0 disables it. |
+| Snapshots | on | PnP only: allow [camera snapshots](#snapshots-pnp). Nothing is streamed until one is requested. |
 | Vehicle IP | 127.0.0.1 | Where mavlink2rest is reachable. The extension uses host networking, so the default works on the vehicle itself. |
 | Quality Rate (Hz) | 1 | Rate of the `NAMED_VALUE_FLOAT` quality messages. |
 | Log only | off | Run VIO as a passive logger: no autopilot parameter changes and no MAVLink output at all. See [Log-only mode](#log-only-mode). |
 
 The defaults are tuned for low CPU usage on a Raspberry Pi.
+
+### Stereo depth (PnP)
+
+The *Stereo Depth (PnP)* section configures the on-camera `StereoDepth` node. The preset is applied first, then every setting below overrides it. The defaults aim for sparse but trustworthy depth at the tracked features, not a dense depth map: no hole filling, and depth stays on the same full-resolution rectified-left pixel grid the feature tracker runs on. Empty optional fields mean "keep the preset or device value". Each setting is passed to `pnp_vio.py` as a command-line flag (`--stereo-...`; `pnp_vio.py --help` lists them).
+
+| Setting | Default | Notes |
+|---|---|---|
+| Stereo preset | ROBOTICS | `setDefaultProfilePreset`; NONE skips it. On RVC2, ROBOTICS also turns on decimation 2 and the spatial filter, which the defaults below turn off again. |
+| Left-right check / threshold | on / 5 | Max disparity difference (px) between the left and right matches. |
+| Confidence threshold | 50 | 0–255; pixels with a worse confidence score are invalidated, so lower is stricter. |
+| Min / max brightness | auto / 255 | Pixels at or below min, or at or above max, are invalidated. Auto min is 1 when the edge fill color is 0, which drops the black rectification border, otherwise 0. |
+| Speckle filter / range | on / 50 | |
+| Min / max depth (mm) | 300 / 4000 | Threshold filter. Depth outside the range is set to 0. |
+| Spatial filter, temporal filter | off, off | Spatial fills holes by smoothing across edges; temporal lags behind motion. |
+| Decimation | 1 | 2–4 make depth coarser than the feature grid. Feature depth lookups are scaled to it, at a cost in accuracy. |
+| Subpixel / bits | on / 3 | The median filter needs 3 bits; with 4 or 5 it is turned off (with a warning). |
+| Median filter | 7x7 | off, 3x3, 5x5 or 7x7. |
+| Distortion correction | on | |
+| Alpha scaling | 0 | 0 crops the rectified image to valid pixels only. Empty keeps the device default. |
+| Edge fill color | 0 | Fill for the area outside the rectified image; -1 replicates edge pixels. |
+| Horizontal P2 penalty | empty | Cost aggregation P2; empty keeps the preset value. |
+
+PnP takes the camera matrix from the depth frame's own transformation (`--intrinsics-from frame`), so it matches the rectified-left grid even when alpha scaling changes it. If the frame has no plausible matrix, it falls back to the CAM_B calibration and logs a warning. The requested settings, the values read back from the node, and any warnings are logged at startup and written to the data log as a `stereo_config` event. The JSONL `start` event also includes them.
+
+Depth is not gated with the stereo confidence map. On the camera, the `confidenceMap` output gets no left-right check, alignment or post-processing, so it doesn't match the depth pixels. Streaming it would also add about 20 Mbit/s, and the confidence threshold above already applies the same score on the camera.
 
 The page is backed by a small HTTP API:
 
@@ -92,6 +119,27 @@ The page is backed by a small HTTP API:
 | GET | `/api/logs/{name}` | Download one data log |
 | POST | `/api/start`, `/api/stop` | Start or stop VIO |
 | POST | `/api/reset` | Restore defaults and restart VIO |
+| GET | `/api/snapshot?stream=<stream>` | PnP only: PNG of one current camera frame; `stream` is `rect_left`, `rect_right`, `depth` or `rgb`. See [Snapshots](#snapshots-pnp). |
+
+### Snapshots (PnP)
+
+`GET /api/snapshot?stream=rect_left|rect_right|depth|rgb` returns a fresh PNG from the running PnP VIO, without stopping it. The *Snapshots (PnP)* buttons on the page use it.
+
+- `rect_left`, `rect_right`: the rectified mono images the stereo matcher sees, 8-bit grayscale. The feature tracker runs on `rect_left`.
+- `depth`: depth aligned to `rect_left`, colorized from red (near) to blue (far) over the min–max depth range. Pixels with no depth are black. `&raw=1` returns the 16-bit depth in millimetres instead (`raw` is only valid for depth).
+- `rgb`: the color camera (CAM_A) at 640×400 and 5 fps. It runs only on devices that have it; on others the request returns 404.
+
+Responses carry `Cache-Control: no-store` and `X-Snapshot-Unix-Time`, `X-Snapshot-Device-Timestamp` and `X-Snapshot-Sequence` headers. A request returns 504 if no frame arrives within 3 s (PnP not running, or the camera is not answering), 404 if the stream is unavailable or snapshots are disabled, and 422 for an unknown stream.
+
+How it works:
+
+- On the camera, a `Script` node holds only the latest frame of each stream, in size-1 non-blocking queues. It forwards one frame only when the host asks for it, so snapshots use no USB/Ethernet bandwidth until requested. Each stereo output's frame pool grows from 3 to 4 frames to cover the frame the gate holds.
+- `main.py` and the VIO process share `/app/data/snapshots/` (`/usr/blueos/extensions/oakd-vio/snapshots/` on the vehicle). The endpoint atomically writes a request file, `requests/<stream>`, holding the request time.
+- The VIO loop checks the directory at most every 0.2 s and claims requests by renaming them. It sends at most one request to the camera per second, with only one in flight at a time; repeated requests for the same stream are merged. Each frame it does a non-blocking check for a reply.
+- PNG encoding runs on a separate writer thread with a bounded queue, so the VIO loop never waits on it. The writer saves `<stream>.png`, plus `depth_raw.png` for depth, then writes `<stream>.json` last, holding the request time it answers. The endpoint waits until that file shows a request time at least as recent as its own.
+- If the camera does not reply within 2 s, an error is written for the endpoint, and the next request can go out.
+
+Host cost, measured on a desktop with a 300-feature PnP frame: about 0.9 ms per frame without snapshots, and about 1.0 ms with a request on every frame (a request rate 15 times higher than the throttle allows). The camera-side cost of the RGB camera and the extra frame per pool has not been measured on hardware.
 
 ## Log-only mode and data logs
 
@@ -105,10 +153,25 @@ In log-only mode the autopilot parameters are neither read nor written and no MA
 
 Each VIO process start writes a JSONL file to `/app/data/logs/` (`/usr/blueos/extensions/oakd-vio/logs/` on the vehicle), named `vio-YYYYmmdd-HHMMSS-<pid>.jsonl`, in both modes. Every line has `type`, `wall_time` (ISO, UTC), `unix_time` and `monotonic`. Lines are flushed as they are written.
 
-- `"type": "event"` lines: `start` (arguments, `log_only`), `warning`, `device_open` attempts, `device`, `calibration`, `tracking` changes, `error`, `exit`.
-- `"type": "step"` lines (PnP only): one per frame, with `device_timestamp`, `sequence`, `time_delta_us`, `position_delta` and `angle_delta` (body FRD, exactly what is or would be sent), `confidence`, `features`, `valid_depth`, `matches`, `inliers`, `proc_ms`, `status` (`ok` or `rejected`), `reason` and `sent`. The deltas are `null` for rejected frames.
+- `"type": "event"` lines: `start` (arguments, `log_only`, and the resolved `stereo` settings for PnP), `warning`, `device_open` attempts, `device`, `calibration`, `tracking` changes, `error`, `exit`. PnP also writes:
+  - `stereo_config`: `requested` settings, `effective` values read back from the node, and `warnings`;
+  - `intrinsics`: the camera matrix used (`fx, fy, cx, cy`) and its `source` (`frame`, `cam_b`, `cam_c` or `cam_b (fallback)`);
+  - `snapshots`: the available `streams`, and `unavailable` ones with the reason;
+  - `recovery`: see [Tracking recovery](#tracking-recovery-pnp).
+- `"type": "step"` lines (PnP only): one per frame, with `device_timestamp`, `sequence`, `time_delta_us`, `position_delta` and `angle_delta` (body FRD, exactly what is or would be sent), `confidence`, `features`, `new_features` and `tracked_features` (ids not seen / seen in the previous frame), `valid_depth`, `matches`, `inliers`, `reprojection_rms_px`, `gyro_disagreement_deg`, `proc_ms`, `status` (`ok` or `rejected`), `reason` and `sent`. The deltas are `null` for rejected frames.
 
 Basalt runs write the events only, not per-frame poses. The supervisor appends its launches, exits (code or signal), restarts and stops to `supervisor.jsonl` in the same directory. Nothing is rotated or deleted. The configuration page links to the files.
+
+## Tracking recovery (PnP)
+
+In a pool test (`vio-20261117-180438-381.jsonl`), PnP tracked every frame for 10 minutes with about 110 features. After the vehicle was handled, it never recovered: the camera kept reporting 10–40 features with depth on only a few, even after the vehicle was static again at its starting heading. A restart in the same scene gave 106 features and 92% good frames. The host keeps no state beyond the previous frame, so the stuck state is in the camera's feature tracker. See [NOTES_OPTION_D.md](NOTES_OPTION_D.md#tracking-degradation-in-the-first-pool-test).
+
+After *PnP Recovery After* (`--recovery-frames`, default 20) consecutive failed frames, the VIO process:
+
+1. drops the host PnP reference, so the next frame starts a new baseline;
+2. re-initialises the camera's `FeatureTracker` through its `inputConfig` queue, without restarting the pipeline: it sends a config with the feature maintainer off, then the normal config one frame later, to make the tracker detect features from scratch.
+
+If tracking still fails, the wait before the next recovery doubles each time (20, 40, 80, ... frames, up to 16×). A successful frame resets the counter and the wait. Each recovery logs a warning and writes a `recovery` event with `count`, `failed_frames`, `reason`, `features`, `valid_depth`, `matches` and `next_after`. The 10 s summary counts recoveries, and the per-frame `new_features` and `tracked_features` show whether the tracker is re-detecting or stuck on old ids.
 
 ## Installing
 
@@ -179,6 +242,10 @@ The image is built in two stages so that the slow part only runs once:
 | `app/autopilot_params.py` | Reads and sets the autopilot's EKF parameters through mavlink2rest |
 | `app/mavlink_node.py` | depthai host node that turns poses into MAVLink messages |
 | `app/basalt.py` | Standalone command-line version of the pipeline, useful for testing |
+| `app/pnp_vio.py`, `app/pnp_odometry.py` | Experimental PnP VIO: camera pipeline and host loop; pose math |
+| `app/stereo_config.py` | PnP stereo settings: defaults, web form, command line and `StereoDepth` configuration |
+| `app/snapshots.py` | Snapshot requests (`main.py`) and serving them from the VIO process |
+| `app/tracking_recovery.py` | Tracking recovery state machine and feature tracker re-initialisation |
 | `entrypoint.sh` | Container entrypoint; starts the web server |
 
 ## Known limitations

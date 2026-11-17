@@ -59,6 +59,41 @@ class Intrinsics:
         ])
 
 
+def intrinsics_from_frame(matrix, frame_size, image_size):
+    """
+    Intrinsics on the image_size (width, height) grid from an ImgFrame's transformation, i.e. the
+    camera matrix of the exact pixel grid the frame is on (rectified left after alpha scaling).
+    A frame that is a uniform downscale of image_size (decimated depth) is scaled back up.
+    None if the matrix is missing or not a plausible pinhole matrix for that grid.
+    """
+    try:
+        m = np.asarray(matrix, dtype=np.float64).reshape(3, 3)
+        frame_w, frame_h = (int(v) for v in frame_size)
+    except (TypeError, ValueError):
+        return None
+    width, height = image_size
+    if frame_w <= 0 or frame_h <= 0 or width * frame_h != height * frame_w or not np.all(np.isfinite(m)):
+        return None
+    m = np.diag([width / frame_w, height / frame_h, 1.0]) @ m
+    intrinsics = Intrinsics.from_matrix(m)
+    if intrinsics.fx <= 0 or intrinsics.fy <= 0:
+        return None
+    if not (0 < intrinsics.cx < width and 0 < intrinsics.cy < height):
+        return None
+    return intrinsics
+
+
+def scale_to_depth_grid(uv, image_size, depth_shape):
+    """Pixel coordinates on the image_size (width, height) grid -> the depth image's grid (decimation)."""
+    if image_size is None:
+        return uv
+    width, height = image_size
+    depth_h, depth_w = depth_shape[:2]
+    if (depth_w, depth_h) == (width, height):
+        return uv
+    return uv * np.array([depth_w / width, depth_h / height])
+
+
 @dataclass
 class PnPParams:
     min_inliers: int = 15
@@ -291,9 +326,11 @@ class PnPOdometry:
     next reported delta starts from here and no jump is integrated.
     """
 
-    def __init__(self, intrinsics, params=None):
+    def __init__(self, intrinsics, params=None, image_size=None):
         self.intrinsics = intrinsics
         self.params = params or PnPParams()
+        # (width, height) of the feature pixel grid; depth may be coarser (decimation)
+        self.image_size = image_size
         self.prev_points = None  # dict id -> 3D point (optical, m)
         self.prev_timestamp = None
 
@@ -310,7 +347,7 @@ class PnPOdometry:
         ids = np.asarray(ids, dtype=np.int64).ravel()
         uv = np.asarray(uv, dtype=np.float64).reshape(-1, 2)
 
-        z = lookup_depth(depth, uv, self.params)
+        z = lookup_depth(depth, scale_to_depth_grid(uv, self.image_size, depth.shape), self.params)
         valid = np.isfinite(z)
         points = back_project(uv[valid], z[valid], self.intrinsics)
         current = dict(zip(ids[valid].tolist(), points))

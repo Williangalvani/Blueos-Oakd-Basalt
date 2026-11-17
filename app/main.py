@@ -9,15 +9,19 @@ import subprocess
 from html import escape
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from pydantic import BaseModel
-from typing import Literal
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from pydantic import BaseModel, create_model
+from typing import Literal, Optional
 import uvicorn
 
+import snapshots
 import vio_log
+from stereo_config import STEREO_DEFAULTS, STEREO_SETTINGS, stereo_command_args
 from vio_supervisor import VIOSupervisor
 
 WEB_PORT = 8095
+SNAPSHOT_DIR = snapshots.SNAPSHOT_DIR
+SNAPSHOT_TIMEOUT = 3.0
 
 app = FastAPI(title="OAK-D VIO Configuration")
 
@@ -43,13 +47,15 @@ DEFAULT_CONFIG = {
     "optical_flow_skip_frames": 1,
     # PnP (option D) parameters
     "num_features": 300,
+    "tracking_recovery_frames": 20,
+    "snapshots": True,
+    **STEREO_DEFAULTS,
     # Passive logger: no MAVLink output, autopilot params untouched (OAKD_LOG_ONLY=1 forces it on)
     "log_only": False,
 }
 
 
-
-class VIOConfig(BaseModel):
+class BaseVIOConfig(BaseModel):
     algorithm: Literal["basalt", "pnp"] = "basalt"
     fps: int = 3
     camera_angle: float = 0.0
@@ -65,7 +71,19 @@ class VIOConfig(BaseModel):
     vio_max_iterations: int = 3
     optical_flow_skip_frames: int = 1
     num_features: int = 300
+    tracking_recovery_frames: int = 20
+    snapshots: bool = True
     log_only: bool = False
+
+
+def _setting_field(setting):
+    kind = Literal[setting.choices] if setting.choices else setting.kind
+    return (Optional[kind] if setting.optional else kind), setting.default
+
+
+# The stereo fields come from the same table as pnp_vio.py's arguments
+VIOConfig = create_model("VIOConfig", __base__=BaseVIOConfig,
+                         **{setting.key: _setting_field(setting) for setting in STEREO_SETTINGS})
 
 
 def load_config() -> dict:
@@ -109,6 +127,9 @@ def build_vio_command(config: dict) -> list:
             "python", "-u", "/app/pnp_vio.py",
             *common_args,
             "--num-features", str(config["num_features"]),
+            "--recovery-frames", str(int(config["tracking_recovery_frames"])),
+            "--snapshots" if config["snapshots"] else "--no-snapshots",
+            *stereo_command_args(config),
         ]
     else:
         cmd = [
@@ -165,6 +186,31 @@ def start_vio():
 def stop_vio():
     """Stop the VIO process without restarting it"""
     supervisor.stop()
+
+
+def stereo_form_fields(config: dict) -> str:
+    """Web form fields for the stereo settings; an empty number field means auto/preset (null)."""
+    fields = []
+    for setting in STEREO_SETTINGS:
+        value = config.get(setting.key, setting.default)
+        name = escape(setting.key)
+        if setting.kind is bool:
+            control = (f'<label class="checkbox"><input type="checkbox" name="{name}"{" checked" if value else ""}> '
+                       f'{escape(setting.label)}</label>')
+        else:
+            label = f'<label>{escape(setting.label)}</label>'
+            if setting.choices:
+                options = "".join(
+                    f'<option value="{escape(str(choice))}"{" selected" if str(choice) == str(value) else ""}>'
+                    f'{escape(str(choice))}</option>' for choice in setting.choices)
+                control = f'{label}<select name="{name}">{options}</select>'
+            else:
+                step = "any" if setting.kind is float else "1"
+                shown = "" if value is None else escape(str(value))
+                control = f'{label}<input type="number" name="{name}" value="{shown}" step="{step}" placeholder="auto">'
+        hint = f'<div class="hint">{escape(setting.hint)}</div>' if setting.hint else ""
+        fields.append(f'                <div class="field">{control}{hint}</div>')
+    return "\n".join(fields)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -282,6 +328,7 @@ async def index():
         .logs { list-style: none; padding: 0; margin: 0; }
         .logs li { padding: 6px 0; border-bottom: 1px solid #222; font-size: 13px; }
         .logs a { color: #00d4ff; }
+        .snapshot { max-width: 100%; margin-top: 10px; border-radius: 4px; }
         .toast.show { opacity: 1; }
         .toast.success { background: #00cc66; }
         .toast.error { background: #cc3333; }
@@ -365,6 +412,23 @@ async def index():
                     <input type="number" name="num_features" value="{num_features}" min="50" max="1000">
                     <div class="hint">PnP only: features tracked on the camera</div>
                 </div>
+                <div class="field">
+                    <label>PnP Recovery After (frames)</label>
+                    <input type="number" name="tracking_recovery_frames" value="{tracking_recovery_frames}" min="0" max="1000">
+                    <div class="hint">PnP only: consecutive failed frames before the tracker is re-initialised; 0 disables</div>
+                </div>
+                <div class="field">
+                    <label class="checkbox">
+                        <input type="checkbox" name="snapshots" {snapshots_checked}>
+                        Snapshots
+                    </label>
+                    <div class="hint">PnP only: on-demand camera snapshots below; no bandwidth until requested</div>
+                </div>
+            </div>
+
+            <h2>🌊 Stereo Depth (PnP)</h2>
+            <div class="grid">
+{stereo_fields}
             </div>
             
             <h2>📡 MAVLink Output</h2>
@@ -393,6 +457,16 @@ async def index():
                 <button type="button" class="btn-secondary" onclick="resetDefaults()">↩️ Reset Defaults</button>
             </div>
         </form>
+
+        <h2>📸 Snapshots (PnP)</h2>
+        <div class="buttons">
+            <button type="button" class="btn-secondary" onclick="snapshot('rect_left')">Rectified left</button>
+            <button type="button" class="btn-secondary" onclick="snapshot('rect_right')">Rectified right</button>
+            <button type="button" class="btn-secondary" onclick="snapshot('depth')">Depth</button>
+            <button type="button" class="btn-secondary" onclick="snapshot('rgb')">RGB</button>
+        </div>
+        <div id="snapshot-status" class="hint"></div>
+        <img id="snapshot" class="snapshot" alt="">
 
         <h2>📝 Data Logs</h2>
         <ul id="logs" class="logs"><li>Loading...</li></ul>
@@ -465,14 +539,19 @@ async def index():
             e.preventDefault();
             const form = new FormData(e.target);
             const config = Object.fromEntries(form.entries());
-            // Convert numbers
-            for (const key of Object.keys(config)) {
-                if (!isNaN(config[key]) && key !== 'vehicle_ip') {
-                    config[key] = parseFloat(config[key]);
+            // Convert numbers; an empty field means "auto" (null)
+            for (const [key, value] of Object.entries(config)) {
+                if (key === 'vehicle_ip') continue;
+                if (value === '') {
+                    config[key] = null;
+                } else if (!isNaN(value)) {
+                    config[key] = parseFloat(value);
                 }
             }
             // Unchecked checkboxes are missing from FormData
-            config.log_only = e.target.elements.log_only.checked;
+            for (const box of e.target.querySelectorAll('input[type=checkbox]')) {
+                config[box.name] = box.checked;
+            }
             
             const res = await fetch('/api/config', {
                 method: 'POST',
@@ -504,6 +583,21 @@ async def index():
             }
         }
         
+        async function snapshot(stream) {
+            const status = document.getElementById('snapshot-status');
+            status.textContent = 'Requesting ' + stream + '...';
+            const res = await fetch('/api/snapshot?stream=' + stream);
+            if (!res.ok) {
+                const error = await res.json().catch(() => ({}));
+                status.textContent = error.detail || ('Error ' + res.status);
+                return;
+            }
+            const img = document.getElementById('snapshot');
+            if (img.src) URL.revokeObjectURL(img.src);
+            img.src = URL.createObjectURL(await res.blob());
+            status.textContent = stream + ' at ' + new Date().toLocaleTimeString();
+        }
+
         async function resetDefaults() {
             const res = await fetch('/api/reset', {method: 'POST'});
             if (res.ok) {
@@ -527,6 +621,8 @@ async def index():
 </html>
 """
     html = html.replace("{log_only_checked}", "checked" if config.get("log_only") else "")
+    html = html.replace("{snapshots_checked}", "checked" if config.get("snapshots") else "")
+    html = html.replace("{stereo_fields}", stereo_form_fields(config))
     # str.format() would choke on the CSS/JS braces in the template
     for key, value in config.items():
         html = html.replace("{" + key + "}", escape(str(value)))
@@ -567,6 +663,31 @@ async def download_log(name: str):
     if path is None:
         raise HTTPException(status_code=404, detail="No such log")
     return FileResponse(path, media_type="application/x-ndjson", filename=path.name)
+
+
+@app.get("/api/snapshot")
+def get_snapshot(stream: Literal[snapshots.STREAMS], raw: bool = False):
+    """
+    PNG of one fresh frame from the running PnP VIO, without stopping it: rect_left, rect_right,
+    depth (colorized, invalid black; raw=1 for 16-bit millimetres) or rgb. Waits up to ~3 s.
+    """
+    if raw and stream != "depth":
+        raise HTTPException(status_code=400, detail="raw=1 only applies to stream=depth")
+    requested_at = snapshots.request_snapshot(stream, SNAPSHOT_DIR)
+    try:
+        data, meta = snapshots.wait_for_snapshot(stream, requested_at, raw=raw, timeout=SNAPSHOT_TIMEOUT,
+                                                 snapshot_dir=SNAPSHOT_DIR)
+    except snapshots.SnapshotUnavailable as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except snapshots.SnapshotTimeout as e:
+        raise HTTPException(status_code=504, detail=f"{e}; snapshots need the PnP algorithm running")
+    headers = {
+        "Cache-Control": "no-store",
+        "X-Snapshot-Unix-Time": str(meta.get("unix_time")),
+        "X-Snapshot-Device-Timestamp": str(meta.get("device_timestamp")),
+        "X-Snapshot-Sequence": str(meta.get("sequence")),
+    }
+    return Response(content=data, media_type="image/png", headers=headers)
 
 
 @app.post("/api/start")

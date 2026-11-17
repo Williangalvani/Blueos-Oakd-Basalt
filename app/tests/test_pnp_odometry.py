@@ -15,10 +15,12 @@ from pnp_odometry import (  # noqa: E402
     camera_to_body_frd,
     confidence_from_inliers,
     integrate_gyro,
+    intrinsics_from_frame,
     lookup_depth,
     matrix_to_rotvec,
     rotation_angle,
     rotvec_to_matrix,
+    scale_to_depth_grid,
     solve_relative_pose,
 )
 
@@ -243,6 +245,79 @@ def test_odometry_end_to_end_with_depth_images():
     assert lost.pose.reason == "too_few_matches"
     still = odom.process(np.arange(9000, 9010), uv1[:10], depth1, timestamp=10.2)
     assert still.dt == pytest.approx(10.2 - 10.133)
+
+
+def test_intrinsics_from_frame():
+    matrix = [[400.0, 0.0, 320.0], [0.0, 400.0, 200.0], [0.0, 0.0, 1.0]]
+    assert intrinsics_from_frame(matrix, (WIDTH, HEIGHT), (WIDTH, HEIGHT)) == K
+    # Decimated depth frame: matrix on the 320x200 grid, scaled back to the feature grid
+    half = [[200.0, 0.0, 160.0], [0.0, 200.0, 100.0], [0.0, 0.0, 1.0]]
+    assert intrinsics_from_frame(half, (320, 200), (WIDTH, HEIGHT)) == K
+    assert intrinsics_from_frame(np.array(matrix), [WIDTH, HEIGHT], (WIDTH, HEIGHT)) == K
+
+
+@pytest.mark.parametrize("matrix, size", [
+    (None, (WIDTH, HEIGHT)),
+    ([[1.0, 0.0], [0.0, 1.0]], (WIDTH, HEIGHT)),
+    ([[400.0, 0.0, 320.0], [0.0, 400.0, 200.0], [0.0, 0.0, 1.0]], (1280, 720)),  # different aspect
+    ([[400.0, 0.0, 320.0], [0.0, 400.0, 200.0], [0.0, 0.0, 1.0]], (0, 0)),
+    ([[0.0, 0.0, 320.0], [0.0, 400.0, 200.0], [0.0, 0.0, 1.0]], (WIDTH, HEIGHT)),
+    ([[400.0, 0.0, 900.0], [0.0, 400.0, 200.0], [0.0, 0.0, 1.0]], (WIDTH, HEIGHT)),  # cx outside
+    ([[float("nan"), 0.0, 320.0], [0.0, 400.0, 200.0], [0.0, 0.0, 1.0]], (WIDTH, HEIGHT)),
+    ([[400.0, 0.0, 320.0], [0.0, 400.0, 200.0], [0.0, 0.0, 1.0]], None),
+])
+def test_intrinsics_from_frame_rejects_implausible(matrix, size):
+    assert intrinsics_from_frame(matrix, size, (WIDTH, HEIGHT)) is None
+
+
+def test_scale_to_depth_grid():
+    uv = np.array([[100.0, 50.0], [639.0, 399.0]])
+    assert scale_to_depth_grid(uv, (WIDTH, HEIGHT), (HEIGHT, WIDTH)) is uv
+    assert scale_to_depth_grid(uv, None, (200, 320)) is uv
+    np.testing.assert_allclose(scale_to_depth_grid(uv, (WIDTH, HEIGHT), (200, 320)), uv / 2)
+
+
+def test_decimated_depth_gives_the_same_pose():
+    """Feature pixels stay on the full grid; depth lookups go to the decimated grid."""
+    rng = np.random.default_rng(7)
+    n0 = np.array([0.1, 0.2, 1.0]); n0 /= np.linalg.norm(n0)
+    depth0 = plane_depth_image(n0, 3.0)
+    uv0 = np.stack([rng.uniform(10, WIDTH - 10, 200), rng.uniform(10, HEIGHT - 10, 200)], axis=1)
+    P0 = back_project(uv0, lookup_depth(depth0, uv0, PnPParams(depth_window=0)), K)
+    rotvec, delta = np.radians([0.3, -0.8, 0.2]), np.array([0.02, 0.01, 0.05])
+    _, R_10, t_10 = make_motion(rotvec, delta)
+    uv1 = project(transform(P0, R_10, t_10))
+    n1 = R_10 @ n0
+    depth1 = plane_depth_image(n1, 3.0 + n1 @ t_10)
+
+    full, decimated = PnPOdometry(K, image_size=(WIDTH, HEIGHT)), PnPOdometry(K, image_size=(WIDTH, HEIGHT))
+    ids = np.arange(200)
+    full.process(ids, uv0, depth0, 1.0)
+    decimated.process(ids, uv0, depth0[::2, ::2], 1.0)
+    a = full.process(ids, uv1, depth1, 1.1)
+    b = decimated.process(ids, uv1, depth1[::2, ::2], 1.1)
+    assert a.pose.ok and b.pose.ok
+    assert b.valid_depth >= 0.95 * a.valid_depth
+    np.testing.assert_allclose(b.pose.position_delta, delta, atol=1e-2)
+    np.testing.assert_allclose(b.pose.angle_delta, a.pose.angle_delta, atol=math.radians(0.2))
+
+    # Without image_size, lookups use full-grid pixels on the half-size depth: most fall outside it
+    # and the rest read depth from the wrong place
+    naive = PnPOdometry(K)
+    naive.process(ids, uv0, depth0[::2, ::2], 1.0)
+    c = naive.process(ids, uv1, depth1[::2, ::2], 1.1)
+    assert c.valid_depth < 0.4 * a.valid_depth
+
+
+def test_reset_drops_the_reference():
+    odom = PnPOdometry(K)
+    depth = np.full((HEIGHT, WIDTH), 2000, dtype=np.uint16)
+    uv = np.array([(u, v) for u in np.linspace(50, 590, 6) for v in np.linspace(50, 350, 5)])
+    odom.process(np.arange(30), uv, depth, 1.0)
+    assert odom.process(np.arange(30), uv, depth, 1.1).pose.ok
+    odom.reset()
+    assert odom.process(np.arange(30), uv, depth, 1.2).pose.reason == "no_reference"
+    assert odom.process(np.arange(30), uv, depth, 1.3).pose.ok
 
 
 def test_non_increasing_timestamp():
