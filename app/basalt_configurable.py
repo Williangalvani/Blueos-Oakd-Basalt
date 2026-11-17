@@ -11,6 +11,7 @@ import depthai as dai
 from mavlink_node import MavlinkNode
 from autopilot_params import AutopilotParams
 from device_open import DEFAULT_TIMEOUT, DeviceOpenTimeout, open_oak_device
+from vio_log import LOG_ONLY_BANNER, env_forces_log_only, open_vio_log, resolve_log_only
 
 
 def parse_args():
@@ -37,25 +38,63 @@ def parse_args():
     parser.add_argument('--quality-rate', type=float, default=1.0)
     parser.add_argument('--device-timeout', type=float, default=DEFAULT_TIMEOUT,
                         help='Seconds to keep waiting for the OAK device to be discoverable and open')
+    parser.add_argument('--log-only', action='store_true',
+                        help='No MAVLink output and no autopilot parameter changes (also forced by OAKD_LOG_ONLY=1). '
+                             'Basalt poses are not written to the data log, only start/device/exit events')
     
     return parser.parse_args()
 
 
+def _raise_system_exit(signum, frame):
+    raise SystemExit(128 + signum)
+
+
 def main():
     args = parse_args()
-    
-    print(f"🚀 Starting OAK-D Basalt VIO")
+    log_only = resolve_log_only(args.log_only)
+    signal.signal(signal.SIGTERM, _raise_system_exit)
+
+    data_log = open_vio_log()
+    print(f"📝 Data log: {data_log.path}", flush=True)
+    data_log.event("start", algorithm="basalt", args=vars(args), log_only=log_only,
+                   log_only_forced_by_env=env_forces_log_only())
+    exit_code = 0
+    try:
+        run(args, log_only, data_log)
+    except SystemExit as e:
+        exit_code = e.code
+        raise
+    except BaseException as e:
+        exit_code = 1
+        data_log.event("error", error=repr(e))
+        raise
+    finally:
+        data_log.event("exit", exit_code=exit_code)
+        data_log.close()
+
+
+def run(args, log_only, data_log):
+    print("🚀 Starting OAK-D Basalt VIO")
     print(f"📷 Camera: {args.width}x{args.height} @ {args.fps} FPS")
     print(f"📐 Camera Angle: {args.camera_angle}°")
     print(f"🔧 VIO: grid={args.grid_size}, iterations={args.flow_iterations}, levels={args.flow_levels}")
-    print(f"📡 MAVLink: {args.vehicle_ip}")
+    print(f"📡 MAVLink: {'disabled (log-only)' if log_only else args.vehicle_ip}")
 
-    AutopilotParams(args.vehicle_ip).configure_visual_odometry()
-    
+    if log_only:
+        print(f"⚠️ {LOG_ONLY_BANNER}", flush=True)
+        data_log.event("warning", message=LOG_ONLY_BANNER)
+    else:
+        AutopilotParams(args.vehicle_ip).configure_visual_odometry()
+
+    def log_device_open(message):
+        print(message, flush=True)
+        data_log.event("device_open", message=message)
+
     try:
-        device = open_oak_device(args.device_timeout)
+        device = open_oak_device(args.device_timeout, log=log_device_open)
     except DeviceOpenTimeout as e:
         print(f"❌ {e}", flush=True)
+        data_log.event("error", error=str(e))
         sys.exit(2)
 
     with dai.Pipeline(device) as p:
@@ -74,15 +113,17 @@ def main():
         odom.vioConfig.vio_max_iterations = args.vio_iterations
         odom.vioConfig.optical_flow_skip_frames = args.skip_frames
         
-        print(f"⚡ VIO configured")
+        print("⚡ VIO configured")
         
-        # Create MAVLink publisher
-        mavlink_url = f"ws://{args.vehicle_ip}/mavlink2rest/ws/mavlink?filter=SEND_ONLY"
-        mavlink_publisher = MavlinkNode(
-            mavlink_host=mavlink_url, 
-            camera_angle=args.camera_angle, 
-            quality_rate=args.quality_rate
-        )
+        # Create MAVLink publisher (not at all in log-only mode, so nothing reaches mavlink2rest)
+        mavlink_publisher = None
+        if not log_only:
+            mavlink_url = f"ws://{args.vehicle_ip}/mavlink2rest/ws/mavlink?filter=SEND_ONLY"
+            mavlink_publisher = MavlinkNode(
+                mavlink_host=mavlink_url, 
+                camera_angle=args.camera_angle, 
+                quality_rate=args.quality_rate
+            )
         
         # Configure IMU
         imu.enableIMUSensor([dai.IMUSensor.ACCELEROMETER_RAW, dai.IMUSensor.GYROSCOPE_RAW], 200)
@@ -93,12 +134,16 @@ def main():
         left.requestOutput((args.width, args.height)).link(odom.left)
         right.requestOutput((args.width, args.height)).link(odom.right)
         imu.out.link(odom.imu)
-        odom.transform.link(mavlink_publisher.inputTrans)
-        odom.quality.link(mavlink_publisher.inputQuality)
+        if mavlink_publisher is not None:
+            odom.transform.link(mavlink_publisher.inputTrans)
+            odom.quality.link(mavlink_publisher.inputQuality)
         
         p.start()
         print("✅ Pipeline started!")
-        print("📡 Sending VIO data via MAVLink...")
+        if log_only:
+            print(f"⚠️ {LOG_ONLY_BANNER}", flush=True)
+        else:
+            print("📡 Sending VIO data via MAVLink...")
         
         while p.isRunning():
             time.sleep(0.1)

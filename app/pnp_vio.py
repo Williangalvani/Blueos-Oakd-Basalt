@@ -8,6 +8,7 @@ rotation prior (pnp_odometry.py), then sends VISION_POSITION_DELTA over MAVLink.
 """
 
 import argparse
+import signal
 import sys
 import time
 from collections import Counter, deque
@@ -21,6 +22,7 @@ from autopilot_params import AutopilotParams
 from device_open import DEFAULT_TIMEOUT, DeviceOpenTimeout, open_oak_device
 from mavlink_sender import MavlinkSender
 from pnp_odometry import Intrinsics, PnPOdometry, PnPParams, camera_to_body_frd, integrate_gyro
+from vio_log import LOG_ONLY_BANNER, env_forces_log_only, open_vio_log, resolve_log_only, setup_autopilot_output
 
 SUMMARY_INTERVAL = 10.0
 GYRO_BUFFER_SECONDS = 2.0
@@ -36,7 +38,7 @@ INTRINSICS_SOCKETS = {
 }
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description='BlueOS OAK-D PnP VIO')
 
     parser.add_argument('--fps', type=int, default=15)
@@ -61,8 +63,11 @@ def parse_args():
     parser.add_argument('--quality-rate', type=float, default=1.0)
     parser.add_argument('--device-timeout', type=float, default=DEFAULT_TIMEOUT,
                         help='Seconds to keep waiting for the OAK device to be discoverable and open')
+    parser.add_argument('--log-only', action='store_true',
+                        help='Passive logger: no MAVLink output and no autopilot parameter changes '
+                             '(also forced by OAKD_LOG_ONLY=1)')
 
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def timestamp_seconds(msg, exposure_middle=False):
@@ -153,6 +158,7 @@ def log_device_info(device):
         except Exception as e:
             info[label] = f"unavailable ({e})"
     logger.info(f"Device: {info['name']}, IMU: {info['IMU']}, USB speed: {info['USB']}")
+    return {label: str(value) for label, value in info.items()}
 
 
 def load_calibration(device, args):
@@ -216,21 +222,49 @@ def build_pipeline(p, args):
     return sync_queue, imu_queue
 
 
-def main():
-    args = parse_args()
+def _raise_system_exit(signum, frame):
+    # The supervisor stops us with SIGTERM; exit through the finally blocks so the log gets its exit line
+    raise SystemExit(128 + signum)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    log_only = resolve_log_only(args.log_only)
+    signal.signal(signal.SIGTERM, _raise_system_exit)
 
     print("🚀 Starting OAK-D PnP VIO")
     print(f"📷 Camera: {args.width}x{args.height} @ {args.fps} FPS")
     print(f"📐 Camera Angle: {args.camera_angle}°")
     print(f"🔧 Features on camera: {args.num_features} ({args.corner_detector}), "
           f"min inliers {args.min_inliers}, gyro gate {args.gyro_gate}°")
-    print(f"📡 MAVLink: {args.vehicle_ip}")
+    print(f"📡 MAVLink: {'disabled (log-only)' if log_only else args.vehicle_ip}")
 
-    AutopilotParams(args.vehicle_ip).configure_visual_odometry()
+    data_log = open_vio_log()
+    logger.info(f"Data log: {data_log.path}")
+    data_log.event("start", algorithm="pnp", args=vars(args), log_only=log_only,
+                   log_only_forced_by_env=env_forces_log_only())
+    exit_code = 0
+    try:
+        run(args, log_only, data_log)
+    except SystemExit as e:
+        exit_code = e.code
+        raise
+    except BaseException as e:
+        exit_code = 1
+        data_log.event("error", error=repr(e))
+        raise
+    finally:
+        data_log.event("exit", exit_code=exit_code)
+        data_log.close()
 
-    mavlink = MavlinkSender(f"ws://{args.vehicle_ip}/mavlink2rest/ws/mavlink?filter=SEND_ONLY")
-    if not mavlink.connect():
-        logger.warning("MAVLink websocket not connected yet; will keep retrying")
+
+def run(args, log_only, data_log):
+    def log_warning(message):
+        logger.warning(message)
+        data_log.event("warning", message=message)
+
+    mavlink = setup_autopilot_output(log_only, args.vehicle_ip, AutopilotParams, MavlinkSender,
+                                     log=log_warning)
 
     params = PnPParams(
         min_inliers=args.min_inliers,
@@ -241,92 +275,133 @@ def main():
     )
     quality_interval = 1.0 / args.quality_rate if args.quality_rate > 0 else float('inf')
 
+    def log_device_open(message):
+        logger.info(message)
+        data_log.event("device_open", message=message)
+
     try:
-        device = open_oak_device(args.device_timeout, log=logger.info)
+        device = open_oak_device(args.device_timeout, log=log_device_open)
     except DeviceOpenTimeout as e:
         logger.error(f"❌ {e}")
-        mavlink.close()
+        data_log.event("error", error=str(e))
+        if mavlink:
+            mavlink.close()
         sys.exit(2)
 
-    with dai.Pipeline(device) as p:
-        sync_queue, imu_queue = build_pipeline(p, args)
-        log_device_info(device)
-        intrinsics, R_cam_imu = load_calibration(device, args)
-        odometry = PnPOdometry(intrinsics, params)
-        gyro = GyroBuffer()
-        stats = Stats(device)
-        tracking = None
-        last_quality_time = 0.0
+    try:
+        with dai.Pipeline(device) as p:
+            sync_queue, imu_queue = build_pipeline(p, args)
+            data_log.event("device", **log_device_info(device))
+            intrinsics, R_cam_imu = load_calibration(device, args)
+            data_log.event("calibration", intrinsics=[intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy],
+                           R_cam_imu=R_cam_imu)
+            odometry = PnPOdometry(intrinsics, params)
+            gyro = GyroBuffer()
+            stats = Stats(device)
+            tracking = None
+            last_quality_time = 0.0
 
-        p.start()
-        print("✅ Pipeline started!")
-        print("📡 Sending VIO data via MAVLink...")
+            p.start()
+            print("✅ Pipeline started!")
+            if log_only:
+                logger.warning(f"⚠️ {LOG_ONLY_BANNER}")
+            else:
+                print("📡 Sending VIO data via MAVLink...")
 
-        while p.isRunning():
-            group = sync_queue.get()
-            start = time.perf_counter()
+            while p.isRunning():
+                group = sync_queue.get()
+                start = time.perf_counter()
 
-            for imu_data in imu_queue.tryGetAll():
-                gyro.add(imu_data)
+                for imu_data in imu_queue.tryGetAll():
+                    gyro.add(imu_data)
 
-            features_msg = group["features"]
-            depth_msg = group["depth"]
-            if features_msg.getSequenceNum() != depth_msg.getSequenceNum():
-                logger.warning(f"Sequence mismatch: features {features_msg.getSequenceNum()} "
-                               f"depth {depth_msg.getSequenceNum()}")
+                features_msg = group["features"]
+                depth_msg = group["depth"]
+                if features_msg.getSequenceNum() != depth_msg.getSequenceNum():
+                    logger.warning(f"Sequence mismatch: features {features_msg.getSequenceNum()} "
+                                   f"depth {depth_msg.getSequenceNum()}")
 
-            t = timestamp_seconds(depth_msg, exposure_middle=True)
-            tracked = features_msg.trackedFeatures
-            ids = np.fromiter((f.id for f in tracked), dtype=np.int64, count=len(tracked))
-            uv = np.array([(f.position.x, f.position.y) for f in tracked], dtype=np.float64).reshape(-1, 2)
-            depth = depth_msg.getFrame()
+                t = timestamp_seconds(depth_msg, exposure_middle=True)
+                tracked = features_msg.trackedFeatures
+                ids = np.fromiter((f.id for f in tracked), dtype=np.int64, count=len(tracked))
+                uv = np.array([(f.position.x, f.position.y) for f in tracked], dtype=np.float64).reshape(-1, 2)
+                depth = depth_msg.getFrame()
 
-            R_prior = None
-            if R_cam_imu is not None and odometry.prev_timestamp is not None:
-                R_prior = gyro.rotation(odometry.prev_timestamp, t, R_cam_imu)
-            gyro.prune(t - GYRO_BUFFER_SECONDS)
+                R_prior = None
+                if R_cam_imu is not None and odometry.prev_timestamp is not None:
+                    R_prior = gyro.rotation(odometry.prev_timestamp, t, R_cam_imu)
+                gyro.prune(t - GYRO_BUFFER_SECONDS)
 
-            frame = odometry.process(ids, uv, depth, t, R_prior)
-            pose = frame.pose
+                frame = odometry.process(ids, uv, depth, t, R_prior)
+                pose = frame.pose
 
-            if pose.ok:
-                mavlink.send_vision_position_delta(
-                    angle_delta=camera_to_body_frd(pose.angle_delta, args.camera_angle),
-                    position_delta=camera_to_body_frd(pose.position_delta, args.camera_angle),
-                    time_delta_us=frame.dt * 1e6,
+                angle_delta = position_delta = time_delta_us = None
+                sent = False
+                if pose.ok:
+                    # Exactly what goes (or would go) into VISION_POSITION_DELTA
+                    angle_delta = camera_to_body_frd(pose.angle_delta, args.camera_angle)
+                    position_delta = camera_to_body_frd(pose.position_delta, args.camera_angle)
+                    time_delta_us = frame.dt * 1e6
+                    if mavlink:
+                        sent = mavlink.send_vision_position_delta(
+                            angle_delta=angle_delta,
+                            position_delta=position_delta,
+                            time_delta_us=time_delta_us,
+                            confidence=pose.confidence,
+                        )
+
+                now_tracking = pose.ok
+                if pose.reason == "no_reference":
+                    now_tracking = tracking  # first frame: nothing to say yet
+                proc_ms = (time.perf_counter() - start) * 1000.0
+
+                data_log.step(
+                    device_timestamp=t,
+                    sequence=depth_msg.getSequenceNum(),
+                    time_delta_us=time_delta_us,
+                    position_delta=position_delta,
+                    angle_delta=angle_delta,
                     confidence=pose.confidence,
+                    features=frame.features,
+                    valid_depth=frame.valid_depth,
+                    matches=pose.matches,
+                    inliers=pose.inliers,
+                    reprojection_rms_px=pose.reprojection_rms_px,
+                    gyro_disagreement_deg=pose.gyro_disagreement_deg,
+                    proc_ms=proc_ms,
+                    status="ok" if pose.ok else "rejected",
+                    reason=pose.reason or None,
+                    sent=sent,
                 )
 
-            now_tracking = pose.ok
-            if pose.reason == "no_reference":
-                now_tracking = tracking  # first frame: nothing to say yet
-            proc_ms = (time.perf_counter() - start) * 1000.0
+                now = time.monotonic()
+                if now_tracking is not None and now_tracking != tracking:
+                    if mavlink:
+                        mavlink.send_named_value_float("VIO_TRACK", 1.0 if now_tracking else 0.0)
+                    if not now_tracking:
+                        logger.warning(f"Tracking lost: {pose.reason} (matches {pose.matches}, inliers {pose.inliers})")
+                    else:
+                        logger.info("Tracking (re)established")
+                    data_log.event("tracking", tracking=now_tracking, reason=pose.reason or None)
+                    tracking = now_tracking
+                if mavlink and now - last_quality_time >= quality_interval:
+                    last_quality_time = now
+                    mavlink.send_named_value_float("VIO_TRACK", 1.0 if tracking else 0.0)
+                    mavlink.send_named_value_float("VIO_INLIER", pose.inliers)
+                    mavlink.send_named_value_float("VIO_FEAT", frame.features)
+                    mavlink.send_named_value_float("VIO_CONF", pose.confidence)
+                    mavlink.send_named_value_float("VIO_PROCMS", proc_ms)
 
-            now = time.monotonic()
-            if now_tracking is not None and now_tracking != tracking:
-                mavlink.send_named_value_float("VIO_TRACK", 1.0 if now_tracking else 0.0)
-                if not now_tracking:
-                    logger.warning(f"Tracking lost: {pose.reason} (matches {pose.matches}, inliers {pose.inliers})")
-                else:
-                    logger.info("Tracking (re)established")
-                tracking = now_tracking
-            if now - last_quality_time >= quality_interval:
-                last_quality_time = now
-                mavlink.send_named_value_float("VIO_TRACK", 1.0 if tracking else 0.0)
-                mavlink.send_named_value_float("VIO_INLIER", pose.inliers)
-                mavlink.send_named_value_float("VIO_FEAT", frame.features)
-                mavlink.send_named_value_float("VIO_CONF", pose.confidence)
-                mavlink.send_named_value_float("VIO_PROCMS", proc_ms)
-
-            logger.debug(
-                f"frame t={t:.3f} dt={frame.dt if frame.dt is not None else float('nan'):.3f}s "
-                f"feat={frame.features} depth={frame.valid_depth} match={pose.matches} inl={pose.inliers} "
-                f"gyro_diff={pose.gyro_disagreement_deg:.2f}° {'ok' if pose.ok else pose.reason} "
-                f"proc={proc_ms:.1f}ms")
-            stats.add(frame, proc_ms)
-            stats.maybe_report()
-
-    mavlink.close()
+                logger.debug(
+                    f"frame t={t:.3f} dt={frame.dt if frame.dt is not None else float('nan'):.3f}s "
+                    f"feat={frame.features} depth={frame.valid_depth} match={pose.matches} inl={pose.inliers} "
+                    f"gyro_diff={pose.gyro_disagreement_deg:.2f}° {'ok' if pose.ok else pose.reason} "
+                    f"proc={proc_ms:.1f}ms")
+                stats.add(frame, proc_ms)
+                stats.maybe_report()
+    finally:
+        if mavlink:
+            mavlink.close()
 
 
 if __name__ == "__main__":

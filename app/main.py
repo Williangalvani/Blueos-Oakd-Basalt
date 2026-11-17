@@ -9,12 +9,12 @@ import subprocess
 from html import escape
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from typing import Literal
 import uvicorn
 
+import vio_log
 from vio_supervisor import VIOSupervisor
 
 WEB_PORT = 8095
@@ -43,6 +43,8 @@ DEFAULT_CONFIG = {
     "optical_flow_skip_frames": 1,
     # PnP (option D) parameters
     "num_features": 300,
+    # Passive logger: no MAVLink output, autopilot params untouched (OAKD_LOG_ONLY=1 forces it on)
+    "log_only": False,
 }
 
 
@@ -63,6 +65,7 @@ class VIOConfig(BaseModel):
     vio_max_iterations: int = 3
     optical_flow_skip_frames: int = 1
     num_features: int = 300
+    log_only: bool = False
 
 
 def load_config() -> dict:
@@ -84,11 +87,15 @@ def save_config(config: dict):
         json.dump(config, f, indent=2)
 
 
-def launch_vio() -> subprocess.Popen:
-    """Launch the VIO process for the saved configuration"""
-    config = load_config()
-    
-    # Build command with config
+def log_only_status(config=None) -> dict:
+    """Effective log-only state: the saved setting, or forced by OAKD_LOG_ONLY in the environment"""
+    config = load_config() if config is None else config
+    forced = vio_log.env_forces_log_only()
+    return {"log_only": bool(config.get("log_only")) or forced, "log_only_forced_by_env": forced}
+
+
+def build_vio_command(config: dict) -> list:
+    """VIO command line for a configuration"""
     common_args = [
         "--fps", str(config["fps"]),
         "--camera-angle", str(config["camera_angle"]),
@@ -115,7 +122,16 @@ def launch_vio() -> subprocess.Popen:
             "--vio-iterations", str(config["vio_max_iterations"]),
             "--skip-frames", str(config["optical_flow_skip_frames"]),
         ]
-    
+    if log_only_status(config)["log_only"]:
+        cmd.append("--log-only")
+    return cmd
+
+
+def launch_vio() -> subprocess.Popen:
+    """Launch the VIO process for the saved configuration"""
+    config = load_config()
+    cmd = build_vio_command(config)
+
     env = os.environ.copy()
     env["PYTHONPATH"] = "/app/depthai-python"
     env["PYTHONUNBUFFERED"] = "1"
@@ -126,12 +142,19 @@ def launch_vio() -> subprocess.Popen:
         env=env,
         cwd="/app"
     )
-    print(f"Started {config['algorithm']} VIO process with PID {process.pid}", flush=True)
+    mode = " (LOG-ONLY)" if "--log-only" in cmd else ""
+    print(f"Started {config['algorithm']} VIO process with PID {process.pid}{mode}", flush=True)
     return process
 
 
+def record_supervisor_event(event, **fields):
+    """Append a supervisor event to supervisor.jsonl next to the VIO data logs"""
+    vio_log.append_event(vio_log.LOG_DIR / "supervisor.jsonl", event, **fields)
+
+
 # Restarts the VIO process if it exits without being stopped (e.g. a depthai segfault)
-supervisor = VIOSupervisor(launch_vio, log=lambda msg: print(msg, flush=True))
+supervisor = VIOSupervisor(launch_vio, log=lambda msg: print(msg, flush=True),
+                           on_event=record_supervisor_event)
 
 
 def start_vio():
@@ -246,6 +269,19 @@ async def index():
             opacity: 0;
             transition: opacity 0.3s;
         }
+        .log-only {
+            padding: 10px 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            background: #4d3d00;
+            color: #ffd54f;
+            font-weight: 600;
+        }
+        .checkbox { display: flex; align-items: center; gap: 10px; text-transform: none; font-size: 14px; color: #eee; }
+        .checkbox input { width: auto; }
+        .logs { list-style: none; padding: 0; margin: 0; }
+        .logs li { padding: 6px 0; border-bottom: 1px solid #222; font-size: 13px; }
+        .logs a { color: #00d4ff; }
         .toast.show { opacity: 1; }
         .toast.success { background: #00cc66; }
         .toast.error { background: #cc3333; }
@@ -259,6 +295,7 @@ async def index():
             <div class="status-dot"></div>
             <span id="status-text">Checking...</span>
         </div>
+        <div id="log-only-banner" class="log-only" hidden></div>
         
         <form id="config-form">
             <h2>📷 Camera Settings</h2>
@@ -340,6 +377,13 @@ async def index():
                     <label>Quality Rate (Hz)</label>
                     <input type="number" name="quality_rate" value="{quality_rate}" step="0.1" min="0.1" max="10">
                 </div>
+                <div class="field">
+                    <label class="checkbox">
+                        <input type="checkbox" name="log_only" {log_only_checked}>
+                        Log only: do not send anything to the autopilot
+                    </label>
+                    <div class="hint">No MAVLink output and no autopilot parameter changes; poses only go to the data log</div>
+                </div>
             </div>
             
             <div class="buttons">
@@ -349,6 +393,9 @@ async def index():
                 <button type="button" class="btn-secondary" onclick="resetDefaults()">↩️ Reset Defaults</button>
             </div>
         </form>
+
+        <h2>📝 Data Logs</h2>
+        <ul id="logs" class="logs"><li>Loading...</li></ul>
     </div>
     
     <div id="toast" class="toast"></div>
@@ -381,6 +428,36 @@ async def index():
                         el.className = 'status stopped';
                         text.textContent = 'VIO Stopped';
                     }
+                    const banner = document.getElementById('log-only-banner');
+                    banner.hidden = !data.log_only;
+                    banner.textContent = data.log_only_forced_by_env
+                        ? 'LOG-ONLY (forced by OAKD_LOG_ONLY on the container): nothing is sent to the autopilot'
+                        : 'LOG-ONLY: nothing is sent to the autopilot';
+                });
+        }
+
+        function updateLogs() {
+            fetch('/api/logs')
+                .then(r => r.json())
+                .then(logs => {
+                    const list = document.getElementById('logs');
+                    list.replaceChildren();
+                    if (!logs.length) {
+                        const item = document.createElement('li');
+                        item.textContent = 'No logs yet';
+                        list.appendChild(item);
+                    }
+                    for (const log of logs) {
+                        const item = document.createElement('li');
+                        const link = document.createElement('a');
+                        link.href = '/api/logs/' + encodeURIComponent(log.name);
+                        link.textContent = log.name;
+                        link.download = log.name;
+                        item.appendChild(link);
+                        item.append(' · ' + (log.size / 1024).toFixed(1) + ' KiB · '
+                            + new Date(log.mtime * 1000).toLocaleString());
+                        list.appendChild(item);
+                    }
                 });
         }
         
@@ -394,6 +471,8 @@ async def index():
                     config[key] = parseFloat(config[key]);
                 }
             }
+            // Unchecked checkboxes are missing from FormData
+            config.log_only = e.target.elements.log_only.checked;
             
             const res = await fetch('/api/config', {
                 method: 'POST',
@@ -441,10 +520,13 @@ async def index():
         // Update status every 5 seconds
         updateStatus();
         setInterval(updateStatus, 5000);
+        updateLogs();
+        setInterval(updateLogs, 15000);
     </script>
 </body>
 </html>
 """
+    html = html.replace("{log_only_checked}", "checked" if config.get("log_only") else "")
     # str.format() would choke on the CSS/JS braces in the template
     for key, value in config.items():
         html = html.replace("{" + key + "}", escape(str(value)))
@@ -468,8 +550,23 @@ async def set_config(config: VIOConfig):
 
 @app.get("/api/status")
 async def get_status():
-    """Get VIO process status, including automatic restarts"""
-    return supervisor.status()
+    """Get VIO process status, including automatic restarts and log-only mode"""
+    return {**supervisor.status(), **log_only_status()}
+
+
+@app.get("/api/logs")
+async def get_logs():
+    """List the data logs (name, size in bytes, mtime as unix time), newest first"""
+    return vio_log.list_logs(vio_log.LOG_DIR)
+
+
+@app.get("/api/logs/{name}")
+async def download_log(name: str):
+    """Download one data log; only plain .jsonl names directly inside the log directory"""
+    path = vio_log.resolve_log_file(name, vio_log.LOG_DIR)
+    if path is None:
+        raise HTTPException(status_code=404, detail="No such log")
+    return FileResponse(path, media_type="application/x-ndjson", filename=path.name)
 
 
 @app.post("/api/start")

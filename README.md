@@ -77,6 +77,7 @@ Open `http://<vehicle>:8095` (or the extension's entry in the BlueOS menu). Savi
 | PnP Features | 300 | PnP only: target number of features tracked on the camera. The Basalt settings above are ignored in PnP mode. |
 | Vehicle IP | 127.0.0.1 | Where mavlink2rest is reachable. The extension uses host networking, so the default works on the vehicle itself. |
 | Quality Rate (Hz) | 1 | Rate of the `NAMED_VALUE_FLOAT` quality messages. |
+| Log only | off | Run VIO as a passive logger: no autopilot parameter changes and no MAVLink output at all. See [Log-only mode](#log-only-mode). |
 
 The defaults are tuned for low CPU usage on a Raspberry Pi.
 
@@ -86,9 +87,28 @@ The page is backed by a small HTTP API:
 |---|---|---|
 | GET | `/api/config` | Current settings |
 | POST | `/api/config` | Save settings (JSON body, same keys) and restart VIO |
-| GET | `/api/status` | Whether the VIO process is running |
+| GET | `/api/status` | Whether the VIO process is running, restarts, and whether log-only mode is active (`log_only`, `log_only_forced_by_env`) |
+| GET | `/api/logs` | Data logs: name, size (bytes), mtime (unix time), newest first |
+| GET | `/api/logs/{name}` | Download one data log |
 | POST | `/api/start`, `/api/stop` | Start or stop VIO |
 | POST | `/api/reset` | Restore defaults and restart VIO |
+
+## Log-only mode and data logs
+
+On a vehicle whose EKF already uses ExternalNav (`VISO_TYPE` 1, `EK3_SRC1_VELXY` 6), every `VISION_POSITION_DELTA` the extension sends is fused. To record VIO without affecting the vehicle, turn on log-only mode in any of these ways:
+
+- tick *Log only: do not send anything to the autopilot* on the configuration page,
+- set `OAKD_LOG_ONLY=1` in the container environment; this forces log-only whatever the saved setting, and the page shows that it is forced,
+- run `pnp_vio.py` or `basalt_configurable.py` with `--log-only`.
+
+In log-only mode the autopilot parameters are neither read nor written and no MAVLink connection is created, so nothing reaches mavlink2rest. The VIO process logs `LOG-ONLY: no MAVLink output, autopilot params untouched` at startup.
+
+Each VIO process start writes a JSONL file to `/app/data/logs/` (`/usr/blueos/extensions/oakd-vio/logs/` on the vehicle), named `vio-YYYYmmdd-HHMMSS-<pid>.jsonl`, in both modes. Every line has `type`, `wall_time` (ISO, UTC), `unix_time` and `monotonic`. Lines are flushed as they are written.
+
+- `"type": "event"` lines: `start` (arguments, `log_only`), `warning`, `device_open` attempts, `device`, `calibration`, `tracking` changes, `error`, `exit`.
+- `"type": "step"` lines (PnP only): one per frame, with `device_timestamp`, `sequence`, `time_delta_us`, `position_delta` and `angle_delta` (body FRD, exactly what is or would be sent), `confidence`, `features`, `valid_depth`, `matches`, `inliers`, `proc_ms`, `status` (`ok` or `rejected`), `reason` and `sent`. The deltas are `null` for rejected frames.
+
+Basalt runs write the events only, not per-frame poses. The supervisor appends its launches, exits (code or signal), restarts and stops to `supervisor.jsonl` in the same directory. Nothing is rotated or deleted. The configuration page links to the files.
 
 ## Installing
 
@@ -154,6 +174,7 @@ The image is built in two stages so that the slow part only runs once:
 | `app/main.py` | Configuration web page and API; starts and stops the VIO process |
 | `app/vio_supervisor.py` | Restarts the VIO process with backoff when it exits unexpectedly |
 | `app/device_open.py` | Waits for the OAK-D and opens it, retrying with backoff |
+| `app/vio_log.py` | Log-only mode selection and the JSONL data logs |
 | `app/basalt_configurable.py` | The VIO pipeline: cameras, IMU, `BasaltVIO`, MAVLink output |
 | `app/autopilot_params.py` | Reads and sets the autopilot's EKF parameters through mavlink2rest |
 | `app/mavlink_node.py` | depthai host node that turns poses into MAVLink messages |

@@ -42,16 +42,19 @@ class VIOSupervisor:
     """
     launch() must return a started subprocess.Popen-like object (poll/terminate/wait/kill/pid).
     The watch thread calls poll() periodically; tests can call it directly with a fake clock.
+    on_event(event, **fields), if given, receives launches, exits, restarts and stops (e.g. to
+    write them to a log file); its errors are logged and otherwise ignored.
     """
 
     def __init__(self, launch, backoff=None, poll_interval=0.5, stop_timeout=5.0,
-                 clock=time.monotonic, log=print):
+                 clock=time.monotonic, log=print, on_event=None):
         self.launch = launch
         self.backoff = backoff or RestartBackoff()
         self.poll_interval = poll_interval
         self.stop_timeout = stop_timeout
         self.clock = clock
         self.log = log
+        self.on_event = on_event
 
         self.process = None
         self.wanted = False
@@ -116,10 +119,13 @@ class VIOSupervisor:
                 self.restart_at = now + delay
                 self.log(f"⚠️ VIO process exited unexpectedly ({describe_exit(returncode)}) after "
                          f"{run_time:.1f}s; restarting in {delay:.1f}s")
+                self._emit("exit", exit_code=returncode, description=describe_exit(returncode),
+                           run_time=run_time, restart_in=delay, restart_count=self.restart_count)
                 return
             if self.restart_at is not None and now >= self.restart_at:
                 self.restart_count += 1
                 self.log(f"🔁 Restarting VIO (restart #{self.restart_count})")
+                self._emit("restart", restart_count=self.restart_count)
                 self._launch()
 
     def _launch(self):
@@ -132,8 +138,10 @@ class VIOSupervisor:
             delay = self.backoff.next_delay(0.0)
             self.restart_at = self.clock() + delay
             self.log(f"❌ Failed to launch VIO ({e}); retrying in {delay:.1f}s")
+            self._emit("launch_failed", error=str(e), restart_in=delay, restart_count=self.restart_count)
             return
         self.started_at = self.clock()
+        self._emit("launch", pid=self.process.pid, restart_count=self.restart_count)
 
     def _stop_process(self):
         process, self.process = self.process, None
@@ -147,6 +155,16 @@ class VIOSupervisor:
             process.kill()
             process.wait()
         self.log("Stopped VIO process")
+        self._emit("stop", pid=process.pid, exit_code=process.poll(),
+                   description=describe_exit(process.poll()), restart_count=self.restart_count)
+
+    def _emit(self, event, **fields):
+        if self.on_event is None:
+            return
+        try:
+            self.on_event(event, **fields)
+        except Exception as e:
+            self.log(f"❌ Could not record supervisor event {event}: {e}")
 
     def _ensure_thread(self):
         if self._thread is not None and self._thread.is_alive():
