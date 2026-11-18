@@ -12,6 +12,11 @@ On-demand snapshots of the PnP VIO camera streams, taken without stopping or slo
    request time it serves.
 4. The endpoint waits up to ~3 s for a <stream>.json that serves its request.
 
+rect_left snapshots also carry the tracked features of the last processed frame ("overlay" in the JSON:
+position, inlier/outlier/unmatched and the position in the previous frame), built on the writer thread
+from references the VIO loop keeps anyway, so it costs nothing until a snapshot is asked for.
+/api/snapshot?overlay=1 draws it (draw_feature_overlay).
+
 Requests for the same stream coalesce in one file. This module is depthai-free so it can be unit tested.
 """
 
@@ -112,7 +117,63 @@ def wait_for_snapshot(stream, requested_at, raw=False, timeout=3.0, snapshot_dir
         sleep(poll)
 
 
+OVERLAY_COLORS = {"inlier": (113, 204, 46), "outlier": (60, 76, 231), "unmatched": (166, 163, 143)}  # BGR
+
+
+def draw_feature_overlay(png, overlay, image_size=None):
+    """
+    PNG bytes with the overlay's features drawn: inliers green, outliers (matched, rejected by RANSAC) red,
+    features without a match or depth grey, and a line from each feature's previous-frame position.
+    """
+    import cv2  # main.py must start even if OpenCV is broken
+    image = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_UNCHANGED)
+    if image is None or image.dtype != np.uint8:
+        raise ValueError("the feature overlay needs an 8-bit image")
+    if image.ndim == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    width, height = image_size or overlay.get("image_size") or (image.shape[1], image.shape[0])
+    sx, sy = image.shape[1] / float(width), image.shape[0] / float(height)
+    for u, v, status, pu, pv in overlay.get("points", ()):
+        color = OVERLAY_COLORS.get(status, OVERLAY_COLORS["unmatched"])
+        centre = (int(round(u * sx)), int(round(v * sy)))
+        if pu is not None and pv is not None:
+            cv2.line(image, (int(round(pu * sx)), int(round(pv * sy))), centre, color, 1, cv2.LINE_AA)
+        cv2.circle(image, centre, 2 if status == "unmatched" else 4, color, 1, cv2.LINE_AA)
+    return encode_png(image)
+
+
 # --- VIO process side -----------------------------------------------------------------------------
+
+def build_overlay(ids, uv, matched_index, inlier_index, previous_ids, previous_uv, sequence=None, image_size=None,
+                  ok=None, reason=None):
+    """
+    Feature overlay of one processed frame: [u, v, status, previous u, previous v] per feature, status
+    inlier / outlier / unmatched. inlier_index refers to matched_index, which refers to ids/uv.
+    """
+    ids = np.asarray(ids).ravel().tolist()
+    uv = np.asarray(uv, dtype=np.float64).reshape(-1, 2)
+    status = ["unmatched"] * len(ids)
+    matched = [] if matched_index is None else np.asarray(matched_index).ravel().tolist()
+    for k in matched:
+        status[k] = "outlier"
+    if inlier_index is not None:
+        for j in np.asarray(inlier_index).ravel().tolist():
+            if 0 <= j < len(matched):
+                status[matched[j]] = "inlier"
+    previous = {}
+    if previous_ids is not None and previous_uv is not None:
+        previous_uv = np.asarray(previous_uv, dtype=np.float64).reshape(-1, 2)
+        previous = dict(zip(np.asarray(previous_ids).ravel().tolist(), previous_uv.tolist()))
+    points = []
+    for k, feature_id in enumerate(ids):
+        prev = previous.get(feature_id)
+        points.append([round(float(uv[k, 0]), 1), round(float(uv[k, 1]), 1), status[k],
+                       None if prev is None else round(prev[0], 1), None if prev is None else round(prev[1], 1)])
+    return {"sequence": sequence, "image_size": None if image_size is None else list(image_size), "ok": ok,
+            "reason": reason or None, "points": points,
+            "inliers": status.count("inlier"), "outliers": status.count("outlier"),
+            "unmatched": status.count("unmatched")}
+
 
 def colorize_depth(depth_mm, min_mm=300, max_mm=4000):
     """uint16 depth (mm) -> BGR image, near = red, far = blue, invalid (0) = black."""
@@ -194,6 +255,7 @@ class SnapshotWriter:
             try:
                 if item[0] == "frame":
                     _, stream, load, meta = item
+                    meta = {key: value() if callable(value) else value for key, value in meta.items()}
                     write_snapshot(self.snapshot_dir, stream, load(), meta, self.depth_range_mm)
                 else:
                     _, stream, requested_at, error = item
@@ -209,14 +271,18 @@ class SnapshotService:
 
     send_request(stream) must ask the device for one frame of stream without blocking.
     unavailable maps streams that can't be served (e.g. no CAM_A) to the error to answer with.
+    overlay(), if given, is called when a rect_left frame arrives and returns a zero-argument function
+    (run on the writer thread) that builds that snapshot's feature overlay, or None.
     """
 
     def __init__(self, available, send_request, writer, snapshot_dir=SNAPSHOT_DIR, unavailable=None,
-                 min_interval=1.0, poll_interval=0.2, reply_timeout=2.0, clock=time.monotonic, log=print):
+                 min_interval=1.0, poll_interval=0.2, reply_timeout=2.0, clock=time.monotonic, log=print,
+                 overlay=None):
         self.available = set(available)
         self.unavailable = dict(unavailable or {})
         self.send_request = send_request
         self.writer = writer
+        self.overlay = overlay
         self.request_dir = Path(snapshot_dir) / "requests"
         self.min_interval = min_interval
         self.poll_interval = poll_interval
@@ -262,6 +328,10 @@ class SnapshotService:
         self.pending = None
         meta = {"requested_at": requested_at, "unix_time": time.time(),
                 "device_timestamp": device_timestamp, "sequence": sequence}
+        if stream == "rect_left" and self.overlay is not None:
+            build = self.overlay()
+            if build is not None:
+                meta["overlay"] = build
         self.served += 1
         return self.writer.submit(stream, lambda: load(stream), meta)
 

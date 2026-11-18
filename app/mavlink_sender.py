@@ -21,6 +21,7 @@ class MavlinkSender:
         self.reconnect_interval = reconnect_interval
         self.ws = None
         self.connected = False
+        self.last_error = None  # last connection or send problem, for the web page's output status
         self._last_connect_attempt = 0.0
         self._start = time.monotonic()
 
@@ -36,10 +37,12 @@ class MavlinkSender:
         def on_close(ws, close_status_code, close_msg):
             logger.warning("WebSocket connection closed")
             self.connected = False
+            self.last_error = f"websocket closed ({time.strftime('%H:%M:%S')})"
 
         def on_error(ws, error):
             logger.error(f"WebSocket error: {error}")
             self.connected = False
+            self.last_error = f"websocket error: {error} ({time.strftime('%H:%M:%S')})"
 
         self.ws = websocket.WebSocketApp(self.mavlink_host, on_open=on_open, on_close=on_close, on_error=on_error)
         threading.Thread(target=self.ws.run_forever, daemon=True).start()
@@ -65,6 +68,7 @@ class MavlinkSender:
         except Exception as e:
             logger.error(f"Error sending {message_type} via WebSocket: {e}")
             self.connected = False
+            self.last_error = f"send {message_type} failed: {e} ({time.strftime('%H:%M:%S')})"
             return False
 
     def send_vision_position_delta(self, angle_delta, position_delta, time_delta_us, confidence, timestamp_us=None):

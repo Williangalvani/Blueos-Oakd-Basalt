@@ -8,6 +8,7 @@ rotation prior (pnp_odometry.py), then sends VISION_POSITION_DELTA over MAVLink.
 """
 
 import argparse
+import math
 import os
 import signal
 import sys
@@ -24,6 +25,7 @@ from loguru import logger
 
 import depth_probe
 import snapshots
+import vio_telemetry
 from autopilot_params import AutopilotParams
 from device_open import DEFAULT_TIMEOUT, DeviceOpenTimeout, open_oak_device
 from mavlink_sender import MavlinkSender
@@ -114,6 +116,8 @@ def parse_args(argv=None):
     parser.add_argument('--snapshots', action=argparse.BooleanOptionalAction, default=True,
                         help='On-demand camera snapshots for /api/snapshot (no bandwidth until requested)')
     parser.add_argument('--snapshot-dir', type=Path, default=snapshots.SNAPSHOT_DIR)
+    parser.add_argument('--telemetry-dir', type=Path, default=None,
+                        help='Live status and plot history for the web page (default: <snapshot-dir>/telemetry)')
 
     parser.add_argument('--vehicle-ip', default='127.0.0.1')
     parser.add_argument('--quality-rate', type=float, default=1.0)
@@ -160,8 +164,9 @@ class GyroBuffer:
 
 
 class Stats:
-    def __init__(self, device=None):
-        self.device = device
+    def __init__(self, temperature=None):
+        # Returns the last sampled chip temperature (°C) or None; sampled off the VIO loop by Telemetry
+        self.temperature = temperature
         self.reset()
 
     def reset(self):
@@ -189,12 +194,8 @@ class Stats:
             self.reference_resets += frame.reference_reset
 
     def chip_temperature(self):
-        if self.device is None:
-            return ""
-        try:
-            return f", chip {self.device.getChipTemperature().average:.1f}°C"
-        except Exception:
-            return ""
+        value = self.temperature() if self.temperature is not None else None
+        return "" if value is None else f", chip {value:.1f}°C"
 
     def maybe_report(self):
         elapsed = time.monotonic() - self.start
@@ -444,6 +445,40 @@ def snapshot_frame(msg, stream):
     return msg.getCvFrame() if stream == "rgb" else msg.getFrame()
 
 
+def body_yaw(R_cam, camera_angle):
+    """Yaw (rad, about body z down) of a camera-frame rotation R_01."""
+    R = camera_to_body_rotation(R_cam, camera_angle)
+    return math.atan2(R[1, 0], R[0, 0])
+
+
+@dataclass
+class OverlayState:
+    """References to the last processed frame's features, kept for the snapshot overlay (no copies)."""
+    ids: object = None
+    uv: object = None
+    previous_ids: object = None
+    previous_uv: object = None
+    matched_index: object = None
+    inlier_index: object = None
+    sequence: Optional[int] = None
+    ok: Optional[bool] = None
+    reason: Optional[str] = None
+
+    def update(self, ids, uv, frame, sequence):
+        self.previous_ids, self.previous_uv = self.ids, self.uv
+        self.ids, self.uv, self.sequence = ids, uv, sequence
+        self.matched_index, self.inlier_index = frame.matched_index, frame.pose.inlier_index
+        self.ok, self.reason = frame.pose.ok, frame.pose.reason
+
+    def builder(self, image_size):
+        """A function building this frame's overlay later (on the snapshot writer thread), or None."""
+        if self.ids is None:
+            return None
+        values = (self.ids, self.uv, self.matched_index, self.inlier_index, self.previous_ids, self.previous_uv,
+                  self.sequence, image_size, self.ok, self.reason)
+        return lambda: snapshots.build_overlay(*values)
+
+
 def _raise_system_exit(signum, frame):
     # The supervisor stops us with SIGTERM; exit through the finally blocks so the log gets its exit line
     raise SystemExit(128 + signum)
@@ -493,12 +528,26 @@ def main(argv=None):
 
 
 def run(args, log_only, data_log, stereo_settings):
+    telemetry = vio_telemetry.Telemetry(args.telemetry_dir or args.snapshot_dir / "telemetry", fps=args.fps,
+                                        min_inliers=args.min_inliers, mode="log-only" if log_only else "sending",
+                                        log=logger.warning)
+    telemetry.set_phase("opening_device")
+    telemetry.start()
+    try:
+        run_pipeline(args, log_only, data_log, stereo_settings, telemetry)
+    finally:
+        telemetry.close()
+
+
+def run_pipeline(args, log_only, data_log, stereo_settings, telemetry):
     def log_warning(message):
         logger.warning(message)
         data_log.event("warning", message=message)
 
     mavlink = setup_autopilot_output(log_only, args.vehicle_ip, AutopilotParams, MavlinkSender,
                                      log=log_warning)
+    if mavlink:
+        telemetry.output_error = lambda: mavlink.last_error
 
     params = PnPParams(
         min_inliers=args.min_inliers,
@@ -524,6 +573,8 @@ def run(args, log_only, data_log, stereo_settings):
         if mavlink:
             mavlink.close()
         sys.exit(2)
+    telemetry.temperature = device.getChipTemperature
+    telemetry.set_phase("configuring")
 
     writer = None
     try:
@@ -556,10 +607,11 @@ def run(args, log_only, data_log, stereo_settings):
                 args.depth_scale, (args.width, args.height), log=logger.warning,
                 refractive_index=args.refractive_index)
             gyro = GyroBuffer()
-            stats = Stats(device)
+            stats = Stats(lambda: telemetry.chip_temperature)
             tracking = None
             last_quality_time = 0.0
             previous_ids = set()
+            overlay = OverlayState()
 
             recovery = TrackingRecovery(args.recovery_frames)
             reinit = FeatureTrackerReinit(lambda maintainer: handles.feature_config_queue.send(
@@ -575,11 +627,13 @@ def run(args, log_only, data_log, stereo_settings):
                 log=logger.warning)
             snapshot_service = snapshots.SnapshotService(
                 handles.snapshot_streams, send_snapshot_request, writer, args.snapshot_dir,
-                unavailable=handles.snapshot_unavailable, log=logger.warning)
+                unavailable=handles.snapshot_unavailable, log=logger.warning,
+                overlay=lambda: overlay.builder((args.width, args.height)))
             data_log.event("snapshots", streams=list(handles.snapshot_streams),
                            unavailable=handles.snapshot_unavailable)
 
             p.start()
+            telemetry.set_phase("running")
             print("✅ Pipeline started!")
             if log_only:
                 logger.warning(f"⚠️ {LOG_ONLY_BANNER}")
@@ -642,14 +696,16 @@ def run(args, log_only, data_log, stereo_settings):
 
                 frame = odometry.process(ids, uv, depth, t, R_prior)
                 pose = frame.pose
+                overlay.update(ids, uv, frame, depth_msg.getSequenceNum())
 
-                angle_delta = position_delta = time_delta_us = None
+                angle_delta = position_delta = time_delta_us = yaw_delta = None
                 sent = False
                 if pose.ok:
                     # Exactly what goes (or would go) into VISION_POSITION_DELTA
                     angle_delta = camera_to_body_frd(pose.angle_delta, args.camera_angle)
                     position_delta = camera_to_body_frd(pose.position_delta, args.camera_angle)
                     time_delta_us = frame.dt * 1e6
+                    yaw_delta = body_yaw(R_prior, args.camera_angle) if R_prior is not None else angle_delta[2]
                     if mavlink:
                         sent = mavlink.send_vision_position_delta(
                             angle_delta=angle_delta,
@@ -667,6 +723,7 @@ def run(args, log_only, data_log, stereo_settings):
                         odometry.reset()
                         reinit.start()
                         stats.recoveries += 1
+                        telemetry.record_recovery()
                         logger.warning(f"🔄 Tracking recovery #{recovery.count} after {failed_frames} failed frames "
                                        f"({pose.reason}, features {frame.features}, depth {frame.valid_depth}): "
                                        f"PnP reference reset, feature tracker re-initialised; "
@@ -710,6 +767,9 @@ def run(args, log_only, data_log, stereo_settings):
                     reference_reset=frame.reference_reset,
                     **lever,
                 )
+                telemetry.record_frame(time.time(), pose.ok, pose.reason, frame.features, frame.valid_depth,
+                                       pose.matches, pose.inliers, proc_ms, frame.dt, position_delta, yaw_delta,
+                                       frame.gap_frames, frame.reference_reset, sent)
 
                 now = time.monotonic()
                 if now_tracking is not None and now_tracking != tracking:

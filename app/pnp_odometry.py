@@ -151,6 +151,8 @@ class PoseResult:
     confidence: float = 0.0
     reprojection_rms_px: float = float("nan")
     gyro_disagreement_deg: float = float("nan")
+    # RANSAC inliers as indices into the matched points (None if RANSAC did not run)
+    inlier_index: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -167,6 +169,8 @@ class FrameResult:
     gap_frames: int = 0
     # This frame failed and replaced a reference that was too old or had too few matches left
     reference_reset: bool = False
+    # Indices into this frame's ids/uv of the features matched to the reference (pose.inlier_index refers to these)
+    matched_index: Optional[np.ndarray] = None
     extra: Dict = field(default_factory=dict)
 
 
@@ -349,7 +353,7 @@ def solve_relative_pose(points_prev, uv_curr, intrinsics, R_prior=None, params=P
 
     inlier_idx = inlier_idx.ravel()
     n_in = len(inlier_idx)
-    result = PoseResult(ok=False, matches=n, inliers=n_in)
+    result = PoseResult(ok=False, matches=n, inliers=n_in, inlier_index=inlier_idx)
     if n_in < params.min_inliers or n_in / n < params.min_inlier_ratio:
         result.reason = "too_few_inliers"
         return result
@@ -445,7 +449,10 @@ class PnPOdometry:
 
         frame.dt = frame.reference_age_s = timestamp - self.prev_timestamp
         frame.gap_frames = self.gap_frames
-        matched = [(self.prev_points[i], uv[k]) for k, i in enumerate(ids.tolist()) if i in self.prev_points]
+        id_list = ids.tolist()
+        matched_index = [k for k, i in enumerate(id_list) if i in self.prev_points]
+        frame.matched_index = np.asarray(matched_index, dtype=np.int64)
+        matched = [(self.prev_points[id_list[k]], uv[k]) for k in matched_index]
         if frame.dt <= 0:
             # Repeated or out of order: leave the reference alone, never adopt an older frame
             frame.pose = PoseResult(ok=False, reason="non_increasing_timestamp", matches=len(matched))

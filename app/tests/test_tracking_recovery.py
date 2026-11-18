@@ -4,6 +4,7 @@ import os
 import signal
 import sys
 import time
+from collections import Counter
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -298,6 +299,31 @@ def test_run_recovers_from_feature_collapse(pnp_vio, monkeypatch, tmp_path):
         snapshots.STREAMS.index("depth")]
     assert (tmp_path / "snapshots" / "depth_raw.png").exists()
     assert snapshots.read_metadata("depth", tmp_path / "snapshots")["sequence"] == 99
+
+
+def test_run_feeds_the_web_telemetry(pnp_vio, monkeypatch, tmp_path):
+    created = []
+    real = pnp_vio.vio_telemetry.Telemetry
+    monkeypatch.setattr(pnp_vio.vio_telemetry, "Telemetry",
+                        lambda *a, **kw: created.append(real(*a, **kw)) or created[-1])
+    lines, _ = run_fake(pnp_vio, monkeypatch, tmp_path, scenario(n_lost=35),
+                        ["--recovery-frames", "10", "--telemetry-dir", str(tmp_path / "telemetry")])
+    steps = [line for line in lines if line["type"] == "step"]
+    (telemetry,) = created
+    assert telemetry.directory == tmp_path / "telemetry" and telemetry.mode == "log-only"
+
+    telemetry.write_status()
+    telemetry.write_history()
+    status = pnp_vio.vio_telemetry.read_status(tmp_path / "telemetry")
+    rows, _ = pnp_vio.vio_telemetry.HistoryReader().read(tmp_path / "telemetry")
+    assert status["phase"] == "running" and status["frames_total"] == len(steps)
+    assert status["ok_total"] == sum(s["status"] == "ok" for s in steps) and status["recoveries"] == 2
+    reasons = {r["reason"]: r["count"] for r in status["failures"]["by_reason"]}
+    assert reasons == Counter(s["reason"] for s in steps if s["status"] != "ok")
+    assert reasons["too_few_matches"] > 30 and reasons["no_reference"] >= 2
+    assert len(rows) == len(steps)
+    ok = rows[:, pnp_vio.vio_telemetry.COLUMN["ok"]]
+    assert list(ok) == [1.0 if s["status"] == "ok" else 0.0 for s in steps]
 
 
 def test_run_without_recovery_never_reinitialises(pnp_vio, monkeypatch, tmp_path):
