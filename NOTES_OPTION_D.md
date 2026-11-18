@@ -20,6 +20,7 @@ Prototype on branch `option-d-pnp`. **Not run on hardware yet.**
 | `app/tests/test_rectified_intrinsics.py`, `test_depth_probe.py` | Rectified K against the dumped calibration (`app/tests/data/calib_oakd_w_poe.json`), source selection, focal check on synthetic and real frames (`app/tests/data/snap4/`), and the probe service and endpoints. |
 | `app/tests/test_stereo_config.py`, `test_snapshots.py`, `test_tracking_recovery.py` | Plumbing, IPC/endpoint, and recovery tests. These include a `pnp_vio.run()` with a fake device that replays the collapse seen in the pool test. |
 | `app/tests/test_pnp_odometry.py` | pytest unit tests on synthetic scenes. |
+| `app/tests/test_autopilot_params.py` | `SUGGESTED_OPTICAL_HOLD_PARAMS` and `diff_params` (task 9), and a pin on the unchanged auto-configuration. No autopilot access (`urlopen` is refused). |
 | `app/tests/test_device_open.py`, `app/tests/test_vio_supervisor.py` | Backoff and restart-policy tests (fake clock, and real subprocesses that exit or SIGSEGV). |
 
 `main.py` is not wired up. On this branch it has no algorithm selector, so adding one wasn't trivial. Run it by hand:
@@ -134,6 +135,12 @@ python /app/pnp_vio.py --fps 15 --width 640 --height 400 --num-features 300 --ve
   - the focal check on a synthetic pair and on the real `snap4` frames (f ≈ 167.7);
   - probe statistics, the service under a fake clock, and a micro-benchmark;
   - the endpoints, and a `pnp_vio.run()` serving a probe mid-run.
+- Refractive index, lever arm, MAVLink output and suggested parameters (task 9): 284 tests. They add:
+  - the refracted K and depth, n = 1 identity, validation and clamping;
+  - a synthetic flat-port scene, where n recovers the true motion and n = 1 shrinks only the axial part;
+  - the lever-arm math against explicit world poses, and a spinning-vehicle `pnp_vio.run()`;
+  - the log-only-off output path over a fake websocket;
+  - `diff_params`.
 - Snapshot host overhead on a desktop with a 300-feature PnP frame: 0.9 ms/frame without snapshots, 1.0 ms with a request every frame (`/tmp/bench_snapshots.py`, not in the repo).
 
 ## To verify on hardware
@@ -241,3 +248,4 @@ Not checked on hardware: whether the 1 s settle delay is enough to avoid the seg
 - `rtabmap_vio.py` in the other checkout sets `initialConfig.FeatureMaintainer.minimumDistanceBetweenFeatures = 49`. That assigns an attribute on the nested *class*, not on the config, so it has no effect. The config's fields aren't exposed in the Python bindings; use `setFeatureMaintainer(...)` instead.
 - The gyro prior isn't used to pre-filter matches before RANSAC. With the EPnP kernel, the initial guess mostly matters for the final LM refine; the gyro's main job is the gate.
 - Accelerometer data is collected but unused. Metric scale comes from stereo depth.
+- `VISUAL_ODOMETRY_PARAMS` (the automatic setup, unchanged) sets `EK3_SRC1_POSXY` to 6 (ExternalNav), but the extension never sends an absolute position. `SUGGESTED_OPTICAL_HOLD_PARAMS` suggests 0 (None). It also adds `VISO_POS_*`, `VISO_ORIENT` 0 and `EK3_SRC1_YAW` 1, which the automatic setup leaves alone.

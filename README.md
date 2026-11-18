@@ -38,6 +38,23 @@ EK3_SRC1_POSZ = 1 (already set)
 Reboot the autopilot for VISO_TYPE to take effect
 ```
 
+### Suggested parameters for optical position hold (not applied)
+
+`SUGGESTED_OPTICAL_HOLD_PARAMS` in [`app/autopilot_params.py`](app/autopilot_params.py) lists what position hold on `VISION_POSITION_DELTA` should use: name, suggested value, whether it needs a reboot, and why. `diff_params(current)` compares it with a `{name: value}` dict and returns the entries that differ or are missing, with status `change` or `missing`. Float32 rounding is ignored. A later UI will use it. Nothing writes these to the autopilot, and the automatic setup above is unchanged.
+
+| Parameter | Suggested | Reboot | Why |
+|---|---|---|---|
+| `VISO_TYPE` | 1 | yes | MAVLink visual odometry. |
+| `VISO_POS_X/Y/Z` | 0.1655, −0.0069, 0.180 | no | Camera relative to the IMU, m FRD, from the CAD. EKF3 applies this lever arm itself (see [Lever arm](#lever-arm-viso_pos-pnp)). |
+| `VISO_ORIENT` | 0 | no | The extension already rotates into body FRD. |
+| `VISO_DELAY_MS` | keep | no | Unverified; tune from logs. |
+| `EK3_SRC1_VELXY` | 6 | no | Fuse the visual body velocity. |
+| `EK3_SRC1_POSXY` | 0 | no | None: the EKF dead-reckons a relative position from the visual velocity, which ArduSub accepts for position hold with visual odometry enabled. 3 (GPS) only helps with a fix at the surface. |
+| `EK3_SRC1_POSZ` | 1 | no | Baro (depth). |
+| `EK3_SRC1_YAW` | 1 | no | Compass: the deltas carry no heading. |
+
+The automatic setup sets `EK3_SRC1_POSXY` to 6 (ExternalNav). That asks for an absolute position this extension never sends; with only `VISION_POSITION_DELTA` the EKF ends up in relative aiding, as with 0.
+
 ## MAVLink output
 
 Messages are sent with component ID 195 (`MAV_COMP_ID_VISUAL_INERTIAL_ODOMETRY`) to `ws://<vehicle_ip>/mavlink2rest/ws/mavlink`.
@@ -158,7 +175,7 @@ The camera is about 0.17 m forward and 0.18 m below the IMU. When the vehicle ro
 - `AP_VisualOdom_Backend::handle_vision_position_delta_msg` (`libraries/AP_VisualOdom/AP_VisualOdom_Backend.cpp`, ~l.62–69) passes `_frontend.get_pos_offset()`, i.e. `VISO_POS_X/Y/Z`, to `AP::ahrs().writeBodyFrameOdom(...)`.
 - EKF3 (`libraries/AP_NavEKF3/AP_NavEKF3_PosVelFusion.cpp`, ~l.1493–1498) predicts the sensor velocity as the body velocity plus `(delAng / delAngDT) × posOffsetBody`, with `posOffsetBody = VISO_POS − INS_POS`. So `VISO_POS_*` is relative to the vehicle origin; with `INS_POS_*` at 0 that is the IMU.
 
-Set `VISO_POS_X/Y/Z` on the autopilot to the lever arm (0.1655, −0.0069, 0.180 m from the CAD). *Lever arm diagnostics* only adds JSONL step fields, for comparing the two in logs:
+Set `VISO_POS_X/Y/Z` on the autopilot to the lever arm (0.1655, −0.0069, 0.180 m from the CAD; see [Suggested parameters](#suggested-parameters-for-optical-position-hold-not-applied)). *Lever arm diagnostics* only adds JSONL step fields, for comparing the two in logs:
 
 - `lever_delta_position`: the IMU delta, `position_delta − (r − Rᵀr)`, body FRD, m;
 - `lever_delta_correction`: the `r − Rᵀr` term;

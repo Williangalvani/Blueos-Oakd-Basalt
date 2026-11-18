@@ -3,9 +3,15 @@ Configures the autopilot's EKF to fuse the VISION_POSITION_DELTA messages sent b
 """
 
 import json
+import math
 import time
 import urllib.request
+from dataclasses import dataclass
+from typing import Optional
+
 from loguru import logger
+
+from stereo_config import DEFAULT_LEVER_ARM_M
 
 # (name, value, takes effect only after an autopilot reboot)
 VISUAL_ODOMETRY_PARAMS = [
@@ -16,6 +22,74 @@ VISUAL_ODOMETRY_PARAMS = [
     ("EK3_SRC1_VELXY", 6, False),  # ExternalNav
     ("EK3_SRC1_POSZ", 1, False),   # Baro
 ]
+
+
+@dataclass(frozen=True)
+class SuggestedParam:
+    name: str
+    value: Optional[float]  # None: keep the vehicle's value (listed for review only)
+    needs_reboot: bool
+    rationale: str
+
+
+# Optical position hold with VISION_POSITION_DELTA (ArduSub, EKF3). Suggestions for a later UI; nothing
+# here is written to the autopilot (configure_visual_odometry still uses VISUAL_ODOMETRY_PARAMS).
+SUGGESTED_OPTICAL_HOLD_PARAMS = (
+    SuggestedParam("VISO_TYPE", 1, True, "MAVLink visual odometry: accept VISION_POSITION_DELTA from this extension."),
+    SuggestedParam("VISO_POS_X", DEFAULT_LEVER_ARM_M[0], False,
+                   "Camera forward of the IMU (m, FRD, from the CAD). EKF3 adds (gyro rate) x VISO_POS to the "
+                   "predicted camera velocity, so the extension sends uncorrected camera deltas. Relative to the "
+                   "vehicle origin: subtract INS_POS_X if that is not 0."),
+    SuggestedParam("VISO_POS_Y", DEFAULT_LEVER_ARM_M[1], False, "Camera right of the IMU (m, FRD, from the CAD)."),
+    SuggestedParam("VISO_POS_Z", DEFAULT_LEVER_ARM_M[2], False, "Camera below the IMU (m, FRD, from the CAD)."),
+    SuggestedParam("VISO_ORIENT", 0, False,
+                   "Forward: the extension already rotates the deltas into body FRD with its Camera Angle, so "
+                   "any other orientation would rotate them twice."),
+    SuggestedParam("VISO_DELAY_MS", None, False,
+                   "Keep the current value (default 10 ms); unverified. The EKF stamps each delta on arrival minus "
+                   "this delay. A delta averages its interval, so its true delay is about half a frame interval "
+                   "plus the pipeline latency; tune it from logs (range 0-250 ms)."),
+    SuggestedParam("EK3_SRC1_VELXY", 6, False,
+                   "ExternalNav: fuse the VISION_POSITION_DELTA body velocity for horizontal velocity."),
+    SuggestedParam("EK3_SRC1_POSXY", 0, False,
+                   "0 None: VISION_POSITION_DELTA carries no absolute position, so the EKF dead-reckons a relative "
+                   "position from the visual velocity; ArduSub accepts that for position hold when visual odometry "
+                   "is enabled. 3 GPS only helps with a GPS fix at the surface (lost when submerged). The current "
+                   "auto-configuration sets 6 ExternalNav, an absolute position this extension never sends."),
+    SuggestedParam("EK3_SRC1_POSZ", 1, False, "Baro: depth from the pressure sensor."),
+    SuggestedParam("EK3_SRC1_YAW", 1, False,
+                   "Compass: the body-frame deltas carry no heading, so heading for an earth-frame hold comes from "
+                   "the compass."),
+)
+
+
+def _same_value(current, wanted):
+    # Autopilot parameters are float32: 0.1655 comes back as 0.16550000011920929
+    return math.isclose(float(current), float(wanted), rel_tol=1e-6, abs_tol=1e-6)
+
+
+def diff_params(current: dict) -> list:
+    """
+    Suggested optical-hold parameters that differ from `current` (name -> value, e.g. read from the
+    autopilot), in SUGGESTED_OPTICAL_HOLD_PARAMS order. Each entry: name, current (None if missing),
+    suggested, needs_reboot, rationale and status ("change" or "missing"). Keep-current entries are skipped.
+    Pure: reads nothing from and writes nothing to the autopilot.
+    """
+    diff = []
+    for param in SUGGESTED_OPTICAL_HOLD_PARAMS:
+        if param.value is None:
+            continue
+        value = current.get(param.name)
+        if value is not None:
+            try:
+                if _same_value(value, param.value):
+                    continue
+            except (TypeError, ValueError):
+                pass
+        diff.append({"name": param.name, "current": value, "suggested": param.value,
+                     "needs_reboot": param.needs_reboot, "rationale": param.rationale,
+                     "status": "missing" if value is None else "change"})
+    return diff
 
 MAV_MODE_FLAG_SAFETY_ARMED = 128
 
