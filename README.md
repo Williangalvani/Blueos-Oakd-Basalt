@@ -82,6 +82,8 @@ Open `http://<vehicle>:8095` (or the extension's entry in the BlueOS menu). Savi
 | PnP Intrinsics Override | empty | PnP only: `fx,fy,cx,cy` in pixels on the width × height grid (`--intrinsics-override`). Wins over the source. Empty = off. |
 | PnP Depth Scale | 1.0 | PnP only: extra trim on the camera depth before back-projection, on top of the refractive index (`--depth-scale`, 0.2–5). Translation scales with it. Use it for a residual measured with the [depth probe](#depth-probe-pnp). |
 | PnP Refractive Index (water) | 1.333 | PnP only: the water in front of the flat port (`--refractive-index`, 1–2). 1.333 is fresh water and about 1.34 sea water. **Set 1.0 for tests in air.** See [Water (refractive index)](#water-refractive-index-pnp). |
+| Lever arm diagnostics (log only) | off | PnP only, **diagnostics only**: also log each delta corrected to the IMU (`--lever-arm`). It never changes what is sent; the autopilot applies `VISO_POS_X/Y/Z` itself. See [Lever arm](#lever-arm-viso_pos-pnp). |
+| Lever Arm x,y,z (m) | 0.1655,-0.0069,0.18 | Camera relative to the IMU in body FRD, from the CAD (`--lever-arm-m`). Only used by the diagnostics. |
 | Vehicle IP | 127.0.0.1 | Where mavlink2rest is reachable. The extension uses host networking, so the default works on the vehicle itself. |
 | Quality Rate (Hz) | 1 | Rate of the `NAMED_VALUE_FLOAT` quality messages. |
 | Log only | off | Run VIO as a passive logger: no autopilot parameter changes and no MAVLink output at all. See [Log-only mode](#log-only-mode). |
@@ -140,6 +142,21 @@ The calibration is done in air, but underwater the camera looks through a flat p
 What this changes: with K and depth both scaled by n, the lateral back-projection X = (u − cx)·Z/fx does not change. So for the same pixel motion, n scales the translation **along the optical axis** by n, and leaves the sideways components alone (tested on a synthetic flat-port scene). For a camera looking down, that is the vertical component. In the old model, a depth scale of 1.33 scaled every axis, which was wrong for the lateral ones. Beyond the paraxial approximation a flat port also bends rays near the image edges; that is not modelled.
 
 The in-air matrix, `effective_intrinsics` (with n), `refractive_index`, `depth_scale` and `total_depth_scale` (n × depth scale) are in the JSONL `intrinsics` event and in `/api/status` → `camera`. The page's status area shows them too. The focal check keeps using the in-air matrix, because the device depth is computed with the in-air focal length.
+
+### Lever arm (VISO_POS) (PnP)
+
+The camera is about 0.17 m forward and 0.18 m below the IMU. When the vehicle rotates, the camera swings on that lever arm, so its measured delta includes a displacement r − Rᵀr (to first order ω × r·dt) that the IMU did not make. **ArduPilot corrects this itself for `VISION_POSITION_DELTA`**, so the extension sends the camera's own delta (rotated into body FRD) and must not correct it a second time. In the ArduPilot source (`~/git/ardupilot`):
+
+- `AP_VisualOdom_Backend::handle_vision_position_delta_msg` (`libraries/AP_VisualOdom/AP_VisualOdom_Backend.cpp`, ~l.62–69) passes `_frontend.get_pos_offset()`, i.e. `VISO_POS_X/Y/Z`, to `AP::ahrs().writeBodyFrameOdom(...)`.
+- EKF3 (`libraries/AP_NavEKF3/AP_NavEKF3_PosVelFusion.cpp`, ~l.1493–1498) predicts the sensor velocity as the body velocity plus `(delAng / delAngDT) × posOffsetBody`, with `posOffsetBody = VISO_POS − INS_POS`. So `VISO_POS_*` is relative to the vehicle origin; with `INS_POS_*` at 0 that is the IMU.
+
+Set `VISO_POS_X/Y/Z` on the autopilot to the lever arm (0.1655, −0.0069, 0.180 m from the CAD). *Lever arm diagnostics* only adds JSONL step fields, for comparing the two in logs:
+
+- `lever_delta_position`: the IMU delta, `position_delta − (r − Rᵀr)`, body FRD, m;
+- `lever_delta_correction`: the `r − Rᵀr` term;
+- `lever_delta_rotation`: `gyro` (the gyro rotation over the delta's interval) or `pnp` (the PnP rotation, when there is no gyro prior).
+
+They are `null` on frames without a delta, absent when the setting is off, and never sent.
 
 Depth is not gated with the stereo confidence map. On the camera, the `confidenceMap` output gets no left-right check, alignment or post-processing, so it doesn't match the depth pixels. Streaming it would also add about 20 Mbit/s, and the confidence threshold above already applies the same score on the camera.
 
@@ -246,7 +263,7 @@ In log-only mode the autopilot parameters are neither read nor written and no MA
 
 Each VIO process start writes a JSONL file to `/app/data/logs/` (`/usr/blueos/extensions/oakd-vio/logs/` on the vehicle), named `vio-YYYYmmdd-HHMMSS-<pid>.jsonl`, in both modes. Every line has `type`, `wall_time` (ISO, UTC), `unix_time` and `monotonic`. Lines are flushed as they are written.
 
-- `"type": "event"` lines: `start` (arguments, `log_only`, and for PnP the resolved `stereo` settings, `depth_scale`, `refractive_index`, `intrinsics_from` and `intrinsics_override`), `warning`, `device_open` attempts, `device`, `calibration`, `tracking` changes, `error`, `exit`. PnP also writes:
+- `"type": "event"` lines: `start` (arguments, `log_only`, and for PnP the resolved `stereo` settings, `depth_scale`, `refractive_index`, `intrinsics_from`, `intrinsics_override`, `lever_arm` and `lever_arm_m`), `warning`, `device_open` attempts, `device`, `calibration`, `tracking` changes, `error`, `exit`. PnP also writes:
   - `calibration`: raw CAM_B `intrinsics` (`fx, fy, cx, cy`), `distortion` (14 coefficients), the computed `rectified` matrix (or `null` and `rectified_problem`), `alpha`, `distortion_correction`, `baseline_m` (calibration) and `baseline_spec_m` (design), and `R_cam_imu`;
   - `stereo_config`: `requested` settings, `effective` values read back from the node, and `warnings`;
   - `intrinsics`: the camera matrix used (`intrinsics`) and its `source`, which is one of:
@@ -255,7 +272,7 @@ Each VIO process start writes a JSONL file to `/app/data/logs/` (`/usr/blueos/ex
     It also has `effective_intrinsics` (fx, fy × the refractive index: what PnP runs with), `requested_source`, `raw`, `rectified`, the depth `frame` matrix and `frame_matches` (`raw`, `rectified` or `neither`), `override`, `alpha`, `distortion_correction`, `baseline_m`, `depth_scale`, `refractive_index`, `total_depth_scale` and `warnings`;
   - `snapshots`: the available `streams`, and `unavailable` ones with the reason;
   - `recovery`: see [Tracking recovery](#tracking-recovery-pnp).
-- `"type": "step"` lines (PnP only): one per frame, with `device_timestamp`, `sequence`, `time_delta_us`, `position_delta` and `angle_delta` (body FRD, exactly what is or would be sent), `confidence`, `features`, `new_features` and `tracked_features` (ids not seen / seen in the previous frame), `valid_depth`, `matches`, `inliers`, `reprojection_rms_px`, `gyro_disagreement_deg`, `proc_ms`, `status` (`ok` or `rejected`), `reason`, `sent`, and `reference_age_s`, `gap_frames` and `reference_reset` (see [Failed frames](#failed-frames-pnp)). The deltas are `null` for rejected frames.
+- `"type": "step"` lines (PnP only): one per frame, with `device_timestamp`, `sequence`, `time_delta_us`, `position_delta` and `angle_delta` (body FRD, exactly what is or would be sent), `confidence`, `features`, `new_features` and `tracked_features` (ids not seen / seen in the previous frame), `valid_depth`, `matches`, `inliers`, `reprojection_rms_px`, `gyro_disagreement_deg`, `proc_ms`, `status` (`ok` or `rejected`), `reason`, `sent`, and `reference_age_s`, `gap_frames` and `reference_reset` (see [Failed frames](#failed-frames-pnp)). The deltas are `null` for rejected frames. With *Lever arm diagnostics* on, also `lever_delta_position`, `lever_delta_correction` and `lever_delta_rotation` (see [Lever arm](#lever-arm-viso_pos-pnp)); these are never sent.
 
 Basalt runs write the events only, not per-frame poses. The supervisor appends its launches, exits (code or signal), restarts and stops to `supervisor.jsonl` in the same directory. Nothing is rotated or deleted. The configuration page links to the files.
 

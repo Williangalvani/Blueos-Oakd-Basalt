@@ -12,15 +12,15 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field, create_model, field_validator
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 import uvicorn
 
 import depth_probe
 import snapshots
 import vio_log
-from stereo_config import (DEFAULT_REFRACTIVE_INDEX, DEPTH_SCALE_RANGE, INTRINSICS_SOURCES, REFRACTIVE_INDEX_RANGE,
-                           STEREO_DEFAULTS, STEREO_SETTINGS, clamp_refractive_index, parse_intrinsics_override,
-                           stereo_command_args)
+from stereo_config import (DEFAULT_LEVER_ARM_M, DEFAULT_REFRACTIVE_INDEX, DEPTH_SCALE_RANGE, INTRINSICS_SOURCES,
+                           REFRACTIVE_INDEX_RANGE, STEREO_DEFAULTS, STEREO_SETTINGS, clamp_refractive_index,
+                           format_lever_arm, parse_intrinsics_override, parse_lever_arm, stereo_command_args)
 from vio_supervisor import VIOSupervisor
 
 WEB_PORT = 8095
@@ -63,6 +63,9 @@ DEFAULT_CONFIG = {
     "intrinsics_override": None,
     "depth_scale": 1.0,
     "refractive_index": DEFAULT_REFRACTIVE_INDEX,
+    # Diagnostics only: the autopilot applies VISO_POS_X/Y/Z itself
+    "lever_arm_enabled": False,
+    "lever_arm_m": list(DEFAULT_LEVER_ARM_M),
     **STEREO_DEFAULTS,
     # Passive logger: no MAVLink output, autopilot params untouched (OAKD_LOG_ONLY=1 forces it on)
     "log_only": False,
@@ -92,7 +95,14 @@ class BaseVIOConfig(BaseModel):
     intrinsics_override: Optional[str] = None
     depth_scale: float = Field(1.0, ge=DEPTH_SCALE_RANGE[0], le=DEPTH_SCALE_RANGE[1])
     refractive_index: float = Field(DEFAULT_REFRACTIVE_INDEX, ge=REFRACTIVE_INDEX_RANGE[0], le=REFRACTIVE_INDEX_RANGE[1])
+    lever_arm_enabled: bool = False
+    lever_arm_m: List[float] = Field(default_factory=lambda: list(DEFAULT_LEVER_ARM_M))
     log_only: bool = False
+
+    @field_validator("lever_arm_m", mode="before")
+    @classmethod
+    def _check_lever_arm(cls, value):
+        return list(parse_lever_arm(value))
 
     @field_validator("intrinsics_override")
     @classmethod
@@ -139,6 +149,14 @@ def log_only_status(config=None) -> dict:
     return {"log_only": bool(config.get("log_only")) or forced, "log_only_forced_by_env": forced}
 
 
+def saved_lever_arm(config: dict) -> tuple:
+    """The saved lever arm, or the default if a hand-edited config.json holds something unusable."""
+    try:
+        return parse_lever_arm(config.get("lever_arm_m", DEFAULT_LEVER_ARM_M))
+    except (TypeError, ValueError):
+        return DEFAULT_LEVER_ARM_M
+
+
 def build_vio_command(config: dict) -> list:
     """VIO command line for a configuration"""
     common_args = [
@@ -160,6 +178,9 @@ def build_vio_command(config: dict) -> list:
             "--intrinsics-from", config.get("intrinsics_from") or "rectified",
             "--depth-scale", str(float(config.get("depth_scale", 1.0))),
             "--refractive-index", str(clamp_refractive_index(config.get("refractive_index", DEFAULT_REFRACTIVE_INDEX))),
+            "--lever-arm" if config.get("lever_arm_enabled") else "--no-lever-arm",
+            # One token: argparse would take a value starting with "-" (negative x) for an option
+            f"--lever-arm-m={format_lever_arm(saved_lever_arm(config))}",
             *stereo_command_args(config),
         ]
         if config.get("intrinsics_override"):
@@ -490,6 +511,18 @@ async def index():
                     <input type="number" name="refractive_index" value="{refractive_index}" step="0.001" min="1" max="2">
                     <div class="hint">PnP only: water in front of the flat port. The calibration is in air, so fx, fy and the depth are multiplied by it. 1.333 fresh water, ~1.34 sea water, 1.0 = in air (bench tests)</div>
                 </div>
+                <div class="field">
+                    <label class="checkbox">
+                        <input type="checkbox" name="lever_arm_enabled" {lever_arm_enabled_checked}>
+                        Lever arm diagnostics (log only)
+                    </label>
+                    <div class="hint">PnP only. Does NOT change what is sent: the autopilot applies the camera offset itself from VISO_POS_X/Y/Z. When on, the data log also gets each delta corrected to the IMU (lever_delta_* fields), for comparison only</div>
+                </div>
+                <div class="field">
+                    <label>Lever Arm x,y,z (m)</label>
+                    <input type="text" name="lever_arm_m" value="{lever_arm_m}" placeholder="0.1655,-0.0069,0.18">
+                    <div class="hint">Camera relative to the IMU, body FRD (forward, right, down), as VISO_POS_X/Y/Z. Only used by the diagnostics above</div>
+                </div>
             </div>
 
             <h2>🌊 Stereo Depth (PnP)</h2>
@@ -643,6 +676,10 @@ async def index():
                     config[key] = value.trim() === '' ? null : value.trim();
                     continue;
                 }
+                if (key === 'lever_arm_m') {
+                    config[key] = value.trim();
+                    continue;
+                }
                 if (value === '') {
                     config[key] = null;
                 } else if (!isNaN(value)) {
@@ -767,6 +804,8 @@ async def index():
 """
     html = html.replace("{log_only_checked}", "checked" if config.get("log_only") else "")
     html = html.replace("{snapshots_checked}", "checked" if config.get("snapshots") else "")
+    html = html.replace("{lever_arm_enabled_checked}", "checked" if config.get("lever_arm_enabled") else "")
+    html = html.replace("{lever_arm_m}", escape(format_lever_arm(saved_lever_arm(config))))
     html = html.replace("{stereo_fields}", stereo_form_fields(config))
     # str.format() would choke on the CSS/JS braces in the template
     for key, value in config.items():

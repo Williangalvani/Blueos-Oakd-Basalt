@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import depth_probe  # noqa: E402
 import snapshots  # noqa: E402
 import vio_log  # noqa: E402
-from pnp_odometry import Intrinsics, PnPOdometry, PnPParams  # noqa: E402
+from pnp_odometry import Intrinsics, PnPOdometry, PnPParams, back_project, camera_to_body_matrix  # noqa: E402
 from rectified_intrinsics import StereoCalibration  # noqa: E402
 from tracking_recovery import FeatureTrackerReinit, TrackingRecovery, feature_id_counts  # noqa: E402
 
@@ -230,7 +230,7 @@ def pnp_vio(monkeypatch, tmp_path):
     sys.modules.pop("pnp_vio", None)
 
 
-def run_fake(module, monkeypatch, tmp_path, groups, argv, imu=()):
+def run_fake(module, monkeypatch, tmp_path, groups, argv, imu=(), log_only=True):
     sync_queue = FakeQueue(groups)
     snapshot_queue = FakeQueue()
     request_queue = FakeQueue()
@@ -244,7 +244,8 @@ def run_fake(module, monkeypatch, tmp_path, groups, argv, imu=()):
     monkeypatch.setattr(module.dai, "Pipeline", lambda device: FakePipeline(sync_queue))
     monkeypatch.setattr(module.dai, "FeatureTrackerConfig", lambda: mock.MagicMock())
     monkeypatch.setattr(module.dai, "Buffer", lambda: mock.MagicMock())
-    module.main(["--log-only", "--gyro-gate", "0", "--snapshot-dir", str(tmp_path / "snapshots"), *argv])
+    module.main([*(["--log-only"] if log_only else []), "--gyro-gate", "0", "--snapshot-dir",
+                 str(tmp_path / "snapshots"), *argv])
     (log_file,) = (tmp_path / "logs").iterdir()
     lines = [json.loads(line) for line in log_file.read_text().splitlines()]
     return lines, handles
@@ -524,6 +525,99 @@ def test_run_with_frame_source_ignores_a_raw_frame_matrix_loudly(pnp_vio, monkey
     assert events["intrinsics"]["source"] == "rectified (frame matrix is raw)"
     warnings = [line["message"] for line in lines if line.get("event") == "warning"]
     assert any("unrectified K; ignored" in message for message in warnings)
+
+
+# --- lever arm diagnostics ------------------------------------------------------------------------
+
+LEVER_ARM = np.array([0.1655, -0.0069, 0.180])
+SPIN_RATE = np.radians(20.0)  # rad/s, nose right
+SPIN_DT = 0.1
+FLOOR = np.full((HEIGHT, WIDTH), 2000, dtype=np.uint16)
+
+
+def yaw_frd(angle):
+    c, s = np.cos(angle), np.sin(angle)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+def spin_scenario(frames=8, lever_arm=LEVER_ARM, rate=SPIN_RATE):
+    """
+    A level vehicle spinning in place about its IMU, camera looking straight down (--camera-angle 90) at a
+    floor 2 m below it, at lever_arm from the IMU. The floor stays at 2 m, so the depth is uniform; the camera
+    swings around the IMU, so the feature motion includes a translation. Returns (sync groups, gyro message):
+    the gyro in the camera frame (R_cam_imu = I).
+    """
+    M = camera_to_body_matrix(90.0)  # optical -> body
+    floor = M @ back_project(GOOD_UV, np.full(len(GOOD_UV), 2.0), K).T + lever_arm[:, None]  # world = body at t0
+    groups = []
+    for n in range(frames):
+        R_wb = yaw_frd(rate * SPIN_DT * n)
+        R_wc, p_c = R_wb @ M, R_wb @ lever_arm
+        X = R_wc.T @ (floor - p_c[:, None])
+        uv = np.stack([K.fx * X[0] / X[2] + K.cx, K.fy * X[1] / X[2] + K.cy], axis=1)
+        t = 1.0 + SPIN_DT * n
+        groups.append({"features": FakeMsg(n, t, features=features(range(len(uv)), uv)),
+                       "depth": FakeMsg(n, t, frame=FLOOR)})
+    omega_cam = M.T @ np.array([0.0, 0.0, rate])
+    packets = [SimpleNamespace(gyroscope=SimpleNamespace(getTimestampDevice=lambda t=t: timedelta(seconds=t),
+                                                         x=omega_cam[0], y=omega_cam[1], z=omega_cam[2]))
+               for t in np.arange(0.9, 1.0 + SPIN_DT * frames, 0.005)]
+    return groups, SimpleNamespace(packets=packets)
+
+
+SPIN_ARGS = ["--camera-angle", "90", "--refractive-index", "1.0", "--intrinsics-override", "300,300,320,200",
+             "--gyro-gate", "5", "--recovery-frames", "0"]
+
+
+def expected_spin_delta(rate=SPIN_RATE):
+    """Camera displacement per frame in body FRD for the spin: r - R^T r."""
+    return LEVER_ARM - yaw_frd(rate * SPIN_DT).T @ LEVER_ARM
+
+
+def test_run_lever_arm_diagnostics_cancel_a_pure_spin(pnp_vio, monkeypatch, tmp_path):
+    monkeypatch.setattr(pnp_vio, "load_calibration", lambda device, args: fake_calibration(np.eye(3)))
+    groups, gyro = spin_scenario()
+    lines, _ = run_fake(pnp_vio, monkeypatch, tmp_path, groups, [*SPIN_ARGS, "--lever-arm"], imu=[gyro])
+    events = {line["event"]: line for line in lines if line["type"] == "event"}
+    assert events["start"]["lever_arm"] is True and events["start"]["lever_arm_m"] == LEVER_ARM.tolist()
+    steps = [line for line in lines if line["type"] == "step"]
+    assert steps[0]["reason"] == "no_reference" and steps[0]["lever_delta_position"] is None
+    for step in steps[1:]:
+        assert step["status"] == "ok", step["reason"]
+        # What is (or would be) sent stays the camera's own motion, swinging on the lever arm
+        np.testing.assert_allclose(step["position_delta"], expected_spin_delta(), atol=1e-3)
+        np.testing.assert_allclose(step["angle_delta"], [0.0, 0.0, SPIN_RATE * SPIN_DT], atol=np.radians(0.05))
+        # The diagnostics take the gyro rotation and find the IMU did not move
+        assert step["lever_delta_rotation"] == "gyro" and step["gyro_disagreement_deg"] < 0.1
+        np.testing.assert_allclose(step["lever_delta_correction"], expected_spin_delta(), atol=1e-4)
+        np.testing.assert_allclose(step["lever_delta_position"], 0.0, atol=1e-3)
+    assert np.linalg.norm(expected_spin_delta()) > 0.005
+
+
+def test_run_without_gyro_uses_the_pnp_rotation_and_lever_arm_off_logs_nothing(pnp_vio, monkeypatch, tmp_path):
+    groups, _ = spin_scenario(5)
+    lines, _ = run_fake(pnp_vio, monkeypatch, tmp_path, groups,
+                        [*SPIN_ARGS, "--gyro-gate", "0", "--lever-arm", "--lever-arm-m=0.1655,-0.0069,0.18"])
+    steps = [line for line in lines if line["type"] == "step"]
+    assert all(s["lever_delta_rotation"] == "pnp" for s in steps[1:])
+    np.testing.assert_allclose([s["lever_delta_position"] for s in steps[1:]], 0.0, atol=1e-3)
+
+    next((tmp_path / "logs").iterdir()).unlink()  # run_fake expects a single log
+    lines, _ = run_fake(pnp_vio, monkeypatch, tmp_path, spin_scenario(3)[0], [*SPIN_ARGS, "--gyro-gate", "0"])
+    steps = [line for line in lines if line["type"] == "step"]
+    assert not any(key.startswith("lever_") for step in steps for key in step)
+    assert {line["event"]: line for line in lines if line["type"] == "event"}["start"]["lever_arm"] is False
+
+
+def test_parse_args_lever_arm(pnp_vio, capsys):
+    args = pnp_vio.parse_args([])
+    assert args.lever_arm is False and args.lever_arm_m == (0.1655, -0.0069, 0.180)
+    args = pnp_vio.parse_args(["--lever-arm", "--lever-arm-m=-0.1,0,0.25"])
+    assert args.lever_arm is True and args.lever_arm_m == (-0.1, 0.0, 0.25)
+    for bad in (["--lever-arm-m", "1,2"], ["--lever-arm-m", "0,0,6"], ["--lever-arm-m", "a,b,c"]):
+        with pytest.raises(SystemExit):
+            pnp_vio.parse_args(bad)
+    assert "lever arm" in capsys.readouterr().err
 
 
 def test_run_applies_the_refractive_index_after_choosing_the_matrix(pnp_vio, monkeypatch, tmp_path):

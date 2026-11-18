@@ -262,14 +262,42 @@ def camera_rotation_matrix(camera_angle_deg):
     ])
 
 
+def camera_to_body_matrix(camera_angle_deg=0.0):
+    """Rotation taking optical camera-frame vectors to body FRD (camera_to_body_frd as a matrix)."""
+    return FLU_TO_FRD @ camera_rotation_matrix(camera_angle_deg) @ OPTICAL_TO_FLU
+
+
 def camera_to_body_frd(vector, camera_angle_deg=0.0):
     """
     Optical camera-frame vector -> vehicle body FRD, matching MavlinkNode: convert to FLU, apply the
     camera_angle pitch rotation, then flip FLU -> FRD. Works for translations and rotation vectors.
     """
-    v = OPTICAL_TO_FLU @ np.asarray(vector, dtype=np.float64)
-    v = camera_rotation_matrix(camera_angle_deg) @ v
-    return FLU_TO_FRD @ v
+    return camera_to_body_matrix(camera_angle_deg) @ np.asarray(vector, dtype=np.float64)
+
+
+def camera_to_body_rotation(R, camera_angle_deg=0.0):
+    """A rotation matrix in the optical camera frame (e.g. R_01) -> the same rotation in body FRD."""
+    M = camera_to_body_matrix(camera_angle_deg)
+    return M @ np.asarray(R, dtype=np.float64) @ M.T
+
+
+def lever_arm_correction(R_01, lever_arm):
+    """
+    r - R_01^T r: the displacement of a point at lever_arm r (body FRD, m, relative to the IMU) caused by
+    the rotation alone, expressed in the current body frame. R_01 is the rotation of the current body
+    frame relative to the reference (body FRD). First order, over dt: omega x r * dt.
+    """
+    r = np.asarray(lever_arm, dtype=np.float64)
+    return r - np.asarray(R_01, dtype=np.float64).T @ r
+
+
+def lever_arm_body_delta(position_delta, R_01, lever_arm):
+    """
+    Body (IMU) displacement from the camera's: camera delta - (r - R_01^T r), all body FRD in the current
+    frame. Diagnostics only: ArduPilot's EKF3 applies VISO_POS_X/Y/Z itself for VISION_POSITION_DELTA, so
+    the deltas sent stay the camera's.
+    """
+    return np.asarray(position_delta, dtype=np.float64) - lever_arm_correction(R_01, lever_arm)
 
 
 def confidence_from_inliers(inliers, matches, good_inliers):

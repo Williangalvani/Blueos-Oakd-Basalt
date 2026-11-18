@@ -27,12 +27,12 @@ import snapshots
 from autopilot_params import AutopilotParams
 from device_open import DEFAULT_TIMEOUT, DeviceOpenTimeout, open_oak_device
 from mavlink_sender import MavlinkSender
-from pnp_odometry import (Intrinsics, PnPOdometry, PnPParams, camera_to_body_frd, integrate_gyro,
-                          intrinsics_from_frame, refracted_intrinsics)
+from pnp_odometry import (Intrinsics, PnPOdometry, PnPParams, camera_to_body_frd, camera_to_body_rotation,
+                          integrate_gyro, intrinsics_from_frame, lever_arm_correction, refracted_intrinsics)
 from rectified_intrinsics import StereoCalibration, as_list, choose_intrinsics, rectified_for_settings
-from stereo_config import (DEFAULT_REFRACTIVE_INDEX, INTRINSICS_SOURCES, add_stereo_arguments, apply_stereo_config,
-                           effective_stereo_config, parse_depth_scale, parse_intrinsics_override,
-                           parse_refractive_index, resolve_stereo_settings, stereo_warnings)
+from stereo_config import (DEFAULT_LEVER_ARM_M, DEFAULT_REFRACTIVE_INDEX, INTRINSICS_SOURCES, add_stereo_arguments,
+                           apply_stereo_config, effective_stereo_config, parse_depth_scale, parse_intrinsics_override,
+                           parse_lever_arm, parse_refractive_index, resolve_stereo_settings, stereo_warnings)
 from tracking_recovery import FeatureTrackerReinit, TrackingRecovery, feature_id_counts
 from vio_log import LOG_ONLY_BANNER, env_forces_log_only, open_vio_log, resolve_log_only, setup_autopilot_output
 
@@ -90,6 +90,13 @@ def parse_args(argv=None):
                         default=DEFAULT_REFRACTIVE_INDEX,
                         help='Medium in front of the flat port (1.333 fresh water, 1.0 in air), 1-2. The calibration is '
                              'in air: PnP multiplies fx, fy of the camera matrix in use and the device depth by it')
+    parser.add_argument('--lever-arm', action=argparse.BooleanOptionalAction, default=False,
+                        help='Diagnostics only: also log each delta corrected for the camera lever arm '
+                             '(lever_delta_* step fields). Never sent: the autopilot applies VISO_POS_X/Y/Z itself')
+    parser.add_argument('--lever-arm-m', type=_argument_type(parse_lever_arm), default=DEFAULT_LEVER_ARM_M,
+                        metavar='X,Y,Z',
+                        help='Camera position relative to the IMU, body FRD, m (use --lever-arm-m=X,Y,Z if X is '
+                             'negative); same as VISO_POS_X/Y/Z')
 
     parser.add_argument('--min-inliers', type=int, default=15)
     parser.add_argument('--reprojection-error', type=float, default=2.0, help='RANSAC threshold (px)')
@@ -317,6 +324,20 @@ def camera_status(args, calibration, rectified, choice, stereo_settings):
     }
 
 
+def lever_arm_fields(position_delta, R_gyro, R_pnp, args):
+    """
+    Step fields for --lever-arm, logged only: the body (IMU) delta, the camera delta minus the rotation's
+    lever-arm term r - R^T r, with R the gyro rotation over the delta's interval (the PnP one without a gyro
+    prior), both in the optical frame. None for frames without a delta.
+    """
+    if position_delta is None:
+        return {"lever_delta_position": None, "lever_delta_correction": None, "lever_delta_rotation": None}
+    source, R = ("gyro", R_gyro) if R_gyro is not None else ("pnp", R_pnp)
+    correction = lever_arm_correction(camera_to_body_rotation(R, args.camera_angle), args.lever_arm_m)
+    return {"lever_delta_position": np.asarray(position_delta) - correction, "lever_delta_correction": correction,
+            "lever_delta_rotation": source}
+
+
 def configure_feature_tracker(config, args, maintainer=True):
     config.setCornerDetector(CORNER_DETECTORS[args.corner_detector])
     config.setNumTargetFeatures(args.num_features)
@@ -445,6 +466,8 @@ def main(argv=None):
           f"{f', override {args.intrinsics_override}' if args.intrinsics_override else ''}, "
           f"refractive index {args.refractive_index}{' (in air)' if args.refractive_index == 1.0 else ''}, "
           f"depth scale {args.depth_scale}")
+    if args.lever_arm:
+        print(f"📐 Lever arm diagnostics on (logged only, not sent): camera at {list(args.lever_arm_m)} m FRD from the IMU")
     print(f"📡 MAVLink: {'disabled (log-only)' if log_only else args.vehicle_ip}")
 
     data_log = open_vio_log()
@@ -452,7 +475,8 @@ def main(argv=None):
     data_log.event("start", algorithm="pnp", args=vars(args), stereo=stereo_settings, log_only=log_only,
                    log_only_forced_by_env=env_forces_log_only(), depth_scale=args.depth_scale,
                    refractive_index=args.refractive_index, intrinsics_from=args.intrinsics_from,
-                   intrinsics_override=args.intrinsics_override)
+                   intrinsics_override=args.intrinsics_override, lever_arm=args.lever_arm,
+                   lever_arm_m=list(args.lever_arm_m))
     exit_code = 0
     try:
         run(args, log_only, data_log, stereo_settings)
@@ -661,6 +685,7 @@ def run(args, log_only, data_log, stereo_settings):
                 probe.on_depth(depth, t, depth_msg.getSequenceNum())
                 proc_ms = (time.perf_counter() - start) * 1000.0
 
+                lever = lever_arm_fields(position_delta, R_prior, pose.rotation, args) if args.lever_arm else {}
                 data_log.step(
                     device_timestamp=t,
                     sequence=depth_msg.getSequenceNum(),
@@ -683,6 +708,7 @@ def run(args, log_only, data_log, stereo_settings):
                     reference_age_s=frame.reference_age_s,
                     gap_frames=frame.gap_frames,
                     reference_reset=frame.reference_reset,
+                    **lever,
                 )
 
                 now = time.monotonic()

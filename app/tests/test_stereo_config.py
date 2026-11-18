@@ -321,6 +321,53 @@ def test_config_api_validates_the_refractive_index_and_the_form_shows_it(client)
     assert 'id="camera-status"' in page and "effective_intrinsics" in page
 
 
+@pytest.mark.parametrize("value, expected", [
+    ("0.1655,-0.0069,0.18", (0.1655, -0.0069, 0.18)), (" 1 2 3 ", (1.0, 2.0, 3.0)), ([0, 0, -5], (0.0, 0.0, -5.0)),
+])
+def test_parse_lever_arm(value, expected):
+    assert stereo_config.parse_lever_arm(value) == expected
+
+
+@pytest.mark.parametrize("value", ["1,2", "1,2,3,4", "a,b,c", "0,0,5.1", [0, 0, float("nan")], None, 3.0])
+def test_parse_lever_arm_rejects(value):
+    with pytest.raises(ValueError):
+        stereo_config.parse_lever_arm(value)
+
+
+def test_main_command_passes_the_lever_arm(client, pnp_vio):
+    main, _ = client
+    pnp = {**main.DEFAULT_CONFIG, "algorithm": "pnp"}
+    assert pnp["lever_arm_enabled"] is False and pnp["lever_arm_m"] == [0.1655, -0.0069, 0.18]
+    args = pnp_vio.parse_args(main.build_vio_command(pnp)[3:])
+    assert args.lever_arm is False and args.lever_arm_m == (0.1655, -0.0069, 0.18)
+    # A negative x must not be taken for an option
+    args = pnp_vio.parse_args(main.build_vio_command({**pnp, "lever_arm_enabled": True,
+                                                      "lever_arm_m": [-0.2, 0.01, 0.3]})[3:])
+    assert args.lever_arm is True and args.lever_arm_m == (-0.2, 0.01, 0.3)
+    # Unusable hand-edited values fall back to the default
+    args = pnp_vio.parse_args(main.build_vio_command({**pnp, "lever_arm_m": "bogus"})[3:])
+    assert args.lever_arm_m == (0.1655, -0.0069, 0.18)
+    assert "--lever-arm" not in main.build_vio_command({**main.DEFAULT_CONFIG, "algorithm": "basalt"})
+
+
+def test_config_api_and_form_for_the_lever_arm(client):
+    main, http = client
+    body = {**main.DEFAULT_CONFIG, "algorithm": "pnp"}
+    # The form posts the text field as it is
+    assert http.post("/api/config", json={**body, "lever_arm_enabled": True,
+                                          "lever_arm_m": " 0.2, -0.01, 0.15 "}).status_code == 200
+    saved = main.load_config()
+    assert saved["lever_arm_enabled"] is True and saved["lever_arm_m"] == [0.2, -0.01, 0.15]
+    page = http.get("/").text
+    assert 'name="lever_arm_enabled" checked' in page and 'name="lever_arm_m" value="0.2,-0.01,0.15"' in page
+    assert "VISO_POS_X/Y/Z" in page and "Does NOT change what is sent" in page
+    for bad in ("1,2", "0,0,9", [1, 2, "x"], None):
+        assert http.post("/api/config", json={**body, "lever_arm_m": bad}).status_code == 422, bad
+    main.save_config({**main.DEFAULT_CONFIG})
+    page = http.get("/").text
+    assert 'name="lever_arm_enabled" >' in page and 'name="lever_arm_m" value="0.1655,-0.0069,0.18"' in page
+
+
 def test_status_reports_the_refractive_index_and_effective_matrix(client, monkeypatch, tmp_path):
     main, http = client
     monkeypatch.setattr(main, "SNAPSHOT_DIR", tmp_path / "snapshots")

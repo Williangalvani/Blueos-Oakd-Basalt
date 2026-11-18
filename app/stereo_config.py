@@ -1,7 +1,7 @@
 """
 StereoDepth settings for the PnP VIO, shared by main.py (config, web form, command line) and
 pnp_vio.py (argparse, device configuration), plus the validators of the camera-model settings
-(intrinsics override, depth scale, refractive index) both sides check.
+(intrinsics override, depth scale, refractive index, lever arm) both sides check.
 
 The defaults favour sparse but trustworthy depth at the tracked features over dense depth: a preset
 first, then LR check, a confidence threshold, speckle and range filters, no spatial/temporal
@@ -77,6 +77,9 @@ DEPTH_SCALE_RANGE = (0.2, 5.0)
 # Medium in front of the flat port: 1.0 is air, 1.333 fresh water (sea water is about 1.34)
 DEFAULT_REFRACTIVE_INDEX = 1.333
 REFRACTIVE_INDEX_RANGE = (1.0, 2.0)
+# Camera relative to the IMU in body FRD (m), from the CAD; ArduPilot's VISO_POS_X/Y/Z range is +-5 m
+DEFAULT_LEVER_ARM_M = (0.1655, -0.0069, 0.180)
+LEVER_ARM_LIMIT_M = 5.0
 
 
 def parse_depth_scale(value):
@@ -106,6 +109,28 @@ def clamp_refractive_index(value):
         return DEFAULT_REFRACTIVE_INDEX
     low, high = REFRACTIVE_INDEX_RANGE
     return min(max(n, low), high)
+
+
+def parse_lever_arm(value):
+    """'x,y,z' or a sequence of three numbers (m, body FRD) -> (x, y, z); ValueError if malformed."""
+    if isinstance(value, str):
+        parts = [part for part in re.split(r"[,\s]+", value.strip()) if part]
+    else:
+        try:
+            parts = list(value)
+        except TypeError:
+            raise ValueError(f"lever arm needs three numbers x,y,z, got {value!r}")
+    if len(parts) != 3:
+        raise ValueError(f"lever arm needs three numbers x,y,z, got {value!r}")
+    values = tuple(float(part) for part in parts)
+    if not all(math.isfinite(v) and abs(v) <= LEVER_ARM_LIMIT_M for v in values):
+        raise ValueError(f"lever arm values must be within +-{LEVER_ARM_LIMIT_M:g} m, got {value!r}")
+    return values
+
+
+def format_lever_arm(values):
+    """(x, y, z) -> 'x,y,z', as the form and the command line take it."""
+    return ",".join(f"{float(v):g}" for v in values)
 
 
 def parse_intrinsics_override(text):

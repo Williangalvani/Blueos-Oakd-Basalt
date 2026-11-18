@@ -13,9 +13,13 @@ from pnp_odometry import (  # noqa: E402
     PnPParams,
     back_project,
     camera_to_body_frd,
+    camera_to_body_matrix,
+    camera_to_body_rotation,
     confidence_from_inliers,
     integrate_gyro,
     intrinsics_from_frame,
+    lever_arm_body_delta,
+    lever_arm_correction,
     lookup_depth,
     matrix_to_rotvec,
     refracted_intrinsics,
@@ -623,6 +627,71 @@ def test_refractive_index_one_is_the_in_air_model():
     delta = np.array([0.03, 0.02, 0.05])
     recovered = flat_port_motion(delta, 1.0)
     np.testing.assert_allclose(recovered[1.0], delta, atol=1.5e-3)
+
+
+LEVER_ARM = np.array([0.1655, -0.0069, 0.180])
+
+
+def yaw_frd(angle):
+    """Rotation about body z (down): positive yaws the nose right."""
+    c, s = math.cos(angle), math.sin(angle)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+def camera_observation(R_wb1, p_b1, camera_angle, lever_arm=LEVER_ARM):
+    """
+    The vehicle body (IMU) goes from the world origin (R_wb0 = I) to (R_wb1, p_b1); the camera sits at
+    lever_arm in body FRD, pitched by camera_angle. Returns what PnP and the gyro report: the camera
+    displacement expressed in its current optical frame, and R_01 in the optical frame.
+    """
+    M = camera_to_body_matrix(camera_angle)  # optical -> body
+    R_wc0, R_wc1 = M, R_wb1 @ M
+    p_c0, p_c1 = lever_arm, p_b1 + R_wb1 @ lever_arm
+    return R_wc1.T @ (p_c1 - p_c0), R_wc0.T @ R_wc1
+
+
+def test_camera_to_body_matrix_matches_the_vector_mapping():
+    for angle in (0.0, 30.0, 90.0):
+        M = camera_to_body_matrix(angle)
+        np.testing.assert_allclose(M @ M.T, np.eye(3), atol=1e-12)
+        assert np.linalg.det(M) == pytest.approx(1.0)
+        v = np.array([0.3, -0.2, 0.9])
+        np.testing.assert_allclose(M @ v, camera_to_body_frd(v, angle), atol=1e-12)
+        # A rotation mapped to body has the mapped rotation vector
+        rotvec = np.radians([3.0, -1.0, 7.0])
+        np.testing.assert_allclose(matrix_to_rotvec(camera_to_body_rotation(rotvec_to_matrix(rotvec), angle)),
+                                   camera_to_body_frd(rotvec, angle), atol=1e-12)
+
+
+@pytest.mark.parametrize("camera_angle", [0.0, 90.0])
+def test_lever_arm_pure_yaw_about_the_imu_gives_no_body_translation(camera_angle):
+    psi = math.radians(8.0)
+    delta_optical, R_01 = camera_observation(yaw_frd(psi), np.zeros(3), camera_angle)
+    camera_delta = camera_to_body_frd(delta_optical, camera_angle)
+    # The camera itself moved: it swings on the lever arm
+    assert np.linalg.norm(camera_delta) > 0.02
+    R_body = camera_to_body_rotation(R_01, camera_angle)
+    np.testing.assert_allclose(R_body, yaw_frd(psi), atol=1e-12)
+    np.testing.assert_allclose(lever_arm_correction(R_body, LEVER_ARM), camera_delta, atol=1e-12)
+    np.testing.assert_allclose(lever_arm_body_delta(camera_delta, R_body, LEVER_ARM), 0.0, atol=1e-12)
+
+
+def test_lever_arm_recovers_the_imu_motion_with_rotation_and_translation():
+    R_wb1 = rotvec_to_matrix([0.05, -0.03, 0.2])
+    p_b1 = np.array([0.04, -0.02, 0.01])
+    delta_optical, R_01 = camera_observation(R_wb1, p_b1, 90.0)
+    camera_delta = camera_to_body_frd(delta_optical, 90.0)
+    body = lever_arm_body_delta(camera_delta, camera_to_body_rotation(R_01, 90.0), LEVER_ARM)
+    # Body displacement expressed in the current body frame, like position_delta
+    np.testing.assert_allclose(body, R_wb1.T @ p_b1, atol=1e-12)
+    assert np.linalg.norm(camera_delta - body) > 0.02
+
+
+def test_lever_arm_correction_is_omega_cross_r_to_first_order():
+    omega, dt = np.array([0.1, -0.2, 0.5]), 0.01
+    correction = lever_arm_correction(rotvec_to_matrix(omega * dt), LEVER_ARM)
+    np.testing.assert_allclose(correction / dt, np.cross(omega, LEVER_ARM), rtol=1e-2)
+    np.testing.assert_allclose(lever_arm_correction(np.eye(3), LEVER_ARM), 0.0)
 
 
 def test_rotation_angle():
