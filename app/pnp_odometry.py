@@ -10,10 +10,10 @@ Conventions
 - Camera frame is the OpenCV optical frame of the rectified left camera:
   x right, y down, z forward. Units are metres and seconds.
 - Depth images are uint16 millimetres (depthai StereoDepth.depth); 0 means invalid.
-- For two consecutive frames C0 (previous) and C1 (current), PnP solves the transform that maps
-  points from C0 into C1: X1 = R_10 @ X0 + t_10.
-- The reported motion follows MAVLink VISION_POSITION_DELTA:
-  * angle_delta: rotation vector of the current frame relative to the previous one
+- For a reference frame C0 (the last good frame, usually the previous one) and the current frame
+  C1, PnP solves the transform that maps points from C0 into C1: X1 = R_10 @ X0 + t_10.
+- The reported motion follows MAVLink VISION_POSITION_DELTA, over the interval since the reference:
+  * angle_delta: rotation vector of the current frame relative to the reference
     (Rodrigues of R_01 = R_10.T).
   * position_delta: displacement of the camera from C0 to C1, expressed in the current frame C1
     (that is R_10 @ (-R_10.T @ t_10) = -t_10).
@@ -103,8 +103,11 @@ class PnPParams:
     ransac_confidence: float = 0.99
     # Max disagreement between PnP rotation and gyro-integrated rotation before the frame is rejected
     gyro_gate_deg: float = 5.0
-    # Reject solutions that move further than this in one frame (m)
+    # Reject solutions that move further than this per frame (m); a solve that bridges failed frames
+    # gets this much for each frame interval it spans
     max_translation_m: float = 0.5
+    # After a failed frame, keep solving against the last good frame for at most this long (s); 0 = no cap
+    max_reference_age_s: float = 1.0
     # Inlier count at which confidence saturates
     good_inliers: int = 60
     # Depth lookup
@@ -135,9 +138,16 @@ class PoseResult:
 class FrameResult:
     pose: PoseResult
     timestamp: float
+    # Time since the reference: the interval pose covers (None without a reference)
     dt: Optional[float] = None
     features: int = 0
     valid_depth: int = 0
+    # Age of the reference this frame was solved against (s); same as dt, kept for rejected frames' logs
+    reference_age_s: Optional[float] = None
+    # Failed frames between the reference and this one, this one excluded
+    gap_frames: int = 0
+    # This frame failed and replaced a reference that was too old or had too few matches left
+    reference_reset: bool = False
     extra: Dict = field(default_factory=dict)
 
 
@@ -199,7 +209,8 @@ def integrate_gyro(times, omegas, t0, t1, R_cam_imu=None, max_gap=0.1):
     times: (N,) sample timestamps (s), sorted. omegas: (N x 3) angular rate (rad/s) in the IMU frame.
     R_cam_imu: rotation taking IMU-frame vectors to the camera frame (identity if None).
     Each sample is held until the next one (zero-order hold). Returns None when the samples don't
-    cover the interval (no data, or nearest sample further than max_gap from an end).
+    cover the interval: no data, nearest sample further than max_gap from an end, or a hole longer
+    than max_gap inside it (likely over the long intervals a held reference spans).
     """
     times = np.asarray(times, dtype=np.float64)
     omegas = np.asarray(omegas, dtype=np.float64).reshape(-1, 3)
@@ -207,11 +218,13 @@ def integrate_gyro(times, omegas, t0, t1, R_cam_imu=None, max_gap=0.1):
         return None
     if times[0] > t0 + max_gap or times[-1] < t1 - max_gap:
         return None
+    inner = times[(times > t0) & (times < t1)]
+    bounds = np.concatenate([[t0], inner, [t1]])
+    if np.max(np.diff(bounds)) > max_gap:
+        return None
     if R_cam_imu is not None:
         omegas = omegas @ np.asarray(R_cam_imu, dtype=np.float64).T
 
-    inner = times[(times > t0) & (times < t1)]
-    bounds = np.concatenate([[t0], inner, [t1]])
     R = np.eye(3)
     for a, b in zip(bounds[:-1], bounds[1:]):
         idx = max(int(np.searchsorted(times, a, side="right")) - 1, 0)
@@ -248,12 +261,15 @@ def confidence_from_inliers(inliers, matches, good_inliers):
     return float(100.0 * ratio * min(1.0, inliers / float(good_inliers)))
 
 
-def solve_relative_pose(points_prev, uv_curr, intrinsics, R_prior=None, params=PnPParams()):
+def solve_relative_pose(points_prev, uv_curr, intrinsics, R_prior=None, params=PnPParams(), max_translation_m=None):
     """
-    Relative pose from 3D points in the previous frame and their 2D observations in the current one.
+    Relative pose from 3D points in the reference frame and their 2D observations in the current one.
 
     R_prior: optional gyro rotation R_01 used as the initial guess and as a sanity gate.
+    max_translation_m: translation gate for this solve (params.max_translation_m if None).
     """
+    if max_translation_m is None:
+        max_translation_m = params.max_translation_m
     points_prev = np.asarray(points_prev, dtype=np.float64).reshape(-1, 3)
     uv_curr = np.asarray(uv_curr, dtype=np.float64).reshape(-1, 2)
     n = len(points_prev)
@@ -305,7 +321,7 @@ def solve_relative_pose(points_prev, uv_curr, intrinsics, R_prior=None, params=P
             result.reason = "gyro_mismatch"
             return result
 
-    if np.linalg.norm(t_10) > params.max_translation_m:
+    if np.linalg.norm(t_10) > max_translation_m:
         result.reason = "implausible_translation"
         return result
 
@@ -319,11 +335,20 @@ def solve_relative_pose(points_prev, uv_curr, intrinsics, R_prior=None, params=P
 
 class PnPOdometry:
     """
-    Frame-to-frame odometry over persistent feature ids.
+    Odometry over persistent feature ids, each frame solved against a reference frame.
 
-    Each frame's features with valid depth become the 3D reference for the next frame. When a
-    frame fails, its delta is dropped and the current frame becomes the new reference, so the
-    next reported delta starts from here and no jump is integrated.
+    A good frame's features with valid depth become the 3D reference for the next frame. When a
+    frame fails, its delta is dropped but the last good frame stays the reference (points and
+    timestamp), so the next good frame's delta and dt cover the whole gap and no motion is lost.
+    The device tracker keeps ids, so features still tracked keep matching the reference.
+
+    The failed frame's own 3D points are not merged into the reference: they are in that frame's
+    camera, and without its pose they can't be expressed in the reference camera. The reference
+    therefore only ever loses matches, as features drop out of tracking.
+
+    A failed frame replaces the reference instead (the gap is dropped, frame.reference_reset) when
+    the reference is older than params.max_reference_age_s, or fewer than params.min_inliers of
+    its points are still matched, so it could never solve again.
     """
 
     def __init__(self, intrinsics, params=None, image_size=None):
@@ -331,18 +356,27 @@ class PnPOdometry:
         self.params = params or PnPParams()
         # (width, height) of the feature pixel grid; depth may be coarser (decimation)
         self.image_size = image_size
-        self.prev_points = None  # dict id -> 3D point (optical, m)
-        self.prev_timestamp = None
+        self.reset()
 
     def reset(self):
-        self.prev_points = None
-        self.prev_timestamp = None
+        self.prev_points = None  # reference: dict id -> 3D point (optical, m)
+        self.prev_timestamp = None  # reference timestamp
+        self.gap_frames = 0  # failed frames since the reference
+
+    def _set_reference(self, points, timestamp):
+        self.prev_points = points
+        self.prev_timestamp = timestamp
+        self.gap_frames = 0
+
+    def _reference_exhausted(self, age, matches):
+        max_age = self.params.max_reference_age_s
+        return (max_age > 0 and age > max_age) or matches < self.params.min_inliers
 
     def process(self, ids, uv, depth, timestamp, R_prior=None):
         """
         ids: (N,) feature ids, uv: (N x 2) pixel positions in the rectified left image,
         depth: depth image (uint16 mm) aligned to the same image, timestamp: seconds.
-        R_prior: gyro rotation R_01 between the previous frame and this one (or None).
+        R_prior: gyro rotation R_01 between the reference (prev_timestamp) and this frame (or None).
         """
         ids = np.asarray(ids, dtype=np.int64).ravel()
         uv = np.asarray(uv, dtype=np.float64).reshape(-1, 2)
@@ -354,19 +388,30 @@ class PnPOdometry:
 
         frame = FrameResult(pose=PoseResult(ok=False, reason="no_reference"), timestamp=timestamp,
                             features=len(ids), valid_depth=int(valid.sum()))
+        if self.prev_points is None:
+            self._set_reference(current, timestamp)
+            return frame
 
-        if self.prev_points is not None:
-            frame.dt = timestamp - self.prev_timestamp
-            matched = [(self.prev_points[i], uv[k]) for k, i in enumerate(ids.tolist()) if i in self.prev_points]
-            if frame.dt <= 0:
-                frame.pose = PoseResult(ok=False, reason="non_increasing_timestamp", matches=len(matched))
-            elif matched:
-                P = np.array([m[0] for m in matched])
-                q = np.array([m[1] for m in matched])
-                frame.pose = solve_relative_pose(P, q, self.intrinsics, R_prior, self.params)
-            else:
-                frame.pose = PoseResult(ok=False, reason="too_few_matches", matches=0)
+        frame.dt = frame.reference_age_s = timestamp - self.prev_timestamp
+        frame.gap_frames = self.gap_frames
+        matched = [(self.prev_points[i], uv[k]) for k, i in enumerate(ids.tolist()) if i in self.prev_points]
+        if frame.dt <= 0:
+            # Repeated or out of order: leave the reference alone, never adopt an older frame
+            frame.pose = PoseResult(ok=False, reason="non_increasing_timestamp", matches=len(matched))
+            return frame
+        if matched:
+            P = np.array([m[0] for m in matched])
+            q = np.array([m[1] for m in matched])
+            frame.pose = solve_relative_pose(P, q, self.intrinsics, R_prior, self.params,
+                                             self.params.max_translation_m * (1 + self.gap_frames))
+        else:
+            frame.pose = PoseResult(ok=False, reason="too_few_matches", matches=0)
 
-        self.prev_points = current
-        self.prev_timestamp = timestamp
+        if frame.pose.ok:
+            self._set_reference(current, timestamp)
+        elif self._reference_exhausted(frame.dt, len(matched)):
+            frame.reference_reset = True
+            self._set_reference(current, timestamp)
+        else:
+            self.gap_frames += 1
         return frame

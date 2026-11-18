@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import snapshots  # noqa: E402
 import vio_log  # noqa: E402
-from pnp_odometry import Intrinsics  # noqa: E402
+from pnp_odometry import Intrinsics, PnPOdometry, PnPParams  # noqa: E402
 from tracking_recovery import FeatureTrackerReinit, TrackingRecovery, feature_id_counts  # noqa: E402
 
 
@@ -68,13 +68,37 @@ def test_feature_id_counts():
     assert feature_id_counts({1}, []) == (0, 0)
 
 
-# --- pnp_vio.run() end to end with a fake device ------------------------------------------------
-
 WIDTH, HEIGHT = 640, 400
 K = Intrinsics(fx=300.0, fy=300.0, cx=320.0, cy=200.0)
 GOOD_UV = np.array([(x, y) for x in range(80, 600, 60) for y in range(60, 360, 60)], dtype=np.float64)
+# The same ids at shuffled pixels: every feature matches the reference, but no pose fits
+SHUFFLED_UV = GOOD_UV[np.random.default_rng(0).permutation(len(GOOD_UV))]
 DEPTH = np.full((HEIGHT, WIDTH), 2000, dtype=np.uint16)
 DEPTH[:, :40] = 0  # a strip without depth, like the underwater frames with streaky depth
+
+
+def test_recovery_clears_a_reference_held_across_failures():
+    recovery = TrackingRecovery(frames=5)
+    odom = PnPOdometry(K, PnPParams(max_reference_age_s=0.0))
+    ids = np.arange(len(GOOD_UV))
+    odom.process(ids, GOOD_UV, DEPTH, 1.0)
+    triggered = []
+    for n in range(1, 6):
+        frame = odom.process(ids, SHUFFLED_UV, DEPTH, 1.0 + 0.1 * n)
+        assert not frame.pose.ok and not frame.reference_reset
+        assert odom.prev_timestamp == 1.0 and frame.gap_frames == n - 1
+        if recovery.update(frame.pose.ok):
+            triggered.append(n)
+            odom.reset()
+            assert odom.prev_points is None and odom.prev_timestamp is None and odom.gap_frames == 0
+    assert triggered == [5]
+    # The frame after the recovery starts a new reference instead of matching the old one
+    assert odom.process(ids, GOOD_UV, DEPTH, 1.6).pose.reason == "no_reference"
+    frame = odom.process(ids, GOOD_UV, DEPTH, 1.7)
+    assert frame.pose.ok and frame.dt == pytest.approx(0.1) and frame.gap_frames == 0
+
+
+# --- pnp_vio.run() end to end with a fake device ------------------------------------------------
 
 
 class FakeTransformation:
@@ -126,6 +150,24 @@ def scenario(n_good=10, n_lost=25, n_back=10):
         t = 1.0 + 0.1 * n
         groups.append({"features": FakeMsg(n, t, features=feats), "depth": FakeMsg(n, t, frame=DEPTH)})
     return groups
+
+
+def pattern_scenario(pattern):
+    """Static scene, one frame per character: G good, F the same ids at shuffled pixels (fails)."""
+    groups = []
+    for n, kind in enumerate(pattern):
+        feats = features(range(len(GOOD_UV)), GOOD_UV if kind == "G" else SHUFFLED_UV)
+        t = 1.0 + 0.1 * n
+        groups.append({"features": FakeMsg(n, t, features=feats), "depth": FakeMsg(n, t, frame=DEPTH)})
+    return groups
+
+
+def still_gyro(t0, t1, rate=200.0):
+    """One IMU message with zero-rate gyro packets covering [t0, t1]."""
+    packets = [SimpleNamespace(gyroscope=SimpleNamespace(getTimestampDevice=lambda t=t: timedelta(seconds=t),
+                                                         x=0.0, y=0.0, z=0.0))
+               for t in np.arange(t0, t1, 1.0 / rate)]
+    return SimpleNamespace(packets=packets)
 
 
 class FakeQueue:
@@ -180,14 +222,14 @@ def pnp_vio(monkeypatch, tmp_path):
     sys.modules.pop("pnp_vio", None)
 
 
-def run_fake(module, monkeypatch, tmp_path, groups, argv):
+def run_fake(module, monkeypatch, tmp_path, groups, argv, imu=()):
     sync_queue = FakeQueue(groups)
     snapshot_queue = FakeQueue()
     request_queue = FakeQueue()
     request_queue.send = lambda msg: (request_queue.sent.append(msg), snapshot_queue.items.append(
         FakeMsg(99, 1.5, frame=DEPTH)))
     handles = module.PipelineHandles(
-        sync_queue=sync_queue, imu_queue=FakeQueue(), feature_config_queue=FakeQueue(),
+        sync_queue=sync_queue, imu_queue=FakeQueue(imu), feature_config_queue=FakeQueue(),
         stereo_effective={"decimation": 1}, snapshot_request_queue=request_queue, snapshot_queue=snapshot_queue,
         snapshot_streams=("rect_left", "rect_right", "depth"), snapshot_unavailable={"rgb": "no CAM_A"})
     monkeypatch.setattr(module, "build_pipeline", lambda p, device, args, settings: handles)
@@ -211,6 +253,9 @@ def test_run_recovers_from_feature_collapse(pnp_vio, monkeypatch, tmp_path):
     reasons = [s["reason"] for s in steps[10:45]]
     assert reasons == ["too_few_matches"] * 10 + ["no_reference"] + ["too_few_matches"] * 20 + [
         "no_reference"] + ["too_few_matches"] * 3
+    # No reference feature survives the collapse, so each lost frame replaces the reference
+    assert steps[10]["reference_reset"] is True and steps[10]["gap_frames"] == 0
+    assert all(s["reference_age_s"] == pytest.approx(0.1) for s in steps[11:20])
 
     recoveries = [line for line in lines if line.get("event") == "recovery"]
     assert len(recoveries) == 2
@@ -248,6 +293,62 @@ def test_run_without_recovery_never_reinitialises(pnp_vio, monkeypatch, tmp_path
     lines, handles = run_fake(pnp_vio, monkeypatch, tmp_path, scenario(), ["--recovery-frames", "0"])
     assert not any(line.get("event") == "recovery" for line in lines)
     assert handles.feature_config_queue.sent == []
+
+
+def test_run_bridges_failed_frames_and_still_recovers(pnp_vio, monkeypatch, tmp_path):
+    lines, handles = run_fake(pnp_vio, monkeypatch, tmp_path, pattern_scenario("GGGGG" "FF" "GGG" "FFFFF" "GGG"),
+                              ["--recovery-frames", "5"])
+    steps = [line for line in lines if line["type"] == "step"]
+    assert [s["status"] for s in steps] == ["rejected"] + ["ok"] * 4 + ["rejected"] * 2 + ["ok"] * 3 + [
+        "rejected"] * 5 + ["rejected", "ok", "ok"]
+
+    # Failed frames keep frame 4 as the reference, and log how long it has been held
+    for n, step in enumerate(steps[5:7]):
+        assert step["reason"] in ("too_few_inliers", "pnp_failed") and step["matches"] == len(GOOD_UV)
+        assert step["gap_frames"] == n and step["reference_age_s"] == pytest.approx(0.1 * (n + 1))
+        assert step["reference_reset"] is False and step["time_delta_us"] is None
+    # The next good frame's delta spans 4 -> 7: time and motion over the same interval
+    bridged = steps[7]
+    assert bridged["gap_frames"] == 2 and bridged["reference_age_s"] == pytest.approx(0.3)
+    assert bridged["time_delta_us"] == pytest.approx(0.3e6)
+    np.testing.assert_allclose(bridged["position_delta"], 0.0, atol=1e-6)
+    assert steps[8]["time_delta_us"] == pytest.approx(0.1e6) and steps[8]["gap_frames"] == 0
+
+    # 5 consecutive failures still trigger the recovery, and the held reference goes with it
+    (recovery,) = [line for line in lines if line.get("event") == "recovery"]
+    assert recovery["failed_frames"] == 5 and recovery["matches"] == len(GOOD_UV)
+    assert [s["gap_frames"] for s in steps[10:15]] == [0, 1, 2, 3, 4]
+    assert steps[15]["reason"] == "no_reference" and steps[15]["reference_age_s"] is None
+    assert steps[16]["time_delta_us"] == pytest.approx(0.1e6) and steps[16]["gap_frames"] == 0
+    assert [c.setFeatureMaintainer.call_args[0][0] for c in handles.feature_config_queue.sent] == [False, True]
+
+
+def test_run_gyro_prior_covers_a_long_gap(pnp_vio, monkeypatch, tmp_path):
+    """A 2.6 s gap, longer than the old fixed gyro history: the prior must still span it."""
+    monkeypatch.setattr(pnp_vio, "load_calibration", lambda device, args: (K, np.eye(3)))
+    pattern = "GGG" + "F" * 25 + "GGG"
+    lines, _ = run_fake(pnp_vio, monkeypatch, tmp_path, pattern_scenario(pattern),
+                        ["--recovery-frames", "0", "--max-reference-age", "0", "--gyro-gate", "5"],
+                        imu=[still_gyro(0.9, 1.0 + 0.1 * len(pattern))])
+    steps = [line for line in lines if line["type"] == "step"]
+    assert [s["status"] for s in steps[3:28]] == ["rejected"] * 25
+    assert not any(s["reference_reset"] for s in steps)
+    bridged = steps[28]
+    assert bridged["status"] == "ok" and bridged["gap_frames"] == 25
+    assert bridged["time_delta_us"] == pytest.approx(2.6e6)
+    # Logged as null when no gyro prior was available
+    assert bridged["gyro_disagreement_deg"] is not None and bridged["gyro_disagreement_deg"] < 0.1
+
+
+def test_run_max_reference_age_from_the_command_line(pnp_vio, monkeypatch, tmp_path):
+    lines, _ = run_fake(pnp_vio, monkeypatch, tmp_path, pattern_scenario("GG" + "F" * 6),
+                        ["--recovery-frames", "0", "--max-reference-age", "0.35"])
+    steps = [line for line in lines if line["type"] == "step"]
+    assert [s["reference_reset"] for s in steps[2:6]] == [False, False, False, True]
+    # The shuffled frame that took over is a valid reference for the next shuffled frames
+    assert [s["status"] for s in steps[6:]] == ["ok", "ok"]
+    events = {line["event"]: line for line in lines if line["type"] == "event"}
+    assert events["start"]["args"]["max_reference_age"] == 0.35
 
 
 def test_intrinsics_fall_back_to_calibration(pnp_vio, monkeypatch, tmp_path):

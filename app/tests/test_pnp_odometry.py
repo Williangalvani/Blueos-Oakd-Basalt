@@ -176,6 +176,19 @@ def test_integrate_gyro_constant_rate():
     assert integrate_gyro([], [], 0.0, 0.1) is None
 
 
+def test_integrate_gyro_over_a_long_interval_with_a_dropout():
+    omega = np.array([0.0, 0.5, 0.0])
+    times = np.arange(0.0, 3.0, 0.005)
+    omegas = np.tile(omega, (len(times), 1))
+    # A held reference spans many frames: still exact over a full second
+    R = integrate_gyro(times, omegas, 0.5, 1.5)
+    np.testing.assert_allclose(matrix_to_rotvec(R), omega * 1.0, atol=1e-9)
+    # A hole in the middle would be bridged by holding one sample: no prior instead
+    holed = (times < 0.9) | (times > 1.2)
+    assert integrate_gyro(times[holed], omegas[holed], 0.5, 1.5) is None
+    assert integrate_gyro(times[holed], omegas[holed], 0.2, 0.8) is not None
+
+
 def test_camera_to_body_frd():
     # Forward-looking camera: optical z (forward) -> FRD x, x (right) -> FRD y, y (down) -> FRD z
     np.testing.assert_allclose(camera_to_body_frd([0, 0, 1]), [1, 0, 0], atol=1e-12)
@@ -309,25 +322,166 @@ def test_decimated_depth_gives_the_same_pose():
     assert c.valid_depth < 0.4 * a.valid_depth
 
 
+FLAT_DEPTH = np.full((HEIGHT, WIDTH), 2000, dtype=np.uint16)
+GRID_UV = np.array([(u, v) for u in np.linspace(50, 590, 6) for v in np.linspace(50, 350, 5)])
+# Same ids at shuffled pixels: plenty of matches, no consistent pose
+SHUFFLED_UV = GRID_UV[np.random.default_rng(42).permutation(len(GRID_UV))]
+
+
 def test_reset_drops_the_reference():
     odom = PnPOdometry(K)
-    depth = np.full((HEIGHT, WIDTH), 2000, dtype=np.uint16)
-    uv = np.array([(u, v) for u in np.linspace(50, 590, 6) for v in np.linspace(50, 350, 5)])
-    odom.process(np.arange(30), uv, depth, 1.0)
-    assert odom.process(np.arange(30), uv, depth, 1.1).pose.ok
+    odom.process(np.arange(30), GRID_UV, FLAT_DEPTH, 1.0)
+    assert odom.process(np.arange(30), GRID_UV, FLAT_DEPTH, 1.1).pose.ok
+    assert odom.process(np.arange(30), SHUFFLED_UV, FLAT_DEPTH, 1.2).gap_frames == 0
+    assert odom.gap_frames == 1
     odom.reset()
-    assert odom.process(np.arange(30), uv, depth, 1.2).pose.reason == "no_reference"
-    assert odom.process(np.arange(30), uv, depth, 1.3).pose.ok
+    assert odom.prev_points is None and odom.prev_timestamp is None and odom.gap_frames == 0
+    assert odom.process(np.arange(30), GRID_UV, FLAT_DEPTH, 1.3).pose.reason == "no_reference"
+    frame = odom.process(np.arange(30), GRID_UV, FLAT_DEPTH, 1.4)
+    assert frame.pose.ok and frame.dt == pytest.approx(0.1) and frame.gap_frames == 0
 
 
-def test_non_increasing_timestamp():
+def test_non_increasing_timestamp_keeps_the_reference():
     odom = PnPOdometry(K)
-    depth = np.full((HEIGHT, WIDTH), 2000, dtype=np.uint16)
-    uv = np.array([[100.0, 100.0]] * 20)
-    odom.process(np.arange(20), uv, depth, timestamp=1.0)
-    frame = odom.process(np.arange(20), uv, depth, timestamp=1.0)
+    ids = np.arange(30)
+    odom.process(ids, GRID_UV, FLAT_DEPTH, timestamp=1.0)
+    reference = odom.prev_points
+    frame = odom.process(ids, GRID_UV, FLAT_DEPTH, timestamp=1.0)
     assert not frame.pose.ok
     assert frame.pose.reason == "non_increasing_timestamp"
+    # An earlier frame is never adopted, even with nothing left to match
+    earlier = odom.process(ids + 100, GRID_UV, FLAT_DEPTH, timestamp=0.9)
+    assert earlier.pose.reason == "non_increasing_timestamp" and not earlier.reference_reset
+    assert odom.prev_timestamp == 1.0 and odom.prev_points is reference and odom.gap_frames == 0
+    later = odom.process(ids, GRID_UV, FLAT_DEPTH, timestamp=1.1)
+    assert later.pose.ok and later.dt == pytest.approx(0.1)
+
+
+def two_step_plane_scene(seed, delta_a, delta_b):
+    """
+    Slanted wall seen from C0, C1, C2. Per-step motions (R_01, displacement in the later frame) are
+    ([0.5, 1, -0.5] deg, delta_a) for C0 -> C1 and ([-0.3, 0.8, 0.2] deg, delta_b) for C1 -> C2.
+    Returns ids, (uv, depth) for each frame, and R_20, t_20 (X2 = R_20 X0 + t_20).
+    """
+    rng = np.random.default_rng(seed)
+    n0 = np.array([0.0, 0.2, 1.0]); n0 /= np.linalg.norm(n0)
+    d0 = 3.0
+    depth0 = plane_depth_image(n0, d0)
+    uv0 = np.stack([rng.uniform(40, WIDTH - 40, 250), rng.uniform(40, HEIGHT - 40, 250)], axis=1)
+    P0 = back_project(uv0, lookup_depth(depth0, uv0, PnPParams(depth_window=0)), K)
+
+    _, R_10, t_10 = make_motion(np.radians([0.5, 1.0, -0.5]), delta_a)
+    _, R_21, t_21 = make_motion(np.radians([-0.3, 0.8, 0.2]), delta_b)
+    R_20, t_20 = R_21 @ R_10, R_21 @ t_10 + t_21
+
+    views = [(uv0, depth0)]
+    inside = np.ones(len(P0), dtype=bool)
+    for R, t in ((R_10, t_10), (R_20, t_20)):
+        uv = project(transform(P0, R, t))
+        inside &= (uv[:, 0] > 2) & (uv[:, 0] < WIDTH - 2) & (uv[:, 1] > 2) & (uv[:, 1] < HEIGHT - 2)
+        n = R @ n0
+        views.append((uv, plane_depth_image(n, d0 + n @ t)))
+    ids = np.flatnonzero(inside)
+    return ids, [(uv[ids], depth) for uv, depth in views], R_20, t_20
+
+
+def test_failed_frame_keeps_the_last_good_reference():
+    """Frame 0 good, frame 1 fails (LK errors on most features), frame 2 is solved against frame 0."""
+    delta_b = np.array([0.04, 0.01, 0.05])
+    ids, ((uv0, depth0), (uv1, depth1), (uv2, depth2)), R_20, t_20 = two_step_plane_scene(
+        9, np.array([0.03, 0.0, 0.06]), delta_b)
+    rng = np.random.default_rng(10)
+    bad = rng.random(len(ids)) < 0.8
+    uv1_blurred = uv1 + bad[:, None] * rng.uniform(-80, 80, (len(ids), 2))
+
+    odom = PnPOdometry(K)
+    odom.process(ids, uv0, depth0, 10.0)
+    failed = odom.process(ids, uv1_blurred, depth1, 10.0667)
+    assert failed.pose.reason in ("too_few_inliers", "pnp_failed")
+    assert failed.pose.matches == len(ids)
+    assert failed.dt == pytest.approx(0.0667) and failed.reference_age_s == pytest.approx(0.0667)
+    assert failed.gap_frames == 0 and not failed.reference_reset
+    assert odom.prev_timestamp == 10.0 and odom.gap_frames == 1
+
+    R_02 = R_20.T
+    good = odom.process(ids, uv2, depth2, 10.1333, R_prior=R_02)  # gyro integrated over the whole gap
+    assert good.pose.ok, good.pose.reason
+    assert good.dt == pytest.approx(0.1333) and good.reference_age_s == pytest.approx(0.1333)
+    assert good.gap_frames == 1 and not good.reference_reset
+    # The delta covers 0 -> 2, the interval time_delta_us = dt * 1e6 reports, not just 1 -> 2
+    np.testing.assert_allclose(good.pose.position_delta, -t_20, atol=5e-3)
+    np.testing.assert_allclose(good.pose.angle_delta, matrix_to_rotvec(R_02), atol=math.radians(0.2))
+    assert np.linalg.norm(good.pose.position_delta - delta_b) > 0.03
+    assert good.pose.gyro_disagreement_deg < 0.5
+    # A good frame becomes the reference
+    assert odom.prev_timestamp == 10.1333 and odom.gap_frames == 0
+    assert odom.process(ids, uv2, depth2, 10.2).pose.ok
+
+
+def test_translation_gate_allows_one_step_per_bridged_frame():
+    ids, ((uv0, depth0), (uv1, depth1), (uv2, depth2)), _, t_20 = two_step_plane_scene(
+        11, np.array([0.0, 0.0, 0.07]), np.array([0.0, 0.0, 0.07]))
+    params = PnPParams(max_translation_m=0.1)
+    assert 0.1 < np.linalg.norm(t_20) < 0.2
+
+    direct = PnPOdometry(K, params)
+    direct.process(ids, uv0, depth0, 1.0)
+    assert direct.process(ids, uv2, depth2, 1.2).pose.reason == "implausible_translation"
+
+    bridged = PnPOdometry(K, params)
+    bridged.process(ids, uv0, depth0, 1.0)
+    shuffled = uv1[np.random.default_rng(12).permutation(len(ids))]
+    assert not bridged.process(ids, shuffled, depth1, 1.1).pose.ok
+    frame = bridged.process(ids, uv2, depth2, 1.2)
+    assert frame.pose.ok, frame.pose.reason
+    assert frame.gap_frames == 1
+    np.testing.assert_allclose(frame.pose.position_delta, -t_20, atol=5e-3)
+
+
+def test_stale_reference_is_replaced_after_max_age():
+    ids = np.arange(30)
+    odom = PnPOdometry(K, PnPParams(max_reference_age_s=0.25))
+    odom.process(ids, GRID_UV, FLAT_DEPTH, 1.0)
+    for n, t in enumerate((1.1, 1.2)):
+        frame = odom.process(ids, SHUFFLED_UV, FLAT_DEPTH, t)
+        assert not frame.pose.ok and frame.pose.matches == 30
+        assert frame.gap_frames == n and not frame.reference_reset
+        assert odom.prev_timestamp == 1.0
+    stale = odom.process(ids, SHUFFLED_UV, FLAT_DEPTH, 1.3)
+    assert not stale.pose.ok and stale.reference_reset
+    assert stale.reference_age_s == pytest.approx(0.3) and stale.gap_frames == 2
+    assert odom.prev_timestamp == 1.3 and odom.gap_frames == 0
+    # The failed frame is the new reference: the next frame is solved against it
+    frame = odom.process(ids, SHUFFLED_UV, FLAT_DEPTH, 1.4)
+    assert frame.pose.ok and frame.dt == pytest.approx(0.1) and frame.gap_frames == 0
+
+
+def test_zero_max_age_holds_the_reference():
+    ids = np.arange(30)
+    odom = PnPOdometry(K, PnPParams(max_reference_age_s=0.0))
+    odom.process(ids, GRID_UV, FLAT_DEPTH, 1.0)
+    for t in (2.0, 5.0, 30.0):
+        assert not odom.process(ids, SHUFFLED_UV, FLAT_DEPTH, t).reference_reset
+    frame = odom.process(ids, GRID_UV, FLAT_DEPTH, 31.0)
+    assert frame.pose.ok and frame.dt == pytest.approx(30.0) and frame.gap_frames == 3
+
+
+def test_dying_reference_is_replaced_by_the_current_frame():
+    ids = np.arange(30)
+    odom = PnPOdometry(K, PnPParams(min_inliers=15))
+    odom.process(ids, GRID_UV, FLAT_DEPTH, 1.0)
+    # 20 reference features still tracked: the failure keeps the reference
+    frame = odom.process(ids[:20], SHUFFLED_UV[:20], FLAT_DEPTH, 1.1)
+    assert not frame.pose.ok and frame.pose.matches == 20 and not frame.reference_reset
+    assert odom.prev_timestamp == 1.0
+    # Only 10 left (plus new ids): it can never solve again, so this frame takes over
+    new_ids = np.concatenate([ids[:10], np.arange(100, 120)])
+    dying = odom.process(new_ids, GRID_UV, FLAT_DEPTH, 1.2)
+    assert dying.pose.reason == "too_few_matches" and dying.pose.matches == 10
+    assert dying.reference_reset and dying.gap_frames == 1
+    assert odom.prev_timestamp == 1.2 and sorted(odom.prev_points) == sorted(new_ids.tolist())
+    frame = odom.process(new_ids, GRID_UV, FLAT_DEPTH, 1.3)
+    assert frame.pose.ok and frame.pose.matches == 30 and frame.dt == pytest.approx(0.1)
 
 
 def test_rotation_angle():

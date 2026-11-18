@@ -33,7 +33,10 @@ from tracking_recovery import FeatureTrackerReinit, TrackingRecovery, feature_id
 from vio_log import LOG_ONLY_BANNER, env_forces_log_only, open_vio_log, resolve_log_only, setup_autopilot_output
 
 SUMMARY_INTERVAL = 10.0
+# Gyro history kept before the older of the PnP reference and the current frame
 GYRO_BUFFER_SECONDS = 2.0
+# Hard cap (about 50 s at 200 Hz) for a reference held with --max-reference-age 0
+GYRO_BUFFER_MAX_SAMPLES = 10000
 SNAPSHOT_RGB_SIZE = (640, 400)
 SNAPSHOT_RGB_FPS = 5.0
 
@@ -67,6 +70,9 @@ def parse_args(argv=None):
     parser.add_argument('--reprojection-error', type=float, default=2.0, help='RANSAC threshold (px)')
     parser.add_argument('--gyro-gate', type=float, default=5.0,
                         help='Reject frames whose PnP rotation differs from the gyro by more than this (deg); 0 disables the gyro prior')
+    parser.add_argument('--max-reference-age', type=float, default=1.0,
+                        help='After a failed frame, keep solving against the last good frame for up to this long (s), '
+                             'so the next delta covers the gap; 0 removes the cap')
     parser.add_argument('--min-depth', type=float, default=0.2, help='m')
     parser.add_argument('--max-depth', type=float, default=15.0, help='m')
     parser.add_argument('--recovery-frames', type=int, default=20,
@@ -102,7 +108,7 @@ class GyroBuffer:
     """Device-timestamped gyro samples (rad/s, IMU frame)."""
 
     def __init__(self):
-        self.samples = deque()
+        self.samples = deque(maxlen=GYRO_BUFFER_MAX_SAMPLES)
 
     def add(self, imu_data):
         for packet in imu_data.packets:
@@ -135,6 +141,8 @@ class Stats:
         self.inliers = []
         self.reasons = Counter()
         self.recoveries = 0
+        self.bridged = 0
+        self.reference_resets = 0
 
     def add(self, frame, proc_ms):
         self.frames += 1
@@ -143,8 +151,10 @@ class Stats:
         if frame.pose.ok:
             self.ok += 1
             self.inliers.append(frame.pose.inliers)
+            self.bridged += frame.gap_frames > 0
         else:
             self.reasons[frame.pose.reason] += 1
+            self.reference_resets += frame.reference_reset
 
     def chip_temperature(self):
         if self.device is None:
@@ -165,7 +175,8 @@ class Stats:
                 f"📊 {elapsed:.1f}s: {self.frames / elapsed:.1f} fps, ok {self.ok}/{self.frames}, "
                 f"proc mean {np.mean(self.proc_ms):.1f} ms max {np.max(self.proc_ms):.1f} ms, "
                 f"mean features {np.mean(self.features):.0f}, mean inliers {mean_inliers:.0f}, "
-                f"failures {dict(self.reasons)}{recoveries}{self.chip_temperature()}")
+                f"failures {dict(self.reasons)}, gaps bridged {self.bridged}, reference resets "
+                f"{self.reference_resets}{recoveries}{self.chip_temperature()}")
         else:
             logger.warning(f"📊 {elapsed:.1f}s: no frames received{self.chip_temperature()}")
         self.reset()
@@ -343,7 +354,8 @@ def main(argv=None):
     print(f"📷 Camera: {args.width}x{args.height} @ {args.fps} FPS")
     print(f"📐 Camera Angle: {args.camera_angle}°")
     print(f"🔧 Features on camera: {args.num_features} ({args.corner_detector}), "
-          f"min inliers {args.min_inliers}, gyro gate {args.gyro_gate}°, recovery after {args.recovery_frames} failures")
+          f"min inliers {args.min_inliers}, gyro gate {args.gyro_gate}°, max reference age {args.max_reference_age} s, "
+          f"recovery after {args.recovery_frames} failures")
     print(f"🌊 Stereo: {', '.join(f'{k[7:]}={v}' for k, v in stereo_settings.items())}")
     print(f"📡 MAVLink: {'disabled (log-only)' if log_only else args.vehicle_ip}")
 
@@ -378,6 +390,7 @@ def run(args, log_only, data_log, stereo_settings):
         min_inliers=args.min_inliers,
         reprojection_error_px=args.reprojection_error,
         gyro_gate_deg=args.gyro_gate if args.gyro_gate > 0 else 180.0,
+        max_reference_age_s=args.max_reference_age,
         min_depth_m=args.min_depth,
         max_depth_m=args.max_depth,
     )
@@ -477,10 +490,12 @@ def run(args, log_only, data_log, stereo_settings):
                 new_features, tracked_features = feature_id_counts(previous_ids, id_list)
                 previous_ids = set(id_list)
 
+                # The reference is held across failed frames, so the prior spans the whole gap
+                reference_t = odometry.prev_timestamp
                 R_prior = None
-                if R_cam_imu is not None and odometry.prev_timestamp is not None:
-                    R_prior = gyro.rotation(odometry.prev_timestamp, t, R_cam_imu)
-                gyro.prune(t - GYRO_BUFFER_SECONDS)
+                if R_cam_imu is not None and reference_t is not None:
+                    R_prior = gyro.rotation(reference_t, t, R_cam_imu)
+                gyro.prune((t if reference_t is None else min(t, reference_t)) - GYRO_BUFFER_SECONDS)
 
                 frame = odometry.process(ids, uv, depth, t, R_prior)
                 pose = frame.pose
@@ -544,6 +559,9 @@ def run(args, log_only, data_log, stereo_settings):
                     status="ok" if pose.ok else "rejected",
                     reason=pose.reason or None,
                     sent=sent,
+                    reference_age_s=frame.reference_age_s,
+                    gap_frames=frame.gap_frames,
+                    reference_reset=frame.reference_reset,
                 )
 
                 now = time.monotonic()
@@ -567,7 +585,8 @@ def run(args, log_only, data_log, stereo_settings):
                 logger.debug(
                     f"frame t={t:.3f} dt={frame.dt if frame.dt is not None else float('nan'):.3f}s "
                     f"feat={frame.features} (new {new_features}) depth={frame.valid_depth} match={pose.matches} "
-                    f"inl={pose.inliers} gyro_diff={pose.gyro_disagreement_deg:.2f}° "
+                    f"inl={pose.inliers} gyro_diff={pose.gyro_disagreement_deg:.2f}° gap={frame.gap_frames}"
+                    f"{' reference reset' if frame.reference_reset else ''} "
                     f"{'ok' if pose.ok else pose.reason} proc={proc_ms:.1f}ms")
                 stats.add(frame, proc_ms)
                 stats.maybe_report()

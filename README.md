@@ -76,6 +76,7 @@ Open `http://<vehicle>:8095` (or the extension's entry in the BlueOS menu). Savi
 | VIO Iterations | 3 | Optimizer iterations per frame. |
 | PnP Features | 300 | PnP only: target number of features tracked on the camera. The Basalt settings above are ignored in PnP mode. |
 | PnP Recovery After (frames) | 20 | PnP only: consecutive failed frames before [tracking recovery](#tracking-recovery-pnp); 0 disables it. |
+| PnP Max Reference Age (s) | 1.0 | PnP only: how long [failed frames](#failed-frames-pnp) keep the last good frame as the reference (`--max-reference-age`); 0 removes the limit. |
 | Snapshots | on | PnP only: allow [camera snapshots](#snapshots-pnp). Nothing is streamed until one is requested. |
 | Vehicle IP | 127.0.0.1 | Where mavlink2rest is reachable. The extension uses host networking, so the default works on the vehicle itself. |
 | Quality Rate (Hz) | 1 | Rate of the `NAMED_VALUE_FLOAT` quality messages. |
@@ -158,17 +159,30 @@ Each VIO process start writes a JSONL file to `/app/data/logs/` (`/usr/blueos/ex
   - `intrinsics`: the camera matrix used (`fx, fy, cx, cy`) and its `source` (`frame`, `cam_b`, `cam_c` or `cam_b (fallback)`);
   - `snapshots`: the available `streams`, and `unavailable` ones with the reason;
   - `recovery`: see [Tracking recovery](#tracking-recovery-pnp).
-- `"type": "step"` lines (PnP only): one per frame, with `device_timestamp`, `sequence`, `time_delta_us`, `position_delta` and `angle_delta` (body FRD, exactly what is or would be sent), `confidence`, `features`, `new_features` and `tracked_features` (ids not seen / seen in the previous frame), `valid_depth`, `matches`, `inliers`, `reprojection_rms_px`, `gyro_disagreement_deg`, `proc_ms`, `status` (`ok` or `rejected`), `reason` and `sent`. The deltas are `null` for rejected frames.
+- `"type": "step"` lines (PnP only): one per frame, with `device_timestamp`, `sequence`, `time_delta_us`, `position_delta` and `angle_delta` (body FRD, exactly what is or would be sent), `confidence`, `features`, `new_features` and `tracked_features` (ids not seen / seen in the previous frame), `valid_depth`, `matches`, `inliers`, `reprojection_rms_px`, `gyro_disagreement_deg`, `proc_ms`, `status` (`ok` or `rejected`), `reason`, `sent`, and `reference_age_s`, `gap_frames` and `reference_reset` (see [Failed frames](#failed-frames-pnp)). The deltas are `null` for rejected frames.
 
 Basalt runs write the events only, not per-frame poses. The supervisor appends its launches, exits (code or signal), restarts and stops to `supervisor.jsonl` in the same directory. Nothing is rotated or deleted. The configuration page links to the files.
 
+## Failed frames (PnP)
+
+A frame fails when PnP finds no trustworthy pose: too few matches or inliers, a rotation that disagrees with the gyro (`--gyro-gate`), or an implausible translation. Nothing is sent for it, but the last good frame stays the reference, so the next good frame is solved against it. Its `VISION_POSITION_DELTA` then covers the whole gap since that frame: `time_delta_us`, `position_delta` and `angle_delta` all span the same interval, and the gyro prior is integrated over it too. Before, the failed frame became the reference and the motion up to it was lost; failures cluster during fast motion, so this lost a share of the distance travelled.
+
+Only the reference frame's points are used. The failed frame's own points are in its own camera frame, which has no pose, so they can't be added to the reference. As features stop being tracked, the reference only loses matches. A failed frame replaces the reference (the gap is dropped, as before) when:
+
+- the reference is older than *PnP Max Reference Age* (`--max-reference-age`, default 1 s), or
+- fewer than `--min-inliers` (15) reference points are still matched, so it can never solve again.
+
+The translation gate (0.5 m) applies per frame interval: a solve that bridges *n* failed frames may move up to (n + 1) × 0.5 m. The gyro gate stays at 5°, because it bounds an error, not the motion. Frames with a repeated or earlier timestamp are rejected and leave the reference alone. [Tracking recovery](#tracking-recovery-pnp) still drops the reference.
+
+Each JSONL step records `reference_age_s` (age of the reference the frame was solved against, the same as the delta's interval), `gap_frames` (failed frames between the reference and this frame) and `reference_reset` (this failed frame replaced the reference). The 10 s summary counts the gaps bridged and the reference resets.
+
 ## Tracking recovery (PnP)
 
-In a pool test (`vio-20261117-180438-381.jsonl`), PnP tracked every frame for 10 minutes with about 110 features. After the vehicle was handled, it never recovered: the camera kept reporting 10–40 features with depth on only a few, even after the vehicle was static again at its starting heading. A restart in the same scene gave 106 features and 92% good frames. The host keeps no state beyond the previous frame, so the stuck state is in the camera's feature tracker. See [NOTES_OPTION_D.md](NOTES_OPTION_D.md#tracking-degradation-in-the-first-pool-test).
+In a pool test (`vio-20261117-180438-381.jsonl`), PnP tracked every frame for 10 minutes with about 110 features. After the vehicle was handled, it never recovered: the camera kept reporting 10–40 features with depth on only a few, even after the vehicle was static again at its starting heading. A restart in the same scene gave 106 features and 92% good frames. At the time, the host kept no state beyond the previous frame, so the stuck state is in the camera's feature tracker. See [NOTES_OPTION_D.md](NOTES_OPTION_D.md#tracking-degradation-in-the-first-pool-test).
 
 After *PnP Recovery After* (`--recovery-frames`, default 20) consecutive failed frames, the VIO process:
 
-1. drops the host PnP reference, so the next frame starts a new baseline;
+1. drops the host PnP reference, including one held across failed frames, so the next frame starts a new baseline;
 2. re-initialises the camera's `FeatureTracker` through its `inputConfig` queue, without restarting the pipeline: it sends a config with the feature maintainer off, then the normal config one frame later, to make the tracker detect features from scratch.
 
 If tracking still fails, the wait before the next recovery doubles each time (20, 40, 80, ... frames, up to 16×). A successful frame resets the counter and the wait. Each recovery logs a warning and writes a `recovery` event with `count`, `failed_frames`, `reason`, `features`, `valid_depth`, `matches` and `next_after`. The 10 s summary counts recoveries, and the per-frame `new_features` and `tracked_features` show whether the tracker is re-detecting or stuck on old ids.

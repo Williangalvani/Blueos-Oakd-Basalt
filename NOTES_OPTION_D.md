@@ -40,15 +40,15 @@ python /app/pnp_vio.py --fps 15 --width 640 --height 400 --num-features 300 --ve
 **Host (Pi), for each synced group:**
 1. Drain the IMU queue into a gyro buffer.
 2. Look up depth at each feature: the median of the valid pixels in a 5×5 window. 0 and out-of-range values are rejected, and at least 30% of the window must be valid. Valid features are back-projected with the rectified-left intrinsics.
-3. Match the features to the previous frame by id. The previous frame supplies the 3D points, the current frame the 2D points.
-4. Integrate the gyro between the two frame timestamps to get the rotation prior `R_01`.
+3. Match the features to the reference frame by id: the last good frame, usually the previous one. The reference supplies the 3D points, the current frame the 2D points.
+4. Integrate the gyro between the reference and current timestamps to get the rotation prior `R_01`. The gyro buffer keeps 2 s before the older of the two (capped at 10000 samples), and `integrate_gyro` returns no prior if there is a hole over 0.1 s in the interval.
 5. Run `cv2.solvePnPRansac`, seeded with the gyro rotation (EPnP minimal sets, then LM refine on the inliers).
 6. Reject the frame if:
    - there are fewer than 15 inliers, or the inlier ratio is below 0.3;
    - the PnP rotation differs from the gyro by more than 5° (`--gyro-gate`);
-   - the translation is over 0.5 m per frame.
-7. On success, convert to body FRD and send `VISION_POSITION_DELTA` with the real `angle_delta` and a confidence of `100 · inlier_ratio · min(1, inliers/60)`.
-8. On failure, send nothing for that interval. The current frame becomes the new reference ("baseline reset"), so the next delta starts here and no jump is integrated. `VIO_TRACK` goes to 0.
+   - the translation is over 0.5 m per frame interval, that is (1 + `gap_frames`) × 0.5 m for a solve that bridges failed frames.
+7. On success, convert to body FRD and send `VISION_POSITION_DELTA` with the real `angle_delta` and a confidence of `100 · inlier_ratio · min(1, inliers/60)`. The current frame becomes the reference.
+8. On failure, send nothing and keep the reference, so the next good delta (and its `dt`) covers the gap since the last good frame. Points from the failed frame aren't merged in: without its pose they can't be expressed in the reference camera. The failed frame replaces the reference instead (old "baseline reset", the gap is dropped) if the reference is older than `--max-reference-age` (1 s; 0 = no cap) or fewer than `--min-inliers` reference points are still matched. Repeated or earlier timestamps leave the reference alone. `VIO_TRACK` goes to 0. Until task 6 every failed frame became the reference, which dropped the motion between the last good frame and the failure.
 9. After `--recovery-frames` (20) consecutive failures (`no_reference` frames don't count), `PnPOdometry.reset()` drops the reference. A `FeatureTrackerConfig` with the maintainer off goes to `feature_tracker.inputConfig`, then the normal config the next frame. The next recovery waits twice as long, up to 16×; a success resets the wait.
 
 **Snapshots.** A `Script` node gets `rectifiedLeft`, `rectifiedRight`, `depth` and, if the device has CAM_A, a 640×400 NV12 output at 5 fps. Each goes into a non-blocking size-1 input, so it holds just the latest frame. A `dai.Buffer` on its `request` input, with the stream index as sequence number, makes it forward one frame. `stereo.setNumFramesPool(4)` (default 3) covers the frame each gate input keeps. On the host, `SnapshotService.tick()` and one `tryGet()` run each frame. They are counted in `proc_ms`. The PNG work runs on the `SnapshotWriter` thread. The request/response files are described in the README.
@@ -69,7 +69,7 @@ python /app/pnp_vio.py --fps 15 --width 640 --height 400 --num-features 300 --ve
   - Frame time is the depth frame's device timestamp at mid-exposure (`CameraExposureOffset.MIDDLE`), which is how `RTABMapVIO` stamps frames.
   - Gyro samples use the device timestamp of each `gyroscope` report, on the same clock.
   - `time_delta_usec` comes from device timestamps. `time_usec` is host wall time, as in `MavlinkNode`.
-- **Gyro → camera:** the rotation part of `calib.getImuToCameraExtrinsics(CAM_B, True)`. The integration holds each sample until the next one (zero-order hold). Gyro bias isn't estimated; a raw bias of a few deg/s is well inside the 5° per-frame gate at 15 fps. If the extrinsics are missing, the gyro prior and gate are disabled.
+- **Gyro → camera:** the rotation part of `calib.getImuToCameraExtrinsics(CAM_B, True)`. The integration holds each sample until the next one (zero-order hold). Gyro bias isn't estimated; a raw bias of a few deg/s is well inside the 5° per-frame gate at 15 fps, but over a reference held for the full 1 s it would use most of the gate. If the extrinsics are missing, the gyro prior and gate are disabled.
 - **Dropped frames:** the sync output queue is non-blocking with size 4. If the host falls behind, frames are dropped. Ids persist on the device, so the next delta simply covers a longer `dt`.
 - **NAMED_VALUE_FLOAT names (max 10 chars):** `VIO_TRACK` (0/1, sent on every change plus at `--quality-rate`), `VIO_INLIER`, `VIO_FEAT`, `VIO_CONF`, `VIO_PROCMS`.
   - `name` goes out as a NUL-padded char list, the way `AutopilotParams` encodes `param_id`.
@@ -97,6 +97,7 @@ python /app/pnp_vio.py --fps 15 --width 640 --height 400 --num-features 300 --ve
   - the snapshot request → device → PNG → endpoint path, with a fake device and a thread standing in for VIO;
   - the recovery state machine;
   - `pnp_vio.run()` replaying the collapse with a fake pipeline. That run checks two recoveries, maintainer off/on configs, the `intrinsics` event `source: frame`, and a snapshot served mid-run.
+- Reference held across failed frames (task 6): 129 tests, adding a slanted-wall run where frame 1 fails and frame 2's delta and `dt` cover 0 → 2, the per-interval translation gate, the age cap (and 0 = no cap), a dying reference, timestamps that go backwards, gyro integration over long intervals with holes, recovery clearing a held reference, and `pnp_vio.run()` runs checking `time_delta_us` and the gyro prior over a 2.6 s gap.
 - Snapshot host overhead on a desktop with a 300-feature PnP frame: 0.9 ms/frame without snapshots, 1.0 ms with a request every frame (`/tmp/bench_snapshots.py`, not in the repo).
 
 ## To verify on hardware
@@ -132,7 +133,7 @@ Data: `~/oakd-stage1/flight1/vio-20261117-180438-381.jsonl` (14530 frames at 10 
 Every failure after 690 s is `too_few_matches`. In the whole run there are no `gyro_mismatch` rejections and one sequence gap. A restart in the same scene gave 106 features and 92% ok (from the task description).
 
 Ruled out:
-- **Host reference or gyro prior stuck:** `PnPOdometry` replaces its reference with the current frame on every frame, ok or not (`prev_points = current`). The only cross-frame state is that reference and the gyro buffer, and the gyro gate never fired. A stuck host would show many matches and a rejection reason other than `too_few_matches`.
+- **Host reference or gyro prior stuck:** at the time, `PnPOdometry` replaced its reference with the current frame on every frame, ok or not (`prev_points = current`). The only cross-frame state is that reference and the gyro buffer, and the gyro gate never fired. A stuck host would show many matches and a rejection reason other than `too_few_matches`.
 - **No keyframe to reset:** PnP is frame-to-frame.
 - **Scene alone:** during the 720–1200 s turn the camera swept every heading, including the starting one, at ~0.1°/frame, slow enough for LK tracking. Features stayed at 35–47 and never got back to ~110. At the end the vehicle was static, with depth on 60–70% of the features (it was ~30% at the start), at about the starting heading. Yet the tracker reported 9–16 features instead of ~110. The DVL suggests about 1.5 m of translation during the second handling, but it drifts ~0.5 cm/s while static, so that is weak evidence.
 
@@ -140,7 +141,7 @@ Conclusion: the collapse is in the camera's `FeatureTracker`, which never repopu
 
 ## Running it in the extension
 
-Select *PnP* as the algorithm on the configuration page (or POST `"algorithm": "pnp"` to `/api/config`). `main.py` then starts `python -u /app/pnp_vio.py` with the FPS, camera angle, resolution, vehicle IP, quality rate, *PnP Features*, *PnP Recovery After*, *Snapshots* and *Stereo Depth (PnP)* settings. Output is unbuffered and goes to the container log. The web UI is on port 8095 (8080 is taken by mavlink-server on BlueOS 1.4.x). At startup the log shows the device name, IMU and USB speed. Every 10 s it prints fps, ok/total, mean/max processing time, mean features, mean inliers, failure reasons and the chip temperature.
+Select *PnP* as the algorithm on the configuration page (or POST `"algorithm": "pnp"` to `/api/config`). `main.py` then starts `python -u /app/pnp_vio.py` with the FPS, camera angle, resolution, vehicle IP, quality rate, *PnP Features*, *PnP Recovery After*, *PnP Max Reference Age*, *Snapshots* and *Stereo Depth (PnP)* settings. Output is unbuffered and goes to the container log. The web UI is on port 8095 (8080 is taken by mavlink-server on BlueOS 1.4.x). At startup the log shows the device name, IMU and USB speed. Every 10 s it prints fps, ok/total, mean/max processing time, mean features, mean inliers, failure reasons and the chip temperature.
 
 ## Device open and restarts
 

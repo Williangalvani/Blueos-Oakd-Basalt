@@ -110,12 +110,15 @@ def test_unset_optionals_on_the_command_line():
 
 def test_main_command_passes_stereo_recovery_and_snapshot_args(client, pnp_vio):
     main, _ = client
-    config = {**main.DEFAULT_CONFIG, "algorithm": "pnp", **CUSTOM, "tracking_recovery_frames": 7, "snapshots": False}
+    config = {**main.DEFAULT_CONFIG, "algorithm": "pnp", **CUSTOM, "tracking_recovery_frames": 7, "snapshots": False,
+              "max_reference_age": 0.5}
     cmd = main.build_vio_command(config)
     assert cmd[:3] == ["python", "-u", "/app/pnp_vio.py"]
     args = pnp_vio.parse_args(cmd[3:])
     assert resolve_stereo_settings(args) == resolve_stereo_settings(CUSTOM)
-    assert args.recovery_frames == 7 and args.snapshots is False
+    assert args.recovery_frames == 7 and args.snapshots is False and args.max_reference_age == 0.5
+    assert pnp_vio.parse_args(main.build_vio_command(main.DEFAULT_CONFIG | {"algorithm": "pnp"})[3:]
+                              ).max_reference_age == 1.0
 
     basalt = main.build_vio_command({**config, "algorithm": "basalt"})
     assert not any(token.startswith("--stereo") for token in basalt)
@@ -139,6 +142,7 @@ def test_old_config_files_get_stereo_defaults(client):
     main.save_config({"algorithm": "pnp", "fps": 10})
     config = main.load_config()
     assert config["stereo_confidence_threshold"] == 50 and config["tracking_recovery_frames"] == 20
+    assert config["max_reference_age"] == 1.0
     assert "--stereo-preset" in main.build_vio_command(config)
 
 

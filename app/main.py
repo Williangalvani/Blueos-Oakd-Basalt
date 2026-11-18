@@ -48,6 +48,7 @@ DEFAULT_CONFIG = {
     # PnP (option D) parameters
     "num_features": 300,
     "tracking_recovery_frames": 20,
+    "max_reference_age": 1.0,
     "snapshots": True,
     **STEREO_DEFAULTS,
     # Passive logger: no MAVLink output, autopilot params untouched (OAKD_LOG_ONLY=1 forces it on)
@@ -72,6 +73,7 @@ class BaseVIOConfig(BaseModel):
     optical_flow_skip_frames: int = 1
     num_features: int = 300
     tracking_recovery_frames: int = 20
+    max_reference_age: float = 1.0
     snapshots: bool = True
     log_only: bool = False
 
@@ -128,6 +130,7 @@ def build_vio_command(config: dict) -> list:
             *common_args,
             "--num-features", str(config["num_features"]),
             "--recovery-frames", str(int(config["tracking_recovery_frames"])),
+            "--max-reference-age", str(float(config["max_reference_age"])),
             "--snapshots" if config["snapshots"] else "--no-snapshots",
             *stereo_command_args(config),
         ]
@@ -416,6 +419,11 @@ async def index():
                     <label>PnP Recovery After (frames)</label>
                     <input type="number" name="tracking_recovery_frames" value="{tracking_recovery_frames}" min="0" max="1000">
                     <div class="hint">PnP only: consecutive failed frames before the tracker is re-initialised; 0 disables</div>
+                </div>
+                <div class="field">
+                    <label>PnP Max Reference Age (s)</label>
+                    <input type="number" name="max_reference_age" value="{max_reference_age}" step="0.1" min="0" max="10">
+                    <div class="hint">PnP only: how long failed frames keep the last good frame as reference, so the next delta covers the gap; 0 = no limit</div>
                 </div>
                 <div class="field">
                     <label class="checkbox">
