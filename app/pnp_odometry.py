@@ -59,6 +59,17 @@ class Intrinsics:
         ])
 
 
+def refracted_intrinsics(intrinsics, refractive_index=1.0):
+    """
+    Effective pinhole matrix behind a flat port in a medium of refractive_index, from the in-air
+    calibration (paraxial): a ray at angle a in the water leaves the port at n*tan(a), so fx and fy
+    become n*fx, n*fy; cx, cy are unchanged. The device's stereo depth is low by the same factor
+    (Z = n*f*B/d), which PnPParams.refractive_index puts back.
+    """
+    n = float(refractive_index)
+    return Intrinsics(fx=intrinsics.fx * n, fy=intrinsics.fy * n, cx=intrinsics.cx, cy=intrinsics.cy)
+
+
 def intrinsics_from_frame(matrix, frame_size, image_size):
     """
     Intrinsics on the image_size (width, height) grid from an ImgFrame's transformation. On the
@@ -120,6 +131,9 @@ class PnPParams:
     # User correction (--depth-scale) multiplied into the looked-up depth, so translation scales with it;
     # min/max_depth_m apply to the uncorrected device depth
     depth_correction: float = 1.0
+    # Medium in front of a flat port (--refractive-index, 1.0 = air): multiplies the looked-up depth on top
+    # of depth_correction, and PnPOdometry multiplies fx, fy of its camera matrix by it (refracted_intrinsics)
+    refractive_index: float = 1.0
     min_valid_depth_fraction: float = 0.3
 
 
@@ -159,8 +173,8 @@ class FrameResult:
 def lookup_depth(depth, uv, params=PnPParams()):
     """
     Depth in metres at each pixel in uv (N x 2), as the median of the valid pixels in a
-    (2w+1)^2 window, times params.depth_correction. Zero and out-of-range depths are ignored;
-    returns NaN where too few window pixels are valid.
+    (2w+1)^2 window, times params.depth_correction and params.refractive_index. Zero and out-of-range
+    depths are ignored; returns NaN where too few window pixels are valid.
     """
     uv = np.asarray(uv, dtype=np.float64).reshape(-1, 2)
     if len(uv) == 0:
@@ -181,7 +195,7 @@ def lookup_depth(depth, uv, params=PnPParams()):
         z = np.nanmedian(samples, axis=1)
     enough = valid.sum(axis=1) >= max(1, math.ceil(params.min_valid_depth_fraction * samples.shape[1]))
     z[~enough] = np.nan
-    return z * params.depth_correction
+    return z * (params.depth_correction * params.refractive_index)
 
 
 def back_project(uv, z, intrinsics):
@@ -354,11 +368,15 @@ class PnPOdometry:
     A failed frame replaces the reference instead (the gap is dropped, frame.reference_reset) when
     the reference is older than params.max_reference_age_s, or fewer than params.min_inliers of
     its points are still matched, so it could never solve again.
+
+    intrinsics is the in-air camera matrix (calibration_intrinsics); the matrix used for back-projection
+    and PnP (intrinsics) has fx, fy multiplied by params.refractive_index.
     """
 
     def __init__(self, intrinsics, params=None, image_size=None):
-        self.intrinsics = intrinsics
         self.params = params or PnPParams()
+        self.calibration_intrinsics = intrinsics
+        self.intrinsics = refracted_intrinsics(intrinsics, self.params.refractive_index)
         # (width, height) of the feature pixel grid; depth may be coarser (decimation)
         self.image_size = image_size
         self.reset()

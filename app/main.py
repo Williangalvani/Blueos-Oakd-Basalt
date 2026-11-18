@@ -18,8 +18,9 @@ import uvicorn
 import depth_probe
 import snapshots
 import vio_log
-from stereo_config import (DEPTH_SCALE_RANGE, INTRINSICS_SOURCES, STEREO_DEFAULTS, STEREO_SETTINGS,
-                           parse_intrinsics_override, stereo_command_args)
+from stereo_config import (DEFAULT_REFRACTIVE_INDEX, DEPTH_SCALE_RANGE, INTRINSICS_SOURCES, REFRACTIVE_INDEX_RANGE,
+                           STEREO_DEFAULTS, STEREO_SETTINGS, clamp_refractive_index, parse_intrinsics_override,
+                           stereo_command_args)
 from vio_supervisor import VIOSupervisor
 
 WEB_PORT = 8095
@@ -61,6 +62,7 @@ DEFAULT_CONFIG = {
     "intrinsics_from": "rectified",
     "intrinsics_override": None,
     "depth_scale": 1.0,
+    "refractive_index": DEFAULT_REFRACTIVE_INDEX,
     **STEREO_DEFAULTS,
     # Passive logger: no MAVLink output, autopilot params untouched (OAKD_LOG_ONLY=1 forces it on)
     "log_only": False,
@@ -89,6 +91,7 @@ class BaseVIOConfig(BaseModel):
     intrinsics_from: Literal[INTRINSICS_SOURCES] = "rectified"
     intrinsics_override: Optional[str] = None
     depth_scale: float = Field(1.0, ge=DEPTH_SCALE_RANGE[0], le=DEPTH_SCALE_RANGE[1])
+    refractive_index: float = Field(DEFAULT_REFRACTIVE_INDEX, ge=REFRACTIVE_INDEX_RANGE[0], le=REFRACTIVE_INDEX_RANGE[1])
     log_only: bool = False
 
     @field_validator("intrinsics_override")
@@ -156,6 +159,7 @@ def build_vio_command(config: dict) -> list:
             "--snapshots" if config["snapshots"] else "--no-snapshots",
             "--intrinsics-from", config.get("intrinsics_from") or "rectified",
             "--depth-scale", str(float(config.get("depth_scale", 1.0))),
+            "--refractive-index", str(clamp_refractive_index(config.get("refractive_index", DEFAULT_REFRACTIVE_INDEX))),
             *stereo_command_args(config),
         ]
         if config.get("intrinsics_override"):
@@ -373,6 +377,7 @@ async def index():
             <div class="status-dot"></div>
             <span id="status-text">Checking...</span>
         </div>
+        <div id="camera-status" class="hint"></div>
         <div id="log-only-banner" class="log-only" hidden></div>
         
         <form id="config-form">
@@ -478,7 +483,12 @@ async def index():
                 <div class="field">
                     <label>PnP Depth Scale</label>
                     <input type="number" name="depth_scale" value="{depth_scale}" step="0.001" min="0.2" max="5">
-                    <div class="hint">PnP only: multiplies the camera depth, and so the translation (e.g. a correction measured with the depth probe); 1 = none</div>
+                    <div class="hint">PnP only: extra trim on the camera depth on top of the refractive index (e.g. a residual measured with the depth probe); 1 = none</div>
+                </div>
+                <div class="field">
+                    <label>PnP Refractive Index (water)</label>
+                    <input type="number" name="refractive_index" value="{refractive_index}" step="0.001" min="1" max="2">
+                    <div class="hint">PnP only: water in front of the flat port. The calibration is in air, so fx, fy and the depth are multiplied by it. 1.333 fresh water, ~1.34 sea water, 1.0 = in air (bench tests)</div>
                 </div>
             </div>
 
@@ -581,7 +591,20 @@ async def index():
                     banner.textContent = data.log_only_forced_by_env
                         ? 'LOG-ONLY (forced by OAKD_LOG_ONLY on the container): nothing is sent to the autopilot'
                         : 'LOG-ONLY: nothing is sent to the autopilot';
+                    document.getElementById('camera-status').textContent = cameraSummary(data.camera);
                 });
+        }
+
+        function cameraSummary(camera) {
+            if (!camera || !camera.intrinsics) return '';
+            const k = values => values.map(v => v.toFixed(1)).join(', ');
+            let text = 'PnP camera matrix (' + camera.source + ', in air) fx, fy, cx, cy = ' + k(camera.intrinsics);
+            if (camera.refractive_index !== undefined) {
+                text += ' · n ' + camera.refractive_index + ' × depth scale ' + camera.depth_scale
+                    + ' → effective ' + k(camera.effective_intrinsics) + ', depth × '
+                    + camera.total_depth_scale.toFixed(4);
+            }
+            return text;
         }
 
         function updateLogs() {
@@ -914,7 +937,8 @@ def get_focal_check(tolerance: float = Query(0.15, gt=0.0, lt=1.0)):
         device_timestamps=timestamps, timestamp_spread_s=(max(known) - min(known)) if known else None,
         note="rect_left, rect_right and depth are separate snapshots about 1 s apart, not one stereo pair: keep the "
              "camera and the scene still. This checks fx against the focal length the device used for depth; it "
-             "does not check fy, cx or cy.")
+             "does not check fy, cx or cy. It uses the in-air camera matrix: the device depth is computed with the "
+             "in-air focal length, so the refractive index cancels out and the check holds in water too.")
     return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
 

@@ -18,6 +18,7 @@ from pnp_odometry import (  # noqa: E402
     intrinsics_from_frame,
     lookup_depth,
     matrix_to_rotvec,
+    refracted_intrinsics,
     rotation_angle,
     rotvec_to_matrix,
     scale_to_depth_grid,
@@ -542,6 +543,86 @@ def test_lookup_depth_applies_unit_and_correction_after_the_range_check():
     assert z[0] == pytest.approx(2.5)
     assert math.isnan(z[1])
     assert lookup_depth(depth, uv[:1], PnPParams(depth_unit_scale=0.01, max_depth_m=30.0))[0] == pytest.approx(20.0)
+
+
+N_WATER = 1.333
+
+
+def test_refracted_intrinsics_scales_the_focal_lengths_only():
+    water = refracted_intrinsics(K_RECTIFIED, N_WATER)
+    assert water.fx == pytest.approx(163.1 * N_WATER) and water.fy == pytest.approx(237.1 * N_WATER)
+    assert (water.cx, water.cy) == (K_RECTIFIED.cx, K_RECTIFIED.cy)
+    assert refracted_intrinsics(K_RECTIFIED, 1.0) == K_RECTIFIED
+    assert refracted_intrinsics(K_RECTIFIED) == K_RECTIFIED
+
+
+def test_odometry_uses_the_refracted_matrix_and_keeps_the_calibration():
+    odom = PnPOdometry(K_RECTIFIED, PnPParams(refractive_index=N_WATER))
+    assert odom.calibration_intrinsics == K_RECTIFIED
+    assert odom.intrinsics == refracted_intrinsics(K_RECTIFIED, N_WATER)
+    assert PnPOdometry(K_RECTIFIED).intrinsics == K_RECTIFIED
+
+
+def test_lookup_depth_multiplies_refractive_index_and_depth_scale():
+    depth = np.full((HEIGHT, WIDTH), 2000, dtype=np.uint16)
+    depth[0:5, 0:5] = 150  # below min depth on the device value, whatever the factors
+    uv = np.array([[320.0, 200.0], [2.0, 2.0]])
+    assert lookup_depth(depth, uv[:1], PnPParams())[0] == pytest.approx(2.0)
+    assert lookup_depth(depth, uv[:1], PnPParams(refractive_index=1.0))[0] == pytest.approx(2.0)
+    z = lookup_depth(depth, uv, PnPParams(refractive_index=N_WATER, depth_correction=1.1, min_depth_m=0.2))
+    assert z[0] == pytest.approx(2.0 * N_WATER * 1.1) and math.isnan(z[1])
+
+
+def flat_port_motion(delta, n, seed=21):
+    """
+    A wall 2 m away seen from behind a flat port in water of index n, the camera translating by delta.
+    Paraxially the in-air K_RECTIFIED images the scene like n*fx, n*fy, and the device's stereo depth is
+    the true Z / n. Returns the position_delta PnP recovers with refractive_index n and with 1.0.
+    """
+    rng = np.random.default_rng(seed)
+    K_water = refracted_intrinsics(K_RECTIFIED, n)
+    normal = np.array([0.1, 0.15, 1.0]); normal /= np.linalg.norm(normal)
+
+    def device_depth(d):
+        return np.rint(plane_depth_image(normal, d, K_water) / n).astype(np.uint16)
+
+    uv0 = np.stack([rng.uniform(15, WIDTH - 15, 300), rng.uniform(15, HEIGHT - 15, 300)], axis=1)
+    depth0 = device_depth(2.0)
+    P0 = back_project(uv0, n * lookup_depth(depth0, uv0, PnPParams(depth_window=0)), K_water)
+    t_10 = -np.asarray(delta, dtype=np.float64)
+    uv1 = project(P0 + t_10, K_water)
+    depth1 = device_depth(2.0 + normal @ t_10)
+    keep = (uv1[:, 0] > 2) & (uv1[:, 0] < WIDTH - 2) & (uv1[:, 1] > 2) & (uv1[:, 1] < HEIGHT - 2)
+    ids = np.arange(len(uv0))
+    recovered = {}
+    for index in (n, 1.0):
+        odom = PnPOdometry(K_RECTIFIED, PnPParams(refractive_index=index), image_size=(WIDTH, HEIGHT))
+        odom.process(ids, uv0, depth0, 1.0)
+        frame = odom.process(ids[keep], uv1[keep], depth1, 1.1, R_prior=np.eye(3))
+        assert frame.pose.ok, frame.pose.reason
+        recovered[index] = frame.pose.position_delta
+    return recovered
+
+
+def test_refractive_index_recovers_true_motion_behind_a_flat_port():
+    delta = np.array([0.03, -0.02, 0.06])
+    recovered = flat_port_motion(delta, N_WATER)
+    water, air = recovered[N_WATER], recovered[1.0]
+    np.testing.assert_allclose(water, delta, atol=1.5e-3)
+    # Same pixel motion, larger translation with n > 1, in the same direction
+    assert np.linalg.norm(water) > np.linalg.norm(air) * 1.1
+    assert np.all(np.sign(water) == np.sign(air)) and np.dot(water, air) / (
+        np.linalg.norm(water) * np.linalg.norm(air)) > 0.95
+    # Paraxially the in-air model only shrinks motion along the optical axis: lateral X = (u - cx) Z / f is
+    # the same with (n f, n Z) as with (f, Z)
+    np.testing.assert_allclose(air[:2], delta[:2], atol=1.5e-3)
+    assert air[2] == pytest.approx(delta[2] / N_WATER, abs=1.5e-3)
+
+
+def test_refractive_index_one_is_the_in_air_model():
+    delta = np.array([0.03, 0.02, 0.05])
+    recovered = flat_port_motion(delta, 1.0)
+    np.testing.assert_allclose(recovered[1.0], delta, atol=1.5e-3)
 
 
 def test_rotation_angle():

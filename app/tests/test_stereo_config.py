@@ -276,3 +276,58 @@ def test_status_reports_the_camera_matrix(client, monkeypatch, tmp_path):
     snapshots.write_camera_status({"source": "rectified", "intrinsics": [163.1, 237.1, 329.4, 199.0]},
                                   tmp_path / "snapshots")
     assert http.get("/api/status").json()["camera"]["source"] == "rectified"
+
+
+@pytest.mark.parametrize("value, ok", [("1", True), ("1.333", True), ("2", True), ("0.999", False), ("2.5", False),
+                                       ("inf", False), ("nan", False), ("x", False)])
+def test_parse_refractive_index(value, ok):
+    if ok:
+        assert stereo_config.parse_refractive_index(value) == float(value)
+    else:
+        with pytest.raises(ValueError):
+            stereo_config.parse_refractive_index(value)
+
+
+@pytest.mark.parametrize("value, clamped", [(1.34, 1.34), (0.5, 1.0), (3, 2.0), (1, 1.0), ("1.2", 1.2),
+                                            (None, 1.333), ("water", 1.333), (float("nan"), 1.333)])
+def test_clamp_refractive_index(value, clamped):
+    assert stereo_config.clamp_refractive_index(value) == clamped
+
+
+def test_main_command_passes_the_refractive_index_clamped(client, pnp_vio):
+    main, _ = client
+    assert main.DEFAULT_CONFIG["refractive_index"] == 1.333
+    pnp = {**main.DEFAULT_CONFIG, "algorithm": "pnp"}
+    assert pnp_vio.parse_args(main.build_vio_command(pnp)[3:]).refractive_index == 1.333
+    assert pnp_vio.parse_args(main.build_vio_command({**pnp, "refractive_index": 1.0})[3:]).refractive_index == 1.0
+    # A hand-edited config.json out of range must not crash-loop the VIO process on its arguments
+    assert pnp_vio.parse_args(main.build_vio_command({**pnp, "refractive_index": 7})[3:]).refractive_index == 2.0
+    config = {key: value for key, value in pnp.items() if key != "refractive_index"}
+    assert pnp_vio.parse_args(main.build_vio_command(config)[3:]).refractive_index == 1.333
+    assert "--refractive-index" not in main.build_vio_command({**main.DEFAULT_CONFIG, "algorithm": "basalt"})
+
+
+def test_config_api_validates_the_refractive_index_and_the_form_shows_it(client):
+    main, http = client
+    body = {**main.DEFAULT_CONFIG, "algorithm": "pnp"}
+    assert http.post("/api/config", json={**body, "refractive_index": 1.0}).status_code == 200
+    assert main.load_config()["refractive_index"] == 1.0
+    assert 'name="refractive_index" value="1.0"' in http.get("/").text
+    for bad in (0.9, 2.1, "salty"):
+        assert http.post("/api/config", json={**body, "refractive_index": bad}).status_code == 422, bad
+    main.save_config({**main.DEFAULT_CONFIG})
+    page = http.get("/").text
+    assert 'name="refractive_index" value="1.333"' in page and "PnP Refractive Index (water)" in page
+    assert 'id="camera-status"' in page and "effective_intrinsics" in page
+
+
+def test_status_reports_the_refractive_index_and_effective_matrix(client, monkeypatch, tmp_path):
+    main, http = client
+    monkeypatch.setattr(main, "SNAPSHOT_DIR", tmp_path / "snapshots")
+    import snapshots
+    snapshots.write_camera_status({"source": "override", "intrinsics": [160.0, 230.0, 330.0, 199.0],
+                                   "effective_intrinsics": [213.28, 306.59, 330.0, 199.0], "refractive_index": 1.333,
+                                   "depth_scale": 1.0, "total_depth_scale": 1.333}, tmp_path / "snapshots")
+    camera = http.get("/api/status").json()["camera"]
+    assert camera["refractive_index"] == 1.333 and camera["effective_intrinsics"][0] == 213.28
+    assert camera["intrinsics"][0] == 160.0 and camera["total_depth_scale"] == 1.333

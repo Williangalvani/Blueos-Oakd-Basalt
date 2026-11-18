@@ -28,10 +28,11 @@ from autopilot_params import AutopilotParams
 from device_open import DEFAULT_TIMEOUT, DeviceOpenTimeout, open_oak_device
 from mavlink_sender import MavlinkSender
 from pnp_odometry import (Intrinsics, PnPOdometry, PnPParams, camera_to_body_frd, integrate_gyro,
-                          intrinsics_from_frame)
+                          intrinsics_from_frame, refracted_intrinsics)
 from rectified_intrinsics import StereoCalibration, as_list, choose_intrinsics, rectified_for_settings
-from stereo_config import (INTRINSICS_SOURCES, add_stereo_arguments, apply_stereo_config, effective_stereo_config,
-                           parse_depth_scale, parse_intrinsics_override, resolve_stereo_settings, stereo_warnings)
+from stereo_config import (DEFAULT_REFRACTIVE_INDEX, INTRINSICS_SOURCES, add_stereo_arguments, apply_stereo_config,
+                           effective_stereo_config, parse_depth_scale, parse_intrinsics_override,
+                           parse_refractive_index, resolve_stereo_settings, stereo_warnings)
 from tracking_recovery import FeatureTrackerReinit, TrackingRecovery, feature_id_counts
 from vio_log import LOG_ONLY_BANNER, env_forces_log_only, open_vio_log, resolve_log_only, setup_autopilot_output
 
@@ -83,8 +84,12 @@ def parse_args(argv=None):
                         metavar='FX,FY,CX,CY',
                         help='Camera matrix in pixels on the width x height grid; wins over --intrinsics-from')
     parser.add_argument('--depth-scale', type=_argument_type(parse_depth_scale), default=1.0,
-                        help='Multiplies the device depth before back-projection, so translation scales with it '
-                             '(e.g. a measured refraction correction); 0.2-5')
+                        help='Extra trim on the device depth before back-projection, on top of --refractive-index; '
+                             'translation scales with it; 0.2-5')
+    parser.add_argument('--refractive-index', type=_argument_type(parse_refractive_index),
+                        default=DEFAULT_REFRACTIVE_INDEX,
+                        help='Medium in front of the flat port (1.333 fresh water, 1.0 in air), 1-2. The calibration is '
+                             'in air: PnP multiplies fx, fy of the camera matrix in use and the device depth by it')
 
     parser.add_argument('--min-inliers', type=int, default=15)
     parser.add_argument('--reprojection-error', type=float, default=2.0, help='RANSAC threshold (px)')
@@ -282,7 +287,11 @@ def select_intrinsics(args, calibration, depth_msg, rectified, rectified_problem
 
 
 def camera_status(args, calibration, rectified, choice, stereo_settings):
-    """What /api/status and /api/focal_check read about the camera matrix in use."""
+    """
+    What /api/status and /api/focal_check read about the camera matrix in use. intrinsics is the in-air
+    matrix the device's depth is consistent with (what the focal check compares); PnP runs with
+    effective_intrinsics and the depth times total_depth_scale.
+    """
     return {
         "pid": os.getpid(),
         "unix_time": time.time(),
@@ -290,6 +299,7 @@ def camera_status(args, calibration, rectified, choice, stereo_settings):
         "source": choice.source,
         "requested_source": args.intrinsics_from,
         "intrinsics": as_list(choice.intrinsics),
+        "effective_intrinsics": as_list(refracted_intrinsics(choice.intrinsics, args.refractive_index)),
         "raw": as_list(calibration.raw),
         "rectified": as_list(rectified),
         "frame": as_list(choice.frame),
@@ -300,6 +310,8 @@ def camera_status(args, calibration, rectified, choice, stereo_settings):
         "baseline_m": calibration.baseline_m,
         "baseline_spec_m": calibration.baseline_spec_m,
         "depth_scale": args.depth_scale,
+        "refractive_index": args.refractive_index,
+        "total_depth_scale": args.depth_scale * args.refractive_index,
         "depth_range_mm": [stereo_settings["stereo_depth_min_mm"], stereo_settings["stereo_depth_max_mm"]],
         "warnings": choice.warnings,
     }
@@ -430,14 +442,17 @@ def main(argv=None):
           f"recovery after {args.recovery_frames} failures")
     print(f"🌊 Stereo: {', '.join(f'{k[7:]}={v}' for k, v in stereo_settings.items())}")
     print(f"📏 Intrinsics from {args.intrinsics_from}"
-          f"{f', override {args.intrinsics_override}' if args.intrinsics_override else ''}, depth scale {args.depth_scale}")
+          f"{f', override {args.intrinsics_override}' if args.intrinsics_override else ''}, "
+          f"refractive index {args.refractive_index}{' (in air)' if args.refractive_index == 1.0 else ''}, "
+          f"depth scale {args.depth_scale}")
     print(f"📡 MAVLink: {'disabled (log-only)' if log_only else args.vehicle_ip}")
 
     data_log = open_vio_log()
     logger.info(f"Data log: {data_log.path}")
     data_log.event("start", algorithm="pnp", args=vars(args), stereo=stereo_settings, log_only=log_only,
                    log_only_forced_by_env=env_forces_log_only(), depth_scale=args.depth_scale,
-                   intrinsics_from=args.intrinsics_from, intrinsics_override=args.intrinsics_override)
+                   refractive_index=args.refractive_index, intrinsics_from=args.intrinsics_from,
+                   intrinsics_override=args.intrinsics_override)
     exit_code = 0
     try:
         run(args, log_only, data_log, stereo_settings)
@@ -469,6 +484,7 @@ def run(args, log_only, data_log, stereo_settings):
         min_depth_m=args.min_depth,
         max_depth_m=args.max_depth,
         depth_correction=args.depth_scale,
+        refractive_index=args.refractive_index,
     )
     quality_interval = 1.0 / args.quality_rate if args.quality_rate > 0 else float('inf')
 
@@ -513,7 +529,8 @@ def run(args, log_only, data_log, stereo_settings):
             probe = depth_probe.DepthProbeService(
                 args.snapshot_dir / "depth_probe",
                 (stereo_settings["stereo_depth_min_mm"], stereo_settings["stereo_depth_max_mm"]),
-                args.depth_scale, (args.width, args.height), log=logger.warning)
+                args.depth_scale, (args.width, args.height), log=logger.warning,
+                refractive_index=args.refractive_index)
             gyro = GyroBuffer()
             stats = Stats(device)
             tracking = None
@@ -569,9 +586,13 @@ def run(args, log_only, data_log, stereo_settings):
                                 f"depth frame {format_intrinsics(choice.frame)} (matches {choice.frame_matches}), "
                                 f"alpha {stereo_settings['stereo_alpha']}")
                     status = camera_status(args, calibration, rectified, choice, stereo_settings)
+                    logger.info(f"Refractive index {args.refractive_index} x depth scale {args.depth_scale}: PnP uses "
+                                f"{format_intrinsics(refracted_intrinsics(intrinsics, args.refractive_index))}, "
+                                f"depth x {status['total_depth_scale']:.4g}")
                     data_log.event("intrinsics", **{key: status[key] for key in (
-                        "source", "requested_source", "intrinsics", "raw", "rectified", "frame", "frame_matches",
-                        "override", "alpha", "distortion_correction", "baseline_m", "depth_scale", "warnings")})
+                        "source", "requested_source", "intrinsics", "effective_intrinsics", "raw", "rectified", "frame",
+                        "frame_matches", "override", "alpha", "distortion_correction", "baseline_m", "depth_scale",
+                        "refractive_index", "total_depth_scale", "warnings")})
                     try:
                         snapshots.write_camera_status(status, args.snapshot_dir)
                     except OSError as e:

@@ -135,6 +135,23 @@ def test_depth_scale_only_changes_the_scaled_outputs():
     assert scaled["depth_scale"] == 1.25 and "scaled 2.500 m" in scaled["summary"]
 
 
+def test_refractive_index_scales_z_and_fx_fy_but_not_the_device_numbers():
+    request = ProbeRequest(500, 50, 3, 3, 1)
+    rois = [np.full((3, 3), 2000, np.uint16)]
+    air = compute_result(request, rois, (300, 4000), 1.0, K)
+    water = compute_result(request, rois, (300, 4000), 1.1, K, refractive_index=1.333)
+    for key in ("median_mm", "median_of_frame_medians_mm", "raw_m", "valid_fraction"):
+        assert water[key] == air[key]
+    assert water["point_m"]["raw"] == air["point_m"]["raw"] and water["range_m"]["raw"] == air["range_m"]["raw"]
+    assert water["refractive_index"] == 1.333 and water["depth_scale"] == 1.1
+    assert water["total_scale"] == pytest.approx(1.333 * 1.1)
+    assert water["scaled_m"] == pytest.approx(2.0 * 1.333 * 1.1)
+    # Z x n x scale with fx, fy x n: X and Y change by the depth scale only, Z by both
+    X, Y, Z = air["point_m"]["raw"]
+    np.testing.assert_allclose(water["point_m"]["scaled"], [1.1 * X, 1.1 * Y, 1.333 * 1.1 * Z])
+    assert ", n 1.333)" in water["summary"] and ", n " not in air["summary"]
+
+
 # --- request / response mechanics ---------------------------------------------------------------
 
 def test_probe_is_served_over_the_next_frames(tmp_path):

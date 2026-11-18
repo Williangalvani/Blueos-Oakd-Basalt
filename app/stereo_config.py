@@ -1,7 +1,7 @@
 """
 StereoDepth settings for the PnP VIO, shared by main.py (config, web form, command line) and
 pnp_vio.py (argparse, device configuration), plus the validators of the camera-model settings
-(intrinsics override, depth scale) both sides check.
+(intrinsics override, depth scale, refractive index) both sides check.
 
 The defaults favour sparse but trustworthy depth at the tracked features over dense depth: a preset
 first, then LR check, a confidence threshold, speckle and range filters, no spatial/temporal
@@ -74,6 +74,9 @@ STEREO_DEFAULTS = {setting.key: setting.default for setting in STEREO_SETTINGS}
 INTRINSICS_SOURCES = ("rectified", "frame", "cam_b", "cam_c")
 # Multiplicative correction of the device depth; outside this range it is almost certainly a typo
 DEPTH_SCALE_RANGE = (0.2, 5.0)
+# Medium in front of the flat port: 1.0 is air, 1.333 fresh water (sea water is about 1.34)
+DEFAULT_REFRACTIVE_INDEX = 1.333
+REFRACTIVE_INDEX_RANGE = (1.0, 2.0)
 
 
 def parse_depth_scale(value):
@@ -82,6 +85,27 @@ def parse_depth_scale(value):
     if not (math.isfinite(scale) and low <= scale <= high):
         raise ValueError(f"depth scale must be between {low} and {high}, got {value!r}")
     return scale
+
+
+def parse_refractive_index(value):
+    n = float(value)
+    low, high = REFRACTIVE_INDEX_RANGE
+    if not (math.isfinite(n) and low <= n <= high):
+        raise ValueError(f"refractive index must be between {low} and {high}, got {value!r}")
+    return n
+
+
+def clamp_refractive_index(value):
+    """A saved refractive index forced into range (the default if it isn't a number), so a hand-edited
+    config.json can't make the VIO process exit on its arguments and restart forever."""
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_REFRACTIVE_INDEX
+    if not math.isfinite(n):
+        return DEFAULT_REFRACTIVE_INDEX
+    low, high = REFRACTIVE_INDEX_RANGE
+    return min(max(n, low), high)
 
 
 def parse_intrinsics_override(text):

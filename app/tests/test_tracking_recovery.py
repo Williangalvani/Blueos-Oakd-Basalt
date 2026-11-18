@@ -411,6 +411,16 @@ def test_parse_args_intrinsics_and_depth_scale(pnp_vio, capsys):
     assert "depth scale must be between" in capsys.readouterr().err
 
 
+def test_parse_args_refractive_index(pnp_vio, capsys):
+    assert pnp_vio.parse_args([]).refractive_index == 1.333
+    assert pnp_vio.parse_args(["--refractive-index", "1.0"]).refractive_index == 1.0
+    assert pnp_vio.parse_args(["--refractive-index", "2"]).refractive_index == 2.0
+    for bad in ("0.99", "2.01", "nan", "water"):
+        with pytest.raises(SystemExit):
+            pnp_vio.parse_args(["--refractive-index", bad])
+    assert "refractive index must be between 1.0 and 2.0" in capsys.readouterr().err
+
+
 @pytest.fixture
 def plain_pnp_vio(monkeypatch):
     monkeypatch.setitem(sys.modules, "depthai", mock.MagicMock())
@@ -479,12 +489,14 @@ def test_run_uses_the_rectified_matrix_and_serves_a_depth_probe(pnp_vio, monkeyp
     probe_dir = tmp_path / "snapshots" / "depth_probe"
     request_id = depth_probe.request_probe(depth_probe.make_request(320, 200, 41, 41, 5, (WIDTH, HEIGHT))[0], probe_dir)
     monkeypatch.setattr(depth_probe, "_run_in_thread", lambda fn: fn())
-    lines, _ = run_fake(pnp_vio, monkeypatch, tmp_path, scenario(12, 0, 0), ["--depth-scale", "1.25"])
+    lines, _ = run_fake(pnp_vio, monkeypatch, tmp_path, scenario(12, 0, 0),
+                        ["--depth-scale", "1.25", "--refractive-index", "1.0"])
     events = {line["event"]: line for line in lines if line["type"] == "event"}
 
     intrinsics = events["intrinsics"]
     assert intrinsics["source"] == "rectified" and intrinsics["requested_source"] == "rectified"
     np.testing.assert_allclose(intrinsics["intrinsics"], [163.1, 237.1, 329.4, 199.0], rtol=0.005)
+    assert intrinsics["effective_intrinsics"] == intrinsics["intrinsics"] and intrinsics["refractive_index"] == 1.0
     assert intrinsics["raw"] == pytest.approx(RAW_MATRIX[0][:1] + [RAW_MATRIX[1][1], RAW_MATRIX[0][2], RAW_MATRIX[1][2]])
     assert intrinsics["frame_matches"] == "raw" and intrinsics["warnings"] == []
     assert intrinsics["alpha"] == 0.0 and intrinsics["depth_scale"] == 1.25
@@ -512,3 +524,33 @@ def test_run_with_frame_source_ignores_a_raw_frame_matrix_loudly(pnp_vio, monkey
     assert events["intrinsics"]["source"] == "rectified (frame matrix is raw)"
     warnings = [line["message"] for line in lines if line.get("event") == "warning"]
     assert any("unrectified K; ignored" in message for message in warnings)
+
+
+def test_run_applies_the_refractive_index_after_choosing_the_matrix(pnp_vio, monkeypatch, tmp_path):
+    """Default n 1.333 on top of an override: fx, fy x n for PnP; the in-air K stays what the focal check reads."""
+    probe_dir = tmp_path / "snapshots" / "depth_probe"
+    request_id = depth_probe.request_probe(depth_probe.make_request(320, 200, 41, 41, 3, (WIDTH, HEIGHT))[0], probe_dir)
+    monkeypatch.setattr(depth_probe, "_run_in_thread", lambda fn: fn())
+    lines, _ = run_fake(pnp_vio, monkeypatch, tmp_path, scenario(6, 0, 0),
+                        ["--intrinsics-override", "160,230,330,199", "--depth-scale", "1.1"])
+    events = {line["event"]: line for line in lines if line["type"] == "event"}
+    assert events["start"]["refractive_index"] == 1.333 and events["start"]["depth_scale"] == 1.1
+
+    intrinsics = events["intrinsics"]
+    assert intrinsics["source"] == "override" and intrinsics["intrinsics"] == [160.0, 230.0, 330.0, 199.0]
+    np.testing.assert_allclose(intrinsics["effective_intrinsics"], [160 * 1.333, 230 * 1.333, 330.0, 199.0])
+    assert intrinsics["refractive_index"] == 1.333 and intrinsics["depth_scale"] == 1.1
+    assert intrinsics["total_depth_scale"] == pytest.approx(1.333 * 1.1)
+
+    camera = snapshots.read_camera_status(tmp_path / "snapshots")
+    assert camera["intrinsics"] == [160.0, 230.0, 330.0, 199.0]
+    assert camera["effective_intrinsics"] == intrinsics["effective_intrinsics"]
+    assert camera["refractive_index"] == 1.333 and camera["total_depth_scale"] == pytest.approx(1.4663)
+
+    result = depth_probe.wait_for_probe(request_id, 0, probe_dir)
+    assert result["raw_m"] == pytest.approx(2.0) and result["scaled_m"] == pytest.approx(2.0 * 1.333 * 1.1)
+    assert result["intrinsics"]["fx"] == 160.0 and result["refractive_index"] == 1.333
+    # Static scene: still no motion in water
+    steps = [line for line in lines if line["type"] == "step"]
+    assert all(s["status"] == "ok" for s in steps[1:])
+    np.testing.assert_allclose([s["position_delta"] for s in steps[1:]], 0.0, atol=1e-6)

@@ -80,7 +80,8 @@ Open `http://<vehicle>:8095` (or the extension's entry in the BlueOS menu). Savi
 | Snapshots | on | PnP only: allow [camera snapshots](#snapshots-pnp). Nothing is streamed until one is requested. |
 | PnP Intrinsics Source | rectified | PnP only: where the rectified-left camera matrix comes from (`--intrinsics-from`). See [Camera matrix](#camera-matrix-pnp). |
 | PnP Intrinsics Override | empty | PnP only: `fx,fy,cx,cy` in pixels on the width × height grid (`--intrinsics-override`). Wins over the source. Empty = off. |
-| PnP Depth Scale | 1.0 | PnP only: multiplies the camera depth before back-projection, so translation scales with it (`--depth-scale`, 0.2–5). Use it for a correction measured with the [depth probe](#depth-probe-pnp), e.g. refraction behind a flat port. |
+| PnP Depth Scale | 1.0 | PnP only: extra trim on the camera depth before back-projection, on top of the refractive index (`--depth-scale`, 0.2–5). Translation scales with it. Use it for a residual measured with the [depth probe](#depth-probe-pnp). |
+| PnP Refractive Index (water) | 1.333 | PnP only: the water in front of the flat port (`--refractive-index`, 1–2). 1.333 is fresh water and about 1.34 sea water. **Set 1.0 for tests in air.** See [Water (refractive index)](#water-refractive-index-pnp). |
 | Vehicle IP | 127.0.0.1 | Where mavlink2rest is reachable. The extension uses host networking, so the default works on the vehicle itself. |
 | Quality Rate (Hz) | 1 | Rate of the `NAMED_VALUE_FLOAT` quality messages. |
 | Log only | off | Run VIO as a passive logger: no autopilot parameter changes and no MAVLink output at all. See [Log-only mode](#log-only-mode). |
@@ -128,6 +129,18 @@ Before this fix, PnP used the raw calibration, because the depth frame's own cam
 
 The chosen matrix and its source go to the container log and the JSONL `intrinsics` event. The raw and rectified matrices, alpha, distortion correction and the stereo baseline go there too. The same information is in `/api/status` under `camera`. The baseline comes from the calibration (`getBaselineDistance(CAM_C, CAM_B, useSpecTranslation=False)`) and is logged at startup next to the design value.
 
+### Water (refractive index) (PnP)
+
+The calibration is done in air, but underwater the camera looks through a flat port into water. To a first (paraxial) approximation, a ray at angle *a* in the water leaves the port at n·tan *a*. The in-air camera therefore images the water scene as if its focal lengths were n·fx and n·fy, and the device's stereo depth, Z = f·B/d with the in-air f, comes out at Z_true / n. PnP corrects both, after the camera matrix above (source or override) is chosen:
+
+- K: fx and fy are multiplied by n; cx and cy are unchanged.
+- Depth: multiplied by n × *PnP Depth Scale*. The device's min/max depth still apply to the uncorrected depth.
+- The gyro prior is a rotation, so it is unaffected.
+
+What this changes: with K and depth both scaled by n, the lateral back-projection X = (u − cx)·Z/fx does not change. So for the same pixel motion, n scales the translation **along the optical axis** by n, and leaves the sideways components alone (tested on a synthetic flat-port scene). For a camera looking down, that is the vertical component. In the old model, a depth scale of 1.33 scaled every axis, which was wrong for the lateral ones. Beyond the paraxial approximation a flat port also bends rays near the image edges; that is not modelled.
+
+The in-air matrix, `effective_intrinsics` (with n), `refractive_index`, `depth_scale` and `total_depth_scale` (n × depth scale) are in the JSONL `intrinsics` event and in `/api/status` → `camera`. The page's status area shows them too. The focal check keeps using the in-air matrix, because the device depth is computed with the in-air focal length.
+
 Depth is not gated with the stereo confidence map. On the camera, the `confidenceMap` output gets no left-right check, alignment or post-processing, so it doesn't match the depth pixels. Streaming it would also add about 20 Mbit/s, and the confidence threshold above already applies the same score on the camera.
 
 The page is backed by a small HTTP API:
@@ -136,7 +149,7 @@ The page is backed by a small HTTP API:
 |---|---|---|
 | GET | `/api/config` | Current settings |
 | POST | `/api/config` | Save settings (JSON body, same keys) and restart VIO |
-| GET | `/api/status` | Whether the VIO process is running, restarts, whether log-only mode is active (`log_only`, `log_only_forced_by_env`), and for PnP the `camera` matrix in use (`null` until the first frame) |
+| GET | `/api/status` | Whether the VIO process is running, restarts, whether log-only mode is active (`log_only`, `log_only_forced_by_env`), and for PnP the `camera` matrix in use (`null` until the first frame): the in-air `intrinsics`, `effective_intrinsics`, `refractive_index`, `depth_scale` and `total_depth_scale` |
 | GET | `/api/logs` | Data logs: name, size (bytes), mtime (unix time), newest first |
 | GET | `/api/logs/{name}` | Download one data log |
 | POST | `/api/start`, `/api/stop` | Start or stop VIO |
@@ -169,7 +182,7 @@ To aim the [depth probe](#depth-probe-pnp), add `&crosshair=1` (and the probe's 
 
 ### Depth probe (PnP)
 
-`GET /api/depth_probe` measures the device depth in a small region while PnP keeps running. Use it to compare the camera's depth with a tape measure, for example to measure the refraction factor behind a flat port and set *PnP Depth Scale*. The *Depth Probe (PnP)* section of the page has the inputs, a *Probe depth* button and *Aim* buttons for the crosshair snapshots.
+`GET /api/depth_probe` measures the device depth in a small region while PnP keeps running. Use it to compare the camera's depth with a tape measure. In water, compare the tape with `scaled_m` (which includes the refractive index) and set *PnP Depth Scale* for any residual. The *Depth Probe (PnP)* section of the page has the inputs, a *Probe depth* button and *Aim* buttons for the crosshair snapshots.
 
 ```
 http://<vehicle>:8095/api/depth_probe                                # image centre, 41×41 px, 10 frames
@@ -181,9 +194,9 @@ http://<vehicle>:8095/api/depth_probe?x=320&y=200&w=41&h=41&frames=10
 - The response:
   - `valid_fraction` and `n_valid_px`: depth outside the camera's min/max depth (300–4000 mm by default) is invalid and only counts against `valid_fraction`.
   - Over the valid pixels of all frames: `median_mm`, `p10_mm`, `p90_mm` and `mean_mm`. Also `median_of_frame_medians_mm`, with `frame_medians_mm` and `frame_valid_fractions` per frame.
-  - `raw_m`: the median of the frame medians, in metres. This is Z, the depth along the optical axis. `scaled_m` = `raw_m` × `depth_scale`, which is what PnP uses.
-  - `range_m` (raw and scaled): the straight-line distance to the ROI centre, Z·√(1 + ((u−cx)/fx)² + ((v−cy)/fy)²). `point_m` is the 3D point (X, Y, Z), raw and scaled. Both use the camera matrix in use, given in `intrinsics` and `intrinsics_source`.
-  - `device_timestamps`, `sequences` and `summary`, e.g. `median 1.234 m (scaled 1.234 m), valid 87%`.
+  - `raw_m`: the median of the frame medians, in metres. This is Z, the device depth along the optical axis. `scaled_m` = `raw_m` × `total_scale`, where `total_scale` = `refractive_index` × `depth_scale`; that is what PnP uses. The `*_mm` statistics are always the device depth.
+  - `range_m` (raw and scaled): the straight-line distance to the ROI centre, Z·√(1 + ((u−cx)/fx)² + ((v−cy)/fy)²). `point_m` is the 3D point (X, Y, Z), raw and scaled. Raw uses the in-air camera matrix in use (`intrinsics`, `intrinsics_source`). Scaled uses that matrix with fx and fy × n, as PnP does.
+  - `device_timestamps`, `sequences` and `summary`, e.g. `median 1.234 m (scaled 1.645 m, n 1.333), valid 87%` (the `n` part is left out in air).
   - `note` explains Z versus range.
 - Where to measure from: the camera's depth is measured from the left camera's optical centre. That is a few mm behind the front of the lens, plus the port. Aim square at a flat target and tape-measure Z from the lens. Off-centre, compare the tape with `range_m`.
 - Errors: 400 for bad parameters, 503 if the algorithm isn't PnP or VIO is stopped, and 504 if no result arrives within frames/fps + 3 s.
@@ -233,13 +246,13 @@ In log-only mode the autopilot parameters are neither read nor written and no MA
 
 Each VIO process start writes a JSONL file to `/app/data/logs/` (`/usr/blueos/extensions/oakd-vio/logs/` on the vehicle), named `vio-YYYYmmdd-HHMMSS-<pid>.jsonl`, in both modes. Every line has `type`, `wall_time` (ISO, UTC), `unix_time` and `monotonic`. Lines are flushed as they are written.
 
-- `"type": "event"` lines: `start` (arguments, `log_only`, and for PnP the resolved `stereo` settings, `depth_scale`, `intrinsics_from` and `intrinsics_override`), `warning`, `device_open` attempts, `device`, `calibration`, `tracking` changes, `error`, `exit`. PnP also writes:
+- `"type": "event"` lines: `start` (arguments, `log_only`, and for PnP the resolved `stereo` settings, `depth_scale`, `refractive_index`, `intrinsics_from` and `intrinsics_override`), `warning`, `device_open` attempts, `device`, `calibration`, `tracking` changes, `error`, `exit`. PnP also writes:
   - `calibration`: raw CAM_B `intrinsics` (`fx, fy, cx, cy`), `distortion` (14 coefficients), the computed `rectified` matrix (or `null` and `rectified_problem`), `alpha`, `distortion_correction`, `baseline_m` (calibration) and `baseline_spec_m` (design), and `R_cam_imu`;
   - `stereo_config`: `requested` settings, `effective` values read back from the node, and `warnings`;
   - `intrinsics`: the camera matrix used (`intrinsics`) and its `source`, which is one of:
     - `rectified`, `frame`, `cam_b`, `cam_c` or `override`;
     - a fallback: `rectified (frame matrix is raw)`, `rectified (fallback)`, `frame (fallback)` or `cam_b (fallback)`.
-    It also has `requested_source`, `raw`, `rectified`, the depth `frame` matrix and `frame_matches` (`raw`, `rectified` or `neither`), `override`, `alpha`, `distortion_correction`, `baseline_m`, `depth_scale` and `warnings`;
+    It also has `effective_intrinsics` (fx, fy × the refractive index: what PnP runs with), `requested_source`, `raw`, `rectified`, the depth `frame` matrix and `frame_matches` (`raw`, `rectified` or `neither`), `override`, `alpha`, `distortion_correction`, `baseline_m`, `depth_scale`, `refractive_index`, `total_depth_scale` and `warnings`;
   - `snapshots`: the available `streams`, and `unavailable` ones with the reason;
   - `recovery`: see [Tracking recovery](#tracking-recovery-pnp).
 - `"type": "step"` lines (PnP only): one per frame, with `device_timestamp`, `sequence`, `time_delta_us`, `position_delta` and `angle_delta` (body FRD, exactly what is or would be sent), `confidence`, `features`, `new_features` and `tracked_features` (ids not seen / seen in the previous frame), `valid_depth`, `matches`, `inliers`, `reprojection_rms_px`, `gyro_disagreement_deg`, `proc_ms`, `status` (`ok` or `rejected`), `reason`, `sent`, and `reference_age_s`, `gap_frames` and `reference_reset` (see [Failed frames](#failed-frames-pnp)). The deltas are `null` for rejected frames.

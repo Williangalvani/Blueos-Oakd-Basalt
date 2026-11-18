@@ -42,8 +42,10 @@ NOTE = ("z is the depth along the optical axis of the rectified left camera (Ste
         "ROI-centre point, sqrt(X^2 + Y^2 + Z^2) with the camera matrix in use; at the image centre they are equal. "
         "To compare with a tape measure, aim at a flat target square to the camera and measure from the left "
         "camera's lens (the optical centre is a few mm behind the front of the lens, plus the port or window "
-        "thickness), not from the housing. raw is the device depth; scaled is raw x depth_scale, what PnP uses. "
-        "Pixels outside the device's min/max depth are invalid (0) and only count against valid_fraction.")
+        "thickness), not from the housing. raw is the device depth with the in-air camera matrix; scaled is "
+        "raw x total_scale (refractive_index x depth_scale) with fx, fy x refractive_index, what PnP uses. In "
+        "water, compare the tape with scaled. Pixels outside the device's min/max depth are invalid (0) and only "
+        "count against valid_fraction.")
 
 
 class ProbeTimeout(Exception):
@@ -102,10 +104,11 @@ def roi_bounds(request, shape, image_size):
     return max(x0, 0), max(y0, 0), min(x0 + w, cols), min(y0 + h, rows)
 
 
-def ray_point(u, v, z, intrinsics):
-    """3D point (X, Y, Z) at pixel (u, v) with depth z, and its range from the optical centre."""
-    X = (u - intrinsics.cx) / intrinsics.fx * z
-    Y = (v - intrinsics.cy) / intrinsics.fy * z
+def ray_point(u, v, z, intrinsics, refractive_index=1.0):
+    """3D point (X, Y, Z) at pixel (u, v) with depth z, and its range from the optical centre, with fx, fy
+    multiplied by refractive_index (pnp_odometry.refracted_intrinsics; not imported, it needs OpenCV)."""
+    X = (u - intrinsics.cx) / (intrinsics.fx * refractive_index) * z
+    Y = (v - intrinsics.cy) / (intrinsics.fy * refractive_index) * z
     return [float(X), float(Y), float(z)], float(math.sqrt(X * X + Y * Y + z * z))
 
 
@@ -114,9 +117,14 @@ def _finite(value):
 
 
 def compute_result(request, rois, depth_range_mm=(300, 4000), depth_scale=1.0, intrinsics=None,
-                   intrinsics_source=None, timestamps=(), sequences=()):
-    """Statistics of the ROI crops (uint16 mm, one per frame); every depth in metres also comes scaled."""
+                   intrinsics_source=None, timestamps=(), sequences=(), refractive_index=1.0):
+    """
+    Statistics of the ROI crops (uint16 mm, one per frame); every depth in metres also comes scaled by
+    refractive_index x depth_scale. intrinsics is the in-air camera matrix; the scaled point uses it
+    with fx, fy x refractive_index, as PnP does. The *_mm statistics are always the device depth.
+    """
     low, high = depth_range_mm
+    total_scale = depth_scale * refractive_index
     valid_parts, frame_medians, frame_valid = [], [], []
     for roi in rois:
         roi = np.asarray(roi)
@@ -140,6 +148,8 @@ def compute_result(request, rois, depth_range_mm=(300, 4000), depth_scale=1.0, i
         "frame_medians_mm": frame_medians,
         "frame_valid_fractions": frame_valid,
         "depth_scale": depth_scale,
+        "refractive_index": refractive_index,
+        "total_scale": total_scale,
         "intrinsics": None if intrinsics is None else {
             "fx": float(intrinsics.fx), "fy": float(intrinsics.fy), "cx": float(intrinsics.cx), "cy": float(intrinsics.cy)},
         "intrinsics_source": intrinsics_source,
@@ -155,10 +165,10 @@ def compute_result(request, rois, depth_range_mm=(300, 4000), depth_scale=1.0, i
         result.update(median_mm=float(median), p10_mm=float(p10), p90_mm=float(p90), mean_mm=float(values.mean()))
     if result["median_of_frame_medians_mm"] is not None:
         raw = result["median_of_frame_medians_mm"] / 1000.0
-        result["raw_m"], result["scaled_m"] = raw, raw * depth_scale
+        result["raw_m"], result["scaled_m"] = raw, raw * total_scale
         if intrinsics is not None:
-            for key, z in (("raw", raw), ("scaled", raw * depth_scale)):
-                result["point_m"][key], result["range_m"][key] = ray_point(request.x, request.y, z, intrinsics)
+            for key, z, n in (("raw", raw, 1.0), ("scaled", raw * total_scale, refractive_index)):
+                result["point_m"][key], result["range_m"][key] = ray_point(request.x, request.y, z, intrinsics, n)
     result["summary"] = summary(result)
     return result
 
@@ -167,7 +177,9 @@ def summary(result):
     valid = f"valid {100 * result['valid_fraction']:.0f}%"
     if result["raw_m"] is None:
         return f"no valid depth in the ROI, {valid}"
-    return f"median {result['raw_m']:.3f} m (scaled {result['scaled_m']:.3f} m), {valid}"
+    n = result.get("refractive_index", 1.0)
+    water = f", n {n:g}" if n != 1.0 else ""
+    return f"median {result['raw_m']:.3f} m (scaled {result['scaled_m']:.3f} m{water}), {valid}"
 
 
 # --- main.py side ---------------------------------------------------------------------------------
@@ -241,10 +253,12 @@ class DepthProbeService:
     """
 
     def __init__(self, probe_dir=PROBE_DIR, depth_range_mm=(300, 4000), depth_scale=1.0, image_size=(640, 400),
-                 poll_interval=0.2, clock=time.monotonic, wall_clock=time.time, run=_run_in_thread, log=print):
+                 poll_interval=0.2, clock=time.monotonic, wall_clock=time.time, run=_run_in_thread, log=print,
+                 refractive_index=1.0):
         self.probe_dir = Path(probe_dir)
         self.depth_range_mm = tuple(depth_range_mm)
         self.depth_scale = depth_scale
+        self.refractive_index = refractive_index
         self.image_size = tuple(image_size)
         self.poll_interval = poll_interval
         self.clock = clock
@@ -306,7 +320,7 @@ class DepthProbeService:
     def _finish(self, active, intrinsics, source, scale, depth_shape):
         try:
             result = compute_result(active["request"], active["rois"], self.depth_range_mm, scale, intrinsics, source,
-                                    active["timestamps"], active["sequences"])
+                                    active["timestamps"], active["sequences"], self.refractive_index)
             x0, y0, x1, y1 = active["bounds"]
             result.update(id=active["id"], requested_at=active["requested_at"], clamped=active["clamped"],
                           roi_depth_px={"x0": x0, "y0": y0, "x1": x1, "y1": y1},
