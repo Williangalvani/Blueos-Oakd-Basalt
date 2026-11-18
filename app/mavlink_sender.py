@@ -68,10 +68,14 @@ class MavlinkSender:
             return False
 
     def send_vision_position_delta(self, angle_delta, position_delta, time_delta_us, confidence, timestamp_us=None):
-        """angle_delta (rad) and position_delta (m) in body FRD; confidence 0..100."""
+        """
+        angle_delta (rad) and position_delta (m) in body FRD; confidence 0..100. ArduPilot ignores
+        time_usec (it stamps the message on arrival, minus VISO_DELAY_MS) but divides by time_delta_usec.
+        """
         return self.send("VISION_POSITION_DELTA", {
             "time_usec": int(timestamp_us if timestamp_us is not None else time.time() * 1e6),
-            "time_delta_usec": int(time_delta_us),
+            # Rounded: differences of float seconds land just below whole microseconds
+            "time_delta_usec": int(round(time_delta_us)),
             "angle_delta": [float(a) for a in angle_delta],
             "position_delta": [float(p) for p in position_delta],
             "confidence": float(confidence),

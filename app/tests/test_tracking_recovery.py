@@ -3,6 +3,7 @@ import json
 import os
 import signal
 import sys
+import time
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -607,6 +608,111 @@ def test_run_without_gyro_uses_the_pnp_rotation_and_lever_arm_off_logs_nothing(p
     steps = [line for line in lines if line["type"] == "step"]
     assert not any(key.startswith("lever_") for step in steps for key in step)
     assert {line["event"]: line for line in lines if line["type"] == "event"}["start"]["lever_arm"] is False
+
+
+# --- MAVLink output (log_only off) against a fake mavlink2rest websocket ------------------------
+
+class FakeWebSocketApp:
+    """Stands in for websocket.WebSocketApp: opens at once and records what is sent."""
+    instances = []
+
+    def __init__(self, url, on_open=None, on_close=None, on_error=None):
+        self.url, self.on_open, self.sent, self.closed = url, on_open, [], False
+        FakeWebSocketApp.instances.append(self)
+
+    def run_forever(self):
+        self.on_open(self)
+
+    def send(self, data):
+        self.sent.append(json.loads(data))
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.fixture
+def mavlink_out(pnp_vio, monkeypatch):
+    """Real MavlinkSender over a fake websocket; AutopilotParams mocked so no autopilot is ever touched."""
+    import mavlink_sender
+    FakeWebSocketApp.instances = []
+    monkeypatch.setattr(mavlink_sender.websocket, "WebSocketApp", FakeWebSocketApp)
+    monkeypatch.setattr(pnp_vio, "AutopilotParams", mock.Mock())
+    monkeypatch.setattr(pnp_vio, "load_calibration", lambda device, args: fake_calibration(np.eye(3)))
+    return pnp_vio
+
+
+def test_run_sends_vision_position_delta_matching_the_log(mavlink_out, monkeypatch, tmp_path):
+    pnp_vio = mavlink_out
+    groups, gyro = spin_scenario(12)
+    before_us = time.time() * 1e6
+    lines, _ = run_fake(pnp_vio, monkeypatch, tmp_path, groups,
+                        [*SPIN_ARGS, "--lever-arm", "--vehicle-ip", "10.0.0.9", "--quality-rate", "0"],
+                        imu=[gyro], log_only=False)
+    after_us = time.time() * 1e6
+    pnp_vio.AutopilotParams.assert_called_once_with("10.0.0.9")
+    pnp_vio.AutopilotParams.return_value.configure_visual_odometry.assert_called_once_with()
+    (ws,) = FakeWebSocketApp.instances
+    assert ws.url == "ws://10.0.0.9/mavlink2rest/ws/mavlink?filter=SEND_ONLY" and ws.closed
+    events = {line["event"]: line for line in lines if line["type"] == "event"}
+    assert events["start"]["log_only"] is False
+
+    steps = [line for line in lines if line["type"] == "step"]
+    sent = [m for m in ws.sent if m["message"]["type"] == "VISION_POSITION_DELTA"]
+    assert [s["sent"] for s in steps] == [False] + [True] * 11 and len(sent) == 11
+    for step, packet in zip(steps[1:], sent):
+        assert packet["header"] == {"system_id": 1, "component_id": 195, "sequence": 0}
+        message = packet["message"]
+        assert set(message) == {"type", "time_usec", "time_delta_usec", "angle_delta", "position_delta", "confidence"}
+        # Exactly the logged body-FRD deltas: metres and radians; the camera's own delta, not the lever-arm one
+        assert message["position_delta"] == pytest.approx(step["position_delta"], abs=1e-12)
+        assert message["angle_delta"] == pytest.approx(step["angle_delta"], abs=1e-12)
+        np.testing.assert_allclose(message["position_delta"], expected_spin_delta(), atol=1e-3)
+        assert np.linalg.norm(np.subtract(message["position_delta"], step["lever_delta_position"])) > 0.004
+        np.testing.assert_allclose(message["angle_delta"], [0.0, 0.0, SPIN_RATE * SPIN_DT], atol=np.radians(0.05))
+        # Microseconds of device time, rounded (not truncated: 1.2 - 1.1 is 0.0999999... s)
+        assert isinstance(message["time_delta_usec"], int) and message["time_delta_usec"] == 100000
+        assert isinstance(message["time_usec"], int) and before_us <= message["time_usec"] <= after_us
+        assert 0.0 < message["confidence"] <= 100.0 and message["confidence"] == pytest.approx(step["confidence"])
+
+    names = ["".join(m["message"]["name"]).rstrip("\u0000") for m in ws.sent
+             if m["message"]["type"] == "NAMED_VALUE_FLOAT"]
+    # quality_rate 0: only the tracking change goes out
+    assert names == ["VIO_TRACK"]
+
+
+def test_sender_message_fields_and_disconnected_drop(monkeypatch):
+    import mavlink_sender
+
+    class NeverOpens(FakeWebSocketApp):
+        def run_forever(self):
+            pass
+    FakeWebSocketApp.instances = []
+    monkeypatch.setattr(mavlink_sender.websocket, "WebSocketApp", NeverOpens)
+    sender = mavlink_sender.MavlinkSender("ws://fake/mavlink2rest/ws/mavlink", reconnect_interval=0.0)
+    # Not connected: dropped (False) without blocking, with a reconnect attempt
+    assert sender.send_vision_position_delta([0.0, 0.0, 0.01], [0.1, 0.0, 0.0], 99999.9999, 42.0) is False
+    (ws,) = FakeWebSocketApp.instances
+    assert ws.sent == []
+    ws.on_open(ws)
+    assert sender.send_vision_position_delta(np.array([0.0, 0.0, 0.01]), np.array([0.1, -0.2, 0.05]),
+                                             99999.9999, np.float64(42.5), timestamp_us=1.7e15) is True
+    (packet,) = ws.sent
+    assert packet["message"] == {"type": "VISION_POSITION_DELTA", "time_usec": 1700000000000000,
+                                 "time_delta_usec": 100000, "angle_delta": [0.0, 0.0, 0.01],
+                                 "position_delta": [0.1, -0.2, 0.05], "confidence": 42.5}
+
+
+def test_run_counts_a_failed_send_as_not_sent(mavlink_out, monkeypatch, tmp_path):
+    pnp_vio = mavlink_out
+
+    def broken_send(self, data):
+        raise ConnectionError("mavlink2rest went away")
+    monkeypatch.setattr(FakeWebSocketApp, "send", broken_send)
+    groups, gyro = spin_scenario(4)
+    lines, _ = run_fake(pnp_vio, monkeypatch, tmp_path, groups, SPIN_ARGS, imu=[gyro], log_only=False)
+    steps = [line for line in lines if line["type"] == "step"]
+    assert [s["status"] for s in steps] == ["rejected", "ok", "ok", "ok"]
+    assert not any(s["sent"] for s in steps)
 
 
 def test_parse_args_lever_arm(pnp_vio, capsys):

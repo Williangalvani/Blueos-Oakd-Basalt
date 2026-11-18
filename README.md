@@ -57,6 +57,14 @@ With the experimental **PnP** algorithm (see [NOTES_OPTION_D.md](NOTES_OPTION_D.
   - `VIO_CONF`: confidence of the last frame, 0 to 100
   - `VIO_PROCMS`: host processing time of the last frame, in milliseconds
 
+PnP's `VISION_POSITION_DELTA` fields: `position_delta` in metres and `angle_delta` in radians, both body FRD over the interval since the reference frame; `time_delta_usec`, that interval from device timestamps, rounded to whole µs; `confidence` 0–100; `time_usec`, host wall time when sent. How ArduPilot (EKF3) uses them, from the source:
+
+- Velocity = `position_delta` / `time_delta_usec`, fused as body-frame velocity, with the `VISO_POS_*` lever arm applied by the EKF (see [Lever arm](#lever-arm-viso_pos-pnp)). `VISO_ORIENT` rotates both vectors, so it must stay 0 (Forward): the extension already applies *Camera Angle*.
+- `time_usec` is ignored. The message is stamped on arrival minus `VISO_DELAY_MS` (default 10 ms). A delta is the average over its interval, so its true delay is about half a frame interval (167 ms at 3 fps) plus the pipeline latency. `VISO_DELAY_MS` (0–250) is not tuned yet.
+- `confidence` sets the velocity noise linearly: `EK3_VIS_VERR_MIN + (EK3_VIS_VERR_MAX − EK3_VIS_VERR_MIN)·(1 − confidence/100)`. `VISO_QUAL_MIN` does **not** apply to `VISION_POSITION_DELTA`.
+- `angle_delta` is stored but not fused. The EKF uses its own gyro, also for the lever-arm term.
+- Messages less than 50 ms apart are dropped. To start using body odometry, the EKF also wants one within the last 200 ms, which 3 fps only meets part of the time. Use 5 fps or more for position hold.
+
 ## Configuration page
 
 Open `http://<vehicle>:8095` (or the extension's entry in the BlueOS menu). Saving restarts VIO with the new values. Settings are stored in `/usr/blueos/extensions/oakd-vio/config.json` on the vehicle, so they survive restarts and updates.
