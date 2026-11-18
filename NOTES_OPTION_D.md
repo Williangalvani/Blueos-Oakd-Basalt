@@ -17,6 +17,11 @@ Prototype on branch `option-d-pnp`. **Not run on hardware yet.**
 | `app/rectified_intrinsics.py` | depthai-free: `rectified_intrinsics()` (the device's rectified-left K from calibration + alpha), `choose_intrinsics()` (source, fallbacks, warnings), and the focal self-check (`measure_rectified_focal`, `focal_check`). |
 | `app/depth_probe.py` | depthai-free depth probe: request/result files, `DepthProbeService` in the VIO loop, statistics, crosshair overlay. |
 | `app/tools/check_rectified_focal.py` | Offline focal check on snapshot PNGs. |
+| `app/vio_telemetry.py` | depthai-free live status and plot history (task 10): ring buffer, failure window, trajectory, lease-gated publisher (VIO process); readers and downsampling (`main.py`). |
+| `app/config_schema.py`, `app/static/` | Settings schema and server-side validation; the web page (task 10). |
+| `app/dvl_source.py`, `app/system_stats.py` | DVL overlay from mavlink2rest; Pi CPU from `/proc/stat` (task 10). |
+| `app/tools/ui_demo_server.py`, `fake_mavlink2rest.py`, `ui_screenshots.py` | Web UI development against a replayed log and a fake mavlink2rest on 127.0.0.1; headless Chrome screenshots. |
+| `app/tests/test_vio_telemetry.py`, `test_web_ui.py`, `test_dvl_source.py`, `test_autopilot_ui.py` | Telemetry (incl. the per-frame cost benchmark), page/schema/validation/status/history/overlay endpoints, DVL discovery with a fake mavlink2rest, and the guarded parameter write. `conftest.py` keeps every test's telemetry out of `/dev/shm` and stops the DVL poller from reaching the configured vehicle. |
 | `app/tests/test_rectified_intrinsics.py`, `test_depth_probe.py` | Rectified K against the dumped calibration (`app/tests/data/calib_oakd_w_poe.json`), source selection, focal check on synthetic and real frames (`app/tests/data/snap4/`), and the probe service and endpoints. |
 | `app/tests/test_stereo_config.py`, `test_snapshots.py`, `test_tracking_recovery.py` | Plumbing, IPC/endpoint, and recovery tests. These include a `pnp_vio.run()` with a fake device that replays the collapse seen in the pool test. |
 | `app/tests/test_pnp_odometry.py` | pytest unit tests on synthetic scenes. |
@@ -142,6 +147,8 @@ python /app/pnp_vio.py --fps 15 --width 640 --height 400 --num-features 300 --ve
   - the log-only-off output path over a fake websocket;
   - `diff_params`.
 - Snapshot host overhead on a desktop with a 300-feature PnP frame: 0.9 ms/frame without snapshots, 1.0 ms with a request every frame (`/tmp/bench_snapshots.py`, not in the repo).
+- Web UI (task 10): 366 tests. They add a check that `pnp_vio.run()` feeds the telemetry (fake device), the telemetry ring buffer, failure window, trajectory, lease-gated publishing and a benchmark (`record_frame` + `publish_due` about 0.02 ms/frame on the desktop, idle and with both leases fresh); the page (self-contained, no external URLs) and static assets; the schema; server validation errors; `/api/status` and `/api/history` (shape, downsampling, caps, empty, ETag/304); the feature overlay; DVL discovery, sampling, loss and "not found" against `fake_mavlink2rest`; and the parameter panel (read/diff/unreadable, never a `PARAM_SET` on read; 400 without confirm, non-whitelisted, out of range; 409 armed, no HEARTBEAT, stale HEARTBEAT, unreachable; success with read-back; a mismatch; arming midway). All network is the in-process fake (`urlopen` patched).
+- The page was checked with `ui_demo_server.py` replaying `vio-20261118-190503-10.jsonl` and headless Chrome screenshots (main page, confirm dialog, write result, validation error, VIO stopped, armed refusal).
 
 ## To verify on hardware
 
@@ -167,6 +174,12 @@ python /app/pnp_vio.py --fps 15 --width 640 --height 400 --num-features 300 --ve
     - The probe's `proc_ms` cost while active.
     - That `x, y` on the crosshair snapshot match the probed pixels.
     - The focal check's match count on typical scenes (the three snapshots are about 1 s apart).
+16. **Web UI (task 10):**
+    - `device.getChipTemperature()` on the PoE device (called every 5 s on the publisher thread; its `.average` is used).
+    - The cost of the telemetry publisher and of `/api/history` on the Pi with the page open (`proc_ms` and the fps summary with and without the page).
+    - Whether mavlink2rest lists the Water Linked DVL's `VISION_POSITION_DELTA`, and which system/component it comes from.
+    - That the feature overlay's inliers line up with the image (the overlay is from the last processed frame, one or two frames older than the snapshot).
+    - A guarded parameter write on a disarmed vehicle on the bench, and the 409 while armed.
 
 ## Rectified intrinsics
 

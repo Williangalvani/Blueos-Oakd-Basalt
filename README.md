@@ -38,9 +38,9 @@ EK3_SRC1_POSZ = 1 (already set)
 Reboot the autopilot for VISO_TYPE to take effect
 ```
 
-### Suggested parameters for optical position hold (not applied)
+### Suggested parameters for optical position hold (written only from the page)
 
-`SUGGESTED_OPTICAL_HOLD_PARAMS` in [`app/autopilot_params.py`](app/autopilot_params.py) lists what position hold on `VISION_POSITION_DELTA` should use: name, suggested value, whether it needs a reboot, and why. `diff_params(current)` compares it with a `{name: value}` dict and returns the entries that differ or are missing, with status `change` or `missing`. Float32 rounding is ignored. A later UI will use it. Nothing writes these to the autopilot, and the automatic setup above is unchanged.
+`SUGGESTED_OPTICAL_HOLD_PARAMS` in [`app/autopilot_params.py`](app/autopilot_params.py) lists what position hold on `VISION_POSITION_DELTA` should use: name, suggested value, whether it needs a reboot, and why. `diff_params(current)` compares it with a `{name: value}` dict and returns the entries that differ or are missing, with status `change` or `missing`. Float32 rounding is ignored. The page's [ArduPilot panel](#ardupilot-panel) shows them next to the vehicle's values and writes them only when you confirm, while the vehicle is disarmed. Nothing writes them at startup, and the automatic setup above is unchanged.
 
 | Parameter | Suggested | Reboot | Why |
 |---|---|---|---|
@@ -86,6 +86,15 @@ PnP's `VISION_POSITION_DELTA` fields: `position_delta` in metres and `angle_delt
 
 Open `http://<vehicle>:8095` (or the extension's entry in the BlueOS menu). Saving restarts VIO with the new values. Settings are stored in `/usr/blueos/extensions/oakd-vio/config.json` on the vehicle, so they survive restarts and updates.
 
+The page is one self-contained file (`app/static/ui.html`, `ui.css` and `ui.js`, inlined by `main.py`): no CDN, no build step, so it works offline on a boat. It has these panels (see [Web UI](#web-ui-pnp) for how the live data is gathered):
+
+- **Live status**: camera connected, VIO running, fps, inliers, frames ok (last 10 s), processing time, features / valid depth, matches, refractive index, depth scale, the effective camera matrix, reference resets / gap frames, recoveries, Pi CPU and the camera chip temperature; failures by reason over the last 5 minutes; the output mode, messages sent, rate and last error, a *Log-only* toggle (saved, restarts VIO) and *Reset VIO*.
+- **Live views**: `rect_left` with the tracked features of the last processed frame (inliers green, outliers red, unmatched grey, with a line from the previous position) and the colorized depth, refreshed on demand or about once a second; the depth probe (click the image to aim it) and the focal check.
+- **Trajectory** (integrated from the deltas and the gyro yaw; it drifts), a **velocity** panel in the layout of the Water Linked DVL A50 widgets, **vx / vy over time** with an optional DVL overlay, and **inliers over time** with `min_inliers`.
+- **Settings**, generated from `GET /api/config/schema`, checked in the browser and again on the server; *Apply* restarts VIO.
+- **ArduPilot parameters**: the suggested optical-hold parameters next to the vehicle's values, with a guarded write.
+- **Data logs**.
+
 | Setting | Default | Notes |
 |---|---|---|
 | Algorithm | Basalt VIO | *Basalt VIO*, or the experimental *PnP* (on-device stereo depth and feature tracking, PnP on the host). |
@@ -100,6 +109,7 @@ Open `http://<vehicle>:8095` (or the extension's entry in the BlueOS menu). Savi
 | Max Keyframes | 4 | Keyframes kept in the optimization. |
 | VIO Iterations | 3 | Optimizer iterations per frame. |
 | PnP Features | 300 | PnP only: target number of features tracked on the camera. The Basalt settings above are ignored in PnP mode. |
+| PnP Min Inliers | 15 | PnP only: RANSAC inliers a frame needs to be accepted and sent (`--min-inliers`, 6–500). The inliers plot draws it. |
 | PnP Recovery After (frames) | 20 | PnP only: consecutive failed frames before [tracking recovery](#tracking-recovery-pnp); 0 disables it. |
 | PnP Max Reference Age (s) | 1.0 | PnP only: how long [failed frames](#failed-frames-pnp) keep the last good frame as the reference (`--max-reference-age`); 0 removes the limit. |
 | Snapshots | on | PnP only: allow [camera snapshots](#snapshots-pnp). Nothing is streamed until one is requested. |
@@ -112,6 +122,7 @@ Open `http://<vehicle>:8095` (or the extension's entry in the BlueOS menu). Savi
 | Vehicle IP | 127.0.0.1 | Where mavlink2rest is reachable. The extension uses host networking, so the default works on the vehicle itself. |
 | Quality Rate (Hz) | 1 | Rate of the `NAMED_VALUE_FLOAT` quality messages. |
 | Log only | off | Run VIO as a passive logger: no autopilot parameter changes and no MAVLink output at all. See [Log-only mode](#log-only-mode). |
+| DVL overlay source | auto | *auto*: plot a DVL's velocity dashed over the VIO velocity, if mavlink2rest has one (see [DVL overlay](#dvl-overlay)); *off*: never poll. |
 
 The defaults are tuned for low CPU usage on a Raspberry Pi.
 
@@ -175,7 +186,7 @@ The camera is about 0.17 m forward and 0.18 m below the IMU. When the vehicle ro
 - `AP_VisualOdom_Backend::handle_vision_position_delta_msg` (`libraries/AP_VisualOdom/AP_VisualOdom_Backend.cpp`, ~l.62–69) passes `_frontend.get_pos_offset()`, i.e. `VISO_POS_X/Y/Z`, to `AP::ahrs().writeBodyFrameOdom(...)`.
 - EKF3 (`libraries/AP_NavEKF3/AP_NavEKF3_PosVelFusion.cpp`, ~l.1493–1498) predicts the sensor velocity as the body velocity plus `(delAng / delAngDT) × posOffsetBody`, with `posOffsetBody = VISO_POS − INS_POS`. So `VISO_POS_*` is relative to the vehicle origin; with `INS_POS_*` at 0 that is the IMU.
 
-Set `VISO_POS_X/Y/Z` on the autopilot to the lever arm (0.1655, −0.0069, 0.180 m from the CAD; see [Suggested parameters](#suggested-parameters-for-optical-position-hold-not-applied)). *Lever arm diagnostics* only adds JSONL step fields, for comparing the two in logs:
+Set `VISO_POS_X/Y/Z` on the autopilot to the lever arm (0.1655, −0.0069, 0.180 m from the CAD; see [Suggested parameters](#suggested-parameters-for-optical-position-hold-written-only-from-the-page)). *Lever arm diagnostics* only adds JSONL step fields, for comparing the two in logs:
 
 - `lever_delta_position`: the IMU delta, `position_delta − (r − Rᵀr)`, body FRD, m;
 - `lever_delta_correction`: the `r − Rᵀr` term;
@@ -190,19 +201,24 @@ The page is backed by a small HTTP API:
 | Method | Path | Action |
 |---|---|---|
 | GET | `/api/config` | Current settings |
-| POST | `/api/config` | Save settings (JSON body, same keys) and restart VIO |
-| GET | `/api/status` | Whether the VIO process is running, restarts, whether log-only mode is active (`log_only`, `log_only_forced_by_env`), and for PnP the `camera` matrix in use (`null` until the first frame): the in-air `intrinsics`, `effective_intrinsics`, `refractive_index`, `depth_scale` and `total_depth_scale` |
+| GET | `/api/config/schema` | Every setting: `name`, `type`, `min`, `max`, `default`, `help`, `label`, `group`, `choices`, `nullable` |
+| POST | `/api/config` | Validate and save settings (JSON body, same keys; missing keys get defaults) and restart VIO. 422 lists every invalid field: `detail: [{field, msg, loc, type}]`, e.g. `FPS (fps): must be between 1 and 60 (got 0)`; nothing is saved |
+| POST | `/api/log_only` | `{"log_only": true\|false}`: save the setting and restart VIO; 400 for anything else |
+| GET | `/api/status` | Whether the VIO process is running, restarts, whether log-only mode is active (`log_only`, `log_only_forced_by_env`), and for PnP the `camera` matrix in use (`null` until the first frame): the in-air `intrinsics`, `effective_intrinsics`, `refractive_index`, `depth_scale` and `total_depth_scale`. Also `algorithm`, `telemetry` (PnP live status, below; `null` until published, `stale: true` when VIO stopped), `camera_connected`, `chip_temperature_c`, `cpu_percent`, `uptime_s` and the last known `vehicle` armed state |
+| GET | `/api/history?seconds=60&max_points=600&tail=0` | PnP plot history, oldest first, `t` in seconds before `server_time`: `vx`, `vy`, `vz` (m/s, body FRD, `null` for rejected frames), integrated `x`, `y`, `yaw`, `inliers`, `ok`. At most `max_points` (≤ 600) over `seconds` (≤ 600); `tail` (≤ 10 s) adds the newest frames at full rate. `dvl` holds the [DVL overlay](#dvl-overlay). Weak `ETag`; `If-None-Match` gives 304 |
+| GET | `/api/autopilot/params` | The suggested optical-hold parameters as the vehicle has them, and the HEARTBEAT armed state. Read only. See [ArduPilot panel](#ardupilot-panel) |
+| POST | `/api/autopilot/params` | `{"confirm": true, "params": {"NAME": value}}`: guarded write with read-back. See [ArduPilot panel](#ardupilot-panel) |
 | GET | `/api/logs` | Data logs: name, size (bytes), mtime (unix time), newest first |
 | GET | `/api/logs/{name}` | Download one data log |
 | POST | `/api/start`, `/api/stop` | Start or stop VIO |
 | POST | `/api/reset` | Restore defaults and restart VIO |
-| GET | `/api/snapshot?stream=<stream>` | PnP only: PNG of one current camera frame; `stream` is `rect_left`, `rect_right`, `depth` or `rgb`. `&crosshair=1&x=&y=&w=&h=` draws the depth probe's ROI. See [Snapshots](#snapshots-pnp). |
+| GET | `/api/snapshot?stream=<stream>` | PnP only: PNG of one current camera frame; `stream` is `rect_left`, `rect_right`, `depth` or `rgb`. `&crosshair=1&x=&y=&w=&h=` draws the depth probe's ROI; `&overlay=1` (rect_left) draws the tracked features. See [Snapshots](#snapshots-pnp). |
 | GET | `/api/depth_probe?x=&y=&w=&h=&frames=` | PnP only: depth statistics in an ROI over the next frames. See [Depth probe](#depth-probe-pnp). |
 | GET | `/api/focal_check` | PnP only: checks fx against the focal length the device depth implies. See [Focal check](#focal-check-pnp). |
 
 ### Snapshots (PnP)
 
-`GET /api/snapshot?stream=rect_left|rect_right|depth|rgb` returns a fresh PNG from the running PnP VIO, without stopping it. The *Snapshots (PnP)* buttons on the page use it.
+`GET /api/snapshot?stream=rect_left|rect_right|depth|rgb` returns a fresh PNG from the running PnP VIO, without stopping it. The page's *Live views* use it.
 
 - `rect_left`, `rect_right`: the rectified mono images the stereo matcher sees, 8-bit grayscale. The feature tracker runs on `rect_left`.
 - `depth`: depth aligned to `rect_left`, colorized from red (near) to blue (far) over the min–max depth range. Pixels with no depth are black. `&raw=1` returns the 16-bit depth in millimetres instead (`raw` is only valid for depth).
@@ -220,11 +236,13 @@ How it works:
 
 Host cost, measured on a desktop with a 300-feature PnP frame: about 0.9 ms per frame without snapshots, and about 1.0 ms with a request on every frame (a request rate 15 times higher than the throttle allows). The camera-side cost of the RGB camera and the extra frame per pool has not been measured on hardware.
 
+`&overlay=1` (rect_left only, else 400) draws the features of the last frame the VIO loop processed: inliers green, outliers (matched, rejected by RANSAC) red, unmatched or without depth grey, each with a line from its position in the previous frame. The VIO loop only keeps references to that frame's ids and pixels; the overlay is built on the snapshot writer thread when a rect_left snapshot is served, and drawn by the web server, so it costs nothing until asked. `X-Overlay` is `features` (with `X-Overlay-Inliers`, `-Outliers`, `-Unmatched` and `-Frame-Sequence`) or `unavailable`. The processed frame is usually one or two frames older than the image.
+
 To aim the [depth probe](#depth-probe-pnp), add `&crosshair=1` (and the probe's `x`, `y`, `w`, `h`) to a `rect_left`, `rect_right` or `depth` snapshot. The PNG then has a magenta crosshair and ROI box, for example `/api/snapshot?stream=rect_left&crosshair=1&x=320&y=200&w=41&h=41`. It doesn't work with `raw=1` or `rgb` (400). Without `crosshair`, snapshots are unchanged.
 
 ### Depth probe (PnP)
 
-`GET /api/depth_probe` measures the device depth in a small region while PnP keeps running. Use it to compare the camera's depth with a tape measure. In water, compare the tape with `scaled_m` (which includes the refractive index) and set *PnP Depth Scale* for any residual. The *Depth Probe (PnP)* section of the page has the inputs, a *Probe depth* button and *Aim* buttons for the crosshair snapshots.
+`GET /api/depth_probe` measures the device depth in a small region while PnP keeps running. Use it to compare the camera's depth with a tape measure. In water, compare the tape with `scaled_m` (which includes the refractive index) and set *PnP Depth Scale* for any residual. The *Depth probe* part of the page's *Live views* has the inputs and a *Probe* button; click the left image to aim, and tick *probe ROI* to draw the crosshair on the views.
 
 ```
 http://<vehicle>:8095/api/depth_probe                                # image centre, 41×41 px, 10 frames
@@ -275,6 +293,50 @@ python app/tools/check_rectified_focal.py rect_left.png rect_right.png depth_raw
 ```
 
 The arguments are the baseline in cm, then optionally the fx to check. `depth_raw.png` is the `raw=1` depth snapshot.
+
+## Web UI (PnP)
+
+The live panels need the PnP algorithm; with Basalt they say so, and the settings, logs and ArduPilot panels still work. The page polls `/api/status` and `/api/history` once a second only while its tab is visible (`document.visibilityState`), snapshots only while *auto-refresh* is on, the logs every 15 s, and the ArduPilot parameters on load and on *Re-read*. No websockets. A stopped VIO, a missing camera or a missing mavlink2rest show as such ("VIO stopped", greyed values, "DVL not found", "unreadable"), and the page picks up again after a VIO restart.
+
+### Live telemetry
+
+The VIO process publishes its live status through files, like snapshots ([`app/vio_telemetry.py`](app/vio_telemetry.py)):
+
+- Per frame, the loop calls `Telemetry.record_frame()`: one row into a preallocated numpy ring buffer, a rolling window of failure reasons, a few counters. Measured with a micro-benchmark in the tests: about 0.02 ms per frame including the publisher step, also while the page is open (the test fails above 0.2 ms).
+- A publisher thread writes `status.json` (a few KB) at most twice a second and `history.npy` (the ring buffer) once a second, but only while `main.py` asked within the last 10 s: each `/api/status` and `/api/history` touches a lease file. With nobody watching nothing is serialized or written. The camera chip temperature (`device.getChipTemperature()`, an RPC) is sampled on that thread at most every 5 s, never in the VIO loop.
+- The files live in `/dev/shm/oakd-vio-telemetry/` (RAM, no SD card wear; `main.py` passes `--telemetry-dir`). A new VIO run deletes the previous run's files.
+- Memory bound: 10 minutes of frames at min(fps, 30), +10 %, 12 float64 columns: at most 19800 rows, 1.9 MB (0.63 MB at 10 fps). The failure window holds at most 5 minutes × 30 fps of (time, reason) pairs.
+- `/api/history` downsamples to at most 600 points (every k-th frame, the newest always kept) and caches the parsed file by mtime. Pi CPU % comes from `/proc/stat` deltas in `main.py` (no psutil).
+- The trajectory rotates each body-frame delta by the yaw integrated so far (from the gyro prior, else the PnP rotation) and starts at the origin facing +x. It drifts, and deltas dropped at reference resets are missing from it.
+
+### DVL overlay
+
+With *DVL overlay source* `auto`, `main.py` ([`app/dvl_source.py`](app/dvl_source.py)) looks for a DVL in mavlink2rest and the vx/vy plot draws its velocity dashed:
+
+- Message: `VISION_POSITION_DELTA`, which the Water Linked DVL extension sends to ArduSub; velocity = `position_delta / time_delta_usec`, in the same body frame as ours, so the overlay compares exactly the two inputs the EKF would fuse. Our own message (system 1, component 195) is excluded.
+- Component: found automatically. The whole message tree (`GET /mavlink2rest/mavlink/vehicles`) is read at most every 10 s until another component's `VISION_POSITION_DELTA` turns up, then only that message is polled, at most twice a second with a 0.4 s timeout, and only while the page asked for history in the last 10 s. A sample is taken when mavlink2rest's message counter advances. After about 3 s of failed polls the source is dropped and searched for again.
+- The overlay only has samples from when the page started asking (up to 10 minutes kept). Nothing here raises; without a DVL the page shows "DVL not found".
+- Not verified on a vehicle: it needs the DVL's messages to reach mavlink2rest's MAVLink endpoint.
+
+### ArduPilot panel
+
+The panel reads the [suggested parameters](#suggested-parameters-for-optical-position-hold-written-only-from-the-page) with `PARAM_REQUEST_READ` and shows current, suggested (editable), status (`ok`, `differs`, `unreadable`), why and *reboot*, plus the armed state from the autopilot's HEARTBEAT (`base_mode & 128`). Reading never writes.
+
+Writing (`POST /api/autopilot/params`):
+
+- The page's *Write selected…* opens a dialog listing each change (`NAME old → new`, reboot flag) and the armed state; a second, explicit click sends `{"confirm": true, "params": {...}}`. Nothing is written automatically or at startup.
+- 400 without `"confirm": true`, for any name outside the suggested table, and for values outside the parameter's range or allowed values (e.g. `VISO_TYPE` 0–3, `VISO_POS_*` ±5 m, `VISO_ORIENT` 0/2/4/6/24/25); one bad entry rejects the whole request.
+- 409, nothing written, unless a HEARTBEAT that arrives during the request (its counter must advance within 2.5 s) says disarmed: armed, no HEARTBEAT, a stale one, or no mavlink2rest all refuse. The armed bit is checked again before each `PARAM_SET`; if the vehicle arms midway, the rest are reported as failed and not written.
+- Each written parameter is read back with a fresh `PARAM_REQUEST_READ`. The response lists `changed` (`name`, `old`, `new`, `readback`), `failed` (with the error, e.g. a read-back mismatch), `unchanged` and `reboot_required`. The autopilot is never rebooted by the extension.
+
+### Demo server and screenshots
+
+[`app/tools/ui_demo_server.py`](app/tools/ui_demo_server.py) runs the real web app against fakes, for working on the page without a vehicle: it replays a PnP data log at real time into the real telemetry code, serves generated camera frames through the real snapshot and depth-probe services, and runs [`app/tools/fake_mavlink2rest.py`](app/tools/fake_mavlink2rest.py) (an autopilot with parameters and HEARTBEAT, and a DVL) on 127.0.0.1. It never contacts another host. [`app/tools/ui_screenshots.py`](app/tools/ui_screenshots.py) takes full-page screenshots with headless Chrome.
+
+```bash
+python app/tools/ui_demo_server.py --log vio-20261118-190503-10.jsonl --port 8099            # add --armed, --no-dvl
+python app/tools/ui_screenshots.py --url http://127.0.0.1:8099/ --out /tmp/ui
+```
 
 ## Log-only mode and data logs
 
@@ -386,12 +448,18 @@ The image is built in two stages so that the slow part only runs once:
 
 | File | Purpose |
 |---|---|
-| `app/main.py` | Configuration web page and API; starts and stops the VIO process |
+| `app/main.py` | Web UI and API; starts and stops the VIO process |
+| `app/static/ui.html`, `ui.css`, `ui.js` | The web page (inlined into one page by `main.py`) |
+| `app/config_schema.py` | Every setting: schema, defaults, server-side validation, form fields |
+| `app/vio_telemetry.py` | PnP live status and plot history: ring buffer and publisher (VIO process), readers (`main.py`) |
+| `app/dvl_source.py` | Optional DVL velocity overlay read from mavlink2rest |
+| `app/system_stats.py` | Pi CPU load from `/proc/stat` |
+| `app/tools/ui_demo_server.py`, `fake_mavlink2rest.py`, `ui_screenshots.py` | Web UI development: replay server, fake mavlink2rest, screenshots |
 | `app/vio_supervisor.py` | Restarts the VIO process with backoff when it exits unexpectedly |
 | `app/device_open.py` | Waits for the OAK-D and opens it, retrying with backoff |
 | `app/vio_log.py` | Log-only mode selection and the JSONL data logs |
 | `app/basalt_configurable.py` | The VIO pipeline: cameras, IMU, `BasaltVIO`, MAVLink output |
-| `app/autopilot_params.py` | Reads and sets the autopilot's EKF parameters through mavlink2rest |
+| `app/autopilot_params.py` | Reads and sets the autopilot's EKF parameters through mavlink2rest; the page's guarded suggested-parameter read and write |
 | `app/mavlink_node.py` | depthai host node that turns poses into MAVLink messages |
 | `app/basalt.py` | Standalone command-line version of the pipeline, useful for testing |
 | `app/pnp_vio.py`, `app/pnp_odometry.py` | Experimental PnP VIO: camera pipeline and host loop; pose math |
@@ -409,3 +477,4 @@ The image is built in two stages so that the slow part only runs once:
 - `VISION_POSITION_DELTA` reports a fixed confidence of 100% and no rotation delta.
 - At startup the VIO process waits up to 30 s (`--device-timeout`) for the OAK-D to be discoverable and to open, retrying with backoff, and then exits with code 2. A PoE OAK-D can take many seconds to come back after the previous pipeline closed; opening it too early has been seen to segfault inside depthai.
 - If the VIO process exits without being stopped from the page (error, crash or segfault), `main.py` restarts it after 2 s, doubling up to 30 s; the delay resets after a run of 60 s. `/api/status` reports `restart_count`, `last_exit_code` (negative for a signal, e.g. -11 for SIGSEGV) and `restart_in`.
+- Web UI: the plots lag by up to about a second (history is published once a second); the plots and the trajectory start over when VIO restarts; the DVL overlay has no history from before the page was opened. Live telemetry, the feature overlay and the chip temperature are PnP only. The web UI was developed against the demo server only; on a vehicle the DVL discovery, `getChipTemperature()` and the Pi CPU cost of the publisher are unverified.
