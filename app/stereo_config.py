@@ -27,6 +27,8 @@ class Setting:
     hint: str = ""
     choices: tuple = ()
     nullable: bool = False  # None (empty in the form, "none" on the command line) allowed
+    minimum: object = None  # inclusive bounds checked by the web config (config_schema.py)
+    maximum: object = None
 
     @property
     def flag(self):
@@ -46,15 +48,19 @@ STEREO_SETTINGS = (
     Setting("stereo_preset", str, "ROBOTICS", "Stereo preset",
             "Applied first; the settings below override it. NONE keeps the plain node defaults", PRESETS),
     Setting("stereo_lr_check", bool, True, "Left-right check"),
-    Setting("stereo_lr_check_threshold", int, 5, "LR check threshold", "Max L-R disparity difference (px)"),
-    Setting("stereo_confidence_threshold", int, 50, "Confidence threshold", "0-255, lower keeps fewer, more confident pixels"),
+    Setting("stereo_lr_check_threshold", int, 5, "LR check threshold", "Max L-R disparity difference (px)",
+            minimum=0, maximum=128),
+    Setting("stereo_confidence_threshold", int, 50, "Confidence threshold", "0-255, lower keeps fewer, more confident pixels",
+            minimum=0, maximum=255),
     Setting("stereo_brightness_min", int, None, "Min brightness",
-            "Pixels at or below are invalidated. Empty: 1 when the edge fill color is 0 (drops the black border), else 0"),
-    Setting("stereo_brightness_max", int, 255, "Max brightness", "Saturated pixels are invalidated; 256 disables"),
+            "Pixels at or below are invalidated. Empty: 1 when the edge fill color is 0 (drops the black border), else 0",
+            minimum=0, maximum=255),
+    Setting("stereo_brightness_max", int, 255, "Max brightness", "Saturated pixels are invalidated; 256 disables",
+            minimum=0, maximum=256),
     Setting("stereo_speckle_filter", bool, True, "Speckle filter"),
-    Setting("stereo_speckle_range", int, 50, "Speckle range", "Speckle search range"),
-    Setting("stereo_depth_min_mm", int, 300, "Min depth (mm)", "Threshold filter"),
-    Setting("stereo_depth_max_mm", int, 4000, "Max depth (mm)", "Threshold filter"),
+    Setting("stereo_speckle_range", int, 50, "Speckle range", "Speckle search range", minimum=0, maximum=65535),
+    Setting("stereo_depth_min_mm", int, 300, "Min depth (mm)", "Threshold filter", minimum=0, maximum=65535),
+    Setting("stereo_depth_max_mm", int, 4000, "Max depth (mm)", "Threshold filter", minimum=1, maximum=65535),
     Setting("stereo_spatial_filter", bool, False, "Spatial filter", "Fills holes by smoothing; off keeps depth honest at corners"),
     Setting("stereo_temporal_filter", bool, False, "Temporal filter", "Off: it lags behind motion"),
     Setting("stereo_decimation", int, 1, "Decimation", "1 keeps depth on the tracker's pixel grid", (1, 2, 3, 4)),
@@ -63,9 +69,12 @@ STEREO_SETTINGS = (
     Setting("stereo_median", str, "7x7", "Median filter", "", tuple(MEDIAN_FILTERS)),
     Setting("stereo_distortion_correction", bool, True, "Distortion correction"),
     Setting("stereo_alpha", float, 0.0, "Alpha scaling",
-            "0 crops to valid pixels only, 1 keeps all source pixels. Empty: device default", nullable=True),
-    Setting("stereo_edge_fill_color", int, 0, "Edge fill color", "0-255, or -1 to replicate edge pixels"),
-    Setting("stereo_p2", int, None, "Horizontal P2 penalty", "Cost aggregation; empty keeps the preset value"),
+            "0 crops to valid pixels only, 1 keeps all source pixels. Empty: device default", nullable=True,
+            minimum=0.0, maximum=1.0),
+    Setting("stereo_edge_fill_color", int, 0, "Edge fill color", "0-255, or -1 to replicate edge pixels",
+            minimum=-1, maximum=255),
+    Setting("stereo_p2", int, None, "Horizontal P2 penalty", "Cost aggregation; empty keeps the preset value",
+            minimum=0, maximum=65535),
 )
 
 SETTINGS_BY_KEY = {setting.key: setting for setting in STEREO_SETTINGS}
