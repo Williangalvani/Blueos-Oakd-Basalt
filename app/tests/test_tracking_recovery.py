@@ -4,6 +4,7 @@ import os
 import signal
 import sys
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -12,9 +13,11 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import depth_probe  # noqa: E402
 import snapshots  # noqa: E402
 import vio_log  # noqa: E402
 from pnp_odometry import Intrinsics, PnPOdometry, PnPParams  # noqa: E402
+from rectified_intrinsics import StereoCalibration  # noqa: E402
 from tracking_recovery import FeatureTrackerReinit, TrackingRecovery, feature_id_counts  # noqa: E402
 
 
@@ -206,6 +209,11 @@ class FakePipeline:
         return bool(self.sync_queue.items)
 
 
+def fake_calibration(R_cam_imu=None):
+    return StereoCalibration(raw=K, distortion=[0.0] * 14, sockets={"cam_b": K}, baseline_m=0.075,
+                             R_cam_imu=R_cam_imu)
+
+
 @pytest.fixture
 def pnp_vio(monkeypatch, tmp_path):
     dai = mock.MagicMock()
@@ -215,7 +223,7 @@ def pnp_vio(monkeypatch, tmp_path):
     module = importlib.import_module("pnp_vio")
     monkeypatch.setattr(module, "open_vio_log", lambda: vio_log.open_vio_log(tmp_path / "logs"))
     monkeypatch.setattr(module, "open_oak_device", lambda timeout, log: mock.MagicMock())
-    monkeypatch.setattr(module, "load_calibration", lambda device, args: (K, None))
+    monkeypatch.setattr(module, "load_calibration", lambda device, args: fake_calibration())
     previous = signal.getsignal(signal.SIGTERM)
     yield module
     signal.signal(signal.SIGTERM, previous)
@@ -244,7 +252,8 @@ def run_fake(module, monkeypatch, tmp_path, groups, argv, imu=()):
 
 def test_run_recovers_from_feature_collapse(pnp_vio, monkeypatch, tmp_path):
     snapshots.request_snapshot("depth", tmp_path / "snapshots")
-    lines, handles = run_fake(pnp_vio, monkeypatch, tmp_path, scenario(n_lost=35), ["--recovery-frames", "10"])
+    lines, handles = run_fake(pnp_vio, monkeypatch, tmp_path, scenario(n_lost=35),
+                              ["--recovery-frames", "10", "--intrinsics-from", "frame"])
     steps = [line for line in lines if line["type"] == "step"]
     events = {line["event"]: line for line in lines if line["type"] == "event"}
 
@@ -276,7 +285,7 @@ def test_run_recovers_from_feature_collapse(pnp_vio, monkeypatch, tmp_path):
     assert (steps[1]["new_features"], steps[1]["tracked_features"]) == (0, len(GOOD_UV))
     assert (steps[10]["new_features"], steps[10]["tracked_features"]) == (8, 0)
 
-    # Intrinsics from the depth frame, not the calibration
+    # --intrinsics-from frame: the depth frame matrix is used, as it is not the raw calibration
     assert events["intrinsics"]["source"] == "frame"
     assert events["intrinsics"]["intrinsics"] == [310.0, 310.0, 321.0, 201.0]
     assert events["stereo_config"]["requested"]["stereo_decimation"] == 1
@@ -325,7 +334,7 @@ def test_run_bridges_failed_frames_and_still_recovers(pnp_vio, monkeypatch, tmp_
 
 def test_run_gyro_prior_covers_a_long_gap(pnp_vio, monkeypatch, tmp_path):
     """A 2.6 s gap, longer than the old fixed gyro history: the prior must still span it."""
-    monkeypatch.setattr(pnp_vio, "load_calibration", lambda device, args: (K, np.eye(3)))
+    monkeypatch.setattr(pnp_vio, "load_calibration", lambda device, args: fake_calibration(np.eye(3)))
     pattern = "GGG" + "F" * 25 + "GGG"
     lines, _ = run_fake(pnp_vio, monkeypatch, tmp_path, pattern_scenario(pattern),
                         ["--recovery-frames", "0", "--max-reference-age", "0", "--gyro-gate", "5"],
@@ -352,8 +361,10 @@ def test_run_max_reference_age_from_the_command_line(pnp_vio, monkeypatch, tmp_p
 
 
 def test_intrinsics_fall_back_to_calibration(pnp_vio, monkeypatch, tmp_path):
+    # No rectified K without alpha, and an unusable frame matrix: the raw calibration is all that is left
     monkeypatch.setattr(FakeTransformation, "getSize", lambda self: (1280, 720))
-    lines, _ = run_fake(pnp_vio, monkeypatch, tmp_path, scenario(5, 0, 0), [])
+    lines, _ = run_fake(pnp_vio, monkeypatch, tmp_path, scenario(5, 0, 0),
+                        ["--intrinsics-from", "frame", "--stereo-alpha", "none"])
     events = {line["event"]: line for line in lines if line["type"] == "event"}
     assert events["intrinsics"]["source"] == "cam_b (fallback)"
     assert events["intrinsics"]["intrinsics"] == [300.0, 300.0, 320.0, 200.0]
@@ -365,3 +376,139 @@ def test_snapshot_script_gates_on_requests(pnp_vio):
     compile(code, "snapshot_script", "exec")
     assert "available = ['depth', 'rect_left']" in code
     assert "node.inputs['request'].get()" in code
+
+
+# --- camera matrix selection, depth scale and depth probe in pnp_vio ---------------------------
+
+CALIB = json.loads((Path(__file__).parent / "data" / "calib_oakd_w_poe.json").read_text())
+K_RAW = Intrinsics.from_matrix(CALIB["cam_b"]["K"])
+
+
+def device_calibration(R_cam_imu=None):
+    return StereoCalibration(raw=K_RAW, distortion=CALIB["cam_b"]["distortion"], sockets={"cam_b": K_RAW},
+                             baseline_m=CALIB["baseline_cm"] / 100, baseline_spec_m=CALIB["baseline_spec_cm"] / 100,
+                             R_cam_imu=R_cam_imu)
+
+
+def depth_msg_with(matrix, size=(WIDTH, HEIGHT)):
+    transformation = SimpleNamespace(getIntrinsicMatrix=lambda: matrix, getSize=lambda: size)
+    return SimpleNamespace(getTransformation=lambda: transformation)
+
+
+RAW_MATRIX = CALIB["cam_b"]["K"]
+
+
+def test_parse_args_intrinsics_and_depth_scale(pnp_vio, capsys):
+    args = pnp_vio.parse_args([])
+    assert args.intrinsics_from == "rectified" and args.intrinsics_override is None and args.depth_scale == 1.0
+    args = pnp_vio.parse_args(["--intrinsics-override", "163.1,237.1,329.4,199", "--depth-scale", "1.33",
+                               "--intrinsics-from", "frame"])
+    assert args.intrinsics_override == (163.1, 237.1, 329.4, 199.0) and args.depth_scale == 1.33
+    for bad in (["--depth-scale", "0.1"], ["--depth-scale", "x"], ["--intrinsics-override", "1,2,3"],
+                ["--intrinsics-from", "sideways"]):
+        with pytest.raises(SystemExit):
+            pnp_vio.parse_args(bad)
+    assert "depth scale must be between" in capsys.readouterr().err
+
+
+@pytest.fixture
+def plain_pnp_vio(monkeypatch):
+    monkeypatch.setitem(sys.modules, "depthai", mock.MagicMock())
+    sys.modules.pop("pnp_vio", None)
+    yield importlib.import_module("pnp_vio")
+    sys.modules.pop("pnp_vio", None)
+
+
+def test_load_calibration_reads_distortion_and_baseline(plain_pnp_vio):
+    pnp_vio = plain_pnp_vio
+    calib = mock.MagicMock()
+    calib.getCameraIntrinsics.side_effect = lambda socket, w, h: (
+        RAW_MATRIX if socket is pnp_vio.dai.CameraBoardSocket.CAM_B else CALIB["cam_c"]["K"])
+    calib.getDistortionCoefficients.return_value = CALIB["cam_b"]["distortion"]
+    calib.getBaselineDistance.side_effect = lambda a, b, spec: 7.5 if spec else 7.496
+    calib.getImuToCameraExtrinsics.return_value = np.eye(4).tolist()
+    device = SimpleNamespace(readCalibration=lambda: calib)
+
+    calibration = pnp_vio.load_calibration(device, pnp_vio.parse_args(["--intrinsics-from", "cam_c"]))
+    assert calibration.raw == K_RAW and calibration.distortion == CALIB["cam_b"]["distortion"]
+    assert calibration.sockets["cam_c"] == Intrinsics.from_matrix(CALIB["cam_c"]["K"])
+    assert calibration.baseline_m == pytest.approx(0.07496) and calibration.baseline_spec_m == pytest.approx(0.075)
+    np.testing.assert_array_equal(calibration.R_cam_imu, np.eye(3))
+    calib.getDistortionCoefficients.assert_called_once_with(pnp_vio.dai.CameraBoardSocket.CAM_B)
+
+    calib.getDistortionCoefficients.side_effect = RuntimeError("no intrinsic data")
+    calib.getBaselineDistance.side_effect = RuntimeError("no extrinsics")
+    calibration = pnp_vio.load_calibration(device, pnp_vio.parse_args(["--gyro-gate", "0"]))
+    assert calibration.distortion == [] and calibration.baseline_m is None and calibration.R_cam_imu is None
+    assert "cam_c" not in calibration.sockets
+
+
+@pytest.mark.parametrize("argv, depth_msg, source, fx", [
+    ([], depth_msg_with(RAW_MATRIX), "rectified", 163.1),
+    (["--intrinsics-from", "frame"], depth_msg_with(RAW_MATRIX), "rectified (frame matrix is raw)", 163.1),
+    (["--intrinsics-from", "frame"], depth_msg_with([[170, 0, 320], [0, 240, 200], [0, 0, 1]]), "frame", 170.0),
+    (["--intrinsics-from", "frame"], SimpleNamespace(getTransformation=lambda: 1 / 0), "rectified (fallback)", 163.1),
+    (["--intrinsics-from", "cam_b"], depth_msg_with(RAW_MATRIX), "cam_b", K_RAW.fx),
+    (["--intrinsics-override", "150,220,330,200"], depth_msg_with(RAW_MATRIX), "override", 150.0),
+])
+def test_select_intrinsics(pnp_vio, argv, depth_msg, source, fx):
+    args = pnp_vio.parse_args(argv)
+    calibration = device_calibration()
+    rectified, problem = pnp_vio.rectified_for_settings(calibration, pnp_vio.resolve_stereo_settings(args),
+                                                        (args.width, args.height))
+    choice = pnp_vio.select_intrinsics(args, calibration, depth_msg, rectified, problem)
+    assert choice.source == source
+    assert choice.intrinsics.fx == pytest.approx(fx, rel=0.005)
+
+
+def test_select_intrinsics_without_alpha_falls_back_to_the_frame_with_a_warning(pnp_vio):
+    args = pnp_vio.parse_args(["--stereo-alpha", "none"])
+    calibration = device_calibration()
+    rectified, problem = pnp_vio.rectified_for_settings(calibration, pnp_vio.resolve_stereo_settings(args), (640, 400))
+    assert rectified is None
+    choice = pnp_vio.select_intrinsics(args, calibration, depth_msg_with(RAW_MATRIX), rectified, problem)
+    assert choice.source == "frame (fallback)" and choice.intrinsics == K_RAW
+    (warning,) = choice.warnings
+    assert "alpha scaling is not set" in warning and "unverified" in warning
+
+
+def test_run_uses_the_rectified_matrix_and_serves_a_depth_probe(pnp_vio, monkeypatch, tmp_path):
+    """Default config, a device whose depth frames carry the raw K (as the OAK-D-W-PoE does)."""
+    monkeypatch.setattr(pnp_vio, "load_calibration", lambda device, args: device_calibration())
+    monkeypatch.setattr(FakeTransformation, "getIntrinsicMatrix", lambda self: RAW_MATRIX)
+    probe_dir = tmp_path / "snapshots" / "depth_probe"
+    request_id = depth_probe.request_probe(depth_probe.make_request(320, 200, 41, 41, 5, (WIDTH, HEIGHT))[0], probe_dir)
+    monkeypatch.setattr(depth_probe, "_run_in_thread", lambda fn: fn())
+    lines, _ = run_fake(pnp_vio, monkeypatch, tmp_path, scenario(12, 0, 0), ["--depth-scale", "1.25"])
+    events = {line["event"]: line for line in lines if line["type"] == "event"}
+
+    intrinsics = events["intrinsics"]
+    assert intrinsics["source"] == "rectified" and intrinsics["requested_source"] == "rectified"
+    np.testing.assert_allclose(intrinsics["intrinsics"], [163.1, 237.1, 329.4, 199.0], rtol=0.005)
+    assert intrinsics["raw"] == pytest.approx(RAW_MATRIX[0][:1] + [RAW_MATRIX[1][1], RAW_MATRIX[0][2], RAW_MATRIX[1][2]])
+    assert intrinsics["frame_matches"] == "raw" and intrinsics["warnings"] == []
+    assert intrinsics["alpha"] == 0.0 and intrinsics["depth_scale"] == 1.25
+    assert intrinsics["baseline_m"] == pytest.approx(0.07496, abs=1e-5)
+    assert events["calibration"]["rectified"] == intrinsics["intrinsics"]
+    assert len(events["calibration"]["distortion"]) == 14
+    assert events["start"]["depth_scale"] == 1.25 and events["start"]["intrinsics_from"] == "rectified"
+    assert not [line for line in lines if line.get("event") == "warning" and "Intrinsics" in line["message"]]
+
+    camera = snapshots.read_camera_status(tmp_path / "snapshots")
+    assert camera["source"] == "rectified" and camera["intrinsics"] == intrinsics["intrinsics"]
+    assert camera["image_size"] == [WIDTH, HEIGHT] and camera["depth_range_mm"] == [300, 4000]
+
+    result = depth_probe.wait_for_probe(request_id, 0, probe_dir)
+    assert result["frames"] == 5 and result["median_mm"] == pytest.approx(2000.0)
+    assert result["raw_m"] == pytest.approx(2.0) and result["scaled_m"] == pytest.approx(2.5)
+    assert result["intrinsics_source"] == "rectified" and result["sequences"] == [0, 1, 2, 3, 4]
+
+
+def test_run_with_frame_source_ignores_a_raw_frame_matrix_loudly(pnp_vio, monkeypatch, tmp_path):
+    monkeypatch.setattr(pnp_vio, "load_calibration", lambda device, args: device_calibration())
+    monkeypatch.setattr(FakeTransformation, "getIntrinsicMatrix", lambda self: RAW_MATRIX)
+    lines, _ = run_fake(pnp_vio, monkeypatch, tmp_path, scenario(3, 0, 0), ["--intrinsics-from", "frame"])
+    events = {line["event"]: line for line in lines if line["type"] == "event"}
+    assert events["intrinsics"]["source"] == "rectified (frame matrix is raw)"
+    warnings = [line["message"] for line in lines if line.get("event") == "warning"]
+    assert any("unrectified K; ignored" in message for message in warnings)

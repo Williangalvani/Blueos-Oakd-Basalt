@@ -267,6 +267,9 @@ def test_intrinsics_from_frame():
     half = [[200.0, 0.0, 160.0], [0.0, 200.0, 100.0], [0.0, 0.0, 1.0]]
     assert intrinsics_from_frame(half, (320, 200), (WIDTH, HEIGHT)) == K
     assert intrinsics_from_frame(np.array(matrix), [WIDTH, HEIGHT], (WIDTH, HEIGHT)) == K
+    # fx != fy survives the scaling
+    anisotropic = [[81.55, 0.0, 164.7], [0.0, 118.55, 99.5], [0.0, 0.0, 1.0]]
+    assert intrinsics_from_frame(anisotropic, (320, 200), (WIDTH, HEIGHT)) == Intrinsics(163.1, 237.1, 329.4, 199.0)
 
 
 @pytest.mark.parametrize("matrix, size", [
@@ -482,6 +485,63 @@ def test_dying_reference_is_replaced_by_the_current_frame():
     assert odom.prev_timestamp == 1.2 and sorted(odom.prev_points) == sorted(new_ids.tolist())
     frame = odom.process(new_ids, GRID_UV, FLAT_DEPTH, 1.3)
     assert frame.pose.ok and frame.pose.matches == 30 and frame.dt == pytest.approx(0.1)
+
+
+# OAK-D-W-PoE CAM_B at 640x400: what the device rectifies to (alpha 0) and the raw calibration
+K_RECTIFIED = Intrinsics(fx=163.1, fy=237.1, cx=329.4, cy=199.0)
+K_RAW = Intrinsics(fx=285.11, fy=285.05, cx=323.2, cy=199.1)
+
+
+def anisotropic_wall_motion(delta, seed=13, depth_correction=1.0):
+    """
+    A wall 2 m away seen through K_RECTIFIED, the camera translating by delta (no rotation). Returns
+    the recovered position_delta for odometry run with K_RECTIFIED and with K_RAW, the pre-fix bug.
+    """
+    rng = np.random.default_rng(seed)
+    n = np.array([0.0, 0.15, 1.0]); n /= np.linalg.norm(n)
+    depth0 = plane_depth_image(n, 2.0, K_RECTIFIED)
+    uv0 = np.stack([rng.uniform(15, WIDTH - 15, 300), rng.uniform(15, HEIGHT - 15, 300)], axis=1)
+    P0 = back_project(uv0, lookup_depth(depth0, uv0, PnPParams(depth_window=0)), K_RECTIFIED)
+    t_10 = -np.asarray(delta, dtype=np.float64)
+    uv1 = project(P0 + t_10, K_RECTIFIED)
+    depth1 = plane_depth_image(n, 2.0 + n @ t_10, K_RECTIFIED)
+    keep = (uv1[:, 0] > 2) & (uv1[:, 0] < WIDTH - 2) & (uv1[:, 1] > 2) & (uv1[:, 1] < HEIGHT - 2)
+    ids = np.arange(len(uv0))
+    recovered = {}
+    for name, intrinsics in (("rectified", K_RECTIFIED), ("raw", K_RAW)):
+        odom = PnPOdometry(intrinsics, PnPParams(depth_correction=depth_correction), image_size=(WIDTH, HEIGHT))
+        odom.process(ids, uv0, depth0, 1.0)
+        frame = odom.process(ids[keep], uv1[keep], depth1, 1.1, R_prior=np.eye(3))
+        assert frame.pose.ok, frame.pose.reason
+        recovered[name] = frame.pose.position_delta
+    return recovered
+
+
+@pytest.mark.parametrize("axis, raw_scale", [(0, 163.1 / 285.11), (1, 237.1 / 285.05), (2, 1.0)])
+def test_anisotropic_rectified_k_gives_true_scale_and_raw_k_reproduces_the_bug(axis, raw_scale):
+    """Regression for the raw-K bug: lateral x0.57, vertical x0.83, forward x1.0 with the raw calibration."""
+    delta = np.zeros(3)
+    delta[axis] = 0.05
+    recovered = anisotropic_wall_motion(delta)
+    np.testing.assert_allclose(recovered["rectified"], delta, atol=1e-3)
+    assert recovered["raw"][axis] / 0.05 == pytest.approx(raw_scale, abs=0.02)
+    assert raw_scale > 0.95 or recovered["raw"][axis] / 0.05 < 0.9
+
+
+def test_depth_correction_scales_translation_linearly():
+    delta = np.array([0.03, 0.02, 0.05])
+    recovered = anisotropic_wall_motion(delta, depth_correction=1.3)
+    np.testing.assert_allclose(recovered["rectified"], 1.3 * delta, atol=1.5e-3)
+
+
+def test_lookup_depth_applies_unit_and_correction_after_the_range_check():
+    depth = np.full((HEIGHT, WIDTH), 2000, dtype=np.uint16)
+    depth[0:5, 0:5] = 100  # 0.1 m: below min depth whatever the correction
+    uv = np.array([[320.0, 200.0], [2.0, 2.0]])
+    z = lookup_depth(depth, uv, PnPParams(depth_correction=1.25, min_depth_m=0.2))
+    assert z[0] == pytest.approx(2.5)
+    assert math.isnan(z[1])
+    assert lookup_depth(depth, uv[:1], PnPParams(depth_unit_scale=0.01, max_depth_m=30.0))[0] == pytest.approx(20.0)
 
 
 def test_rotation_angle():

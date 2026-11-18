@@ -6,22 +6,30 @@ BlueOS OAK-D VIO Extension - Web Configuration Interface
 import os
 import json
 import subprocess
+import time
 from html import escape
 from pathlib import Path
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
-from pydantic import BaseModel, create_model
+from pydantic import BaseModel, Field, create_model, field_validator
 from typing import Literal, Optional
 import uvicorn
 
+import depth_probe
 import snapshots
 import vio_log
-from stereo_config import STEREO_DEFAULTS, STEREO_SETTINGS, stereo_command_args
+from stereo_config import (DEPTH_SCALE_RANGE, INTRINSICS_SOURCES, STEREO_DEFAULTS, STEREO_SETTINGS,
+                           parse_intrinsics_override, stereo_command_args)
 from vio_supervisor import VIOSupervisor
 
 WEB_PORT = 8095
 SNAPSHOT_DIR = snapshots.SNAPSHOT_DIR
 SNAPSHOT_TIMEOUT = 3.0
+# Wait for a depth probe: its frames at the configured fps plus this much
+PROBE_EXTRA_TIMEOUT = 3.0
+# The three focal-check snapshots go out one per second (SnapshotService.min_interval)
+FOCAL_CHECK_TIMEOUT = 3 * SNAPSHOT_TIMEOUT
+FOCAL_CHECK_STREAMS = ("rect_left", "rect_right", "depth")
 
 app = FastAPI(title="OAK-D VIO Configuration")
 
@@ -50,6 +58,9 @@ DEFAULT_CONFIG = {
     "tracking_recovery_frames": 20,
     "max_reference_age": 1.0,
     "snapshots": True,
+    "intrinsics_from": "rectified",
+    "intrinsics_override": None,
+    "depth_scale": 1.0,
     **STEREO_DEFAULTS,
     # Passive logger: no MAVLink output, autopilot params untouched (OAKD_LOG_ONLY=1 forces it on)
     "log_only": False,
@@ -75,7 +86,18 @@ class BaseVIOConfig(BaseModel):
     tracking_recovery_frames: int = 20
     max_reference_age: float = 1.0
     snapshots: bool = True
+    intrinsics_from: Literal[INTRINSICS_SOURCES] = "rectified"
+    intrinsics_override: Optional[str] = None
+    depth_scale: float = Field(1.0, ge=DEPTH_SCALE_RANGE[0], le=DEPTH_SCALE_RANGE[1])
     log_only: bool = False
+
+    @field_validator("intrinsics_override")
+    @classmethod
+    def _check_intrinsics_override(cls, value):
+        if value is None or not value.strip():
+            return None
+        parse_intrinsics_override(value)
+        return value.strip()
 
 
 def _setting_field(setting):
@@ -132,8 +154,12 @@ def build_vio_command(config: dict) -> list:
             "--recovery-frames", str(int(config["tracking_recovery_frames"])),
             "--max-reference-age", str(float(config["max_reference_age"])),
             "--snapshots" if config["snapshots"] else "--no-snapshots",
+            "--intrinsics-from", config.get("intrinsics_from") or "rectified",
+            "--depth-scale", str(float(config.get("depth_scale", 1.0))),
             *stereo_command_args(config),
         ]
+        if config.get("intrinsics_override"):
+            cmd += ["--intrinsics-override", str(config["intrinsics_override"])]
     else:
         cmd = [
             "python", "-u", "/app/basalt_configurable.py",
@@ -332,6 +358,8 @@ async def index():
         .logs li { padding: 6px 0; border-bottom: 1px solid #222; font-size: 13px; }
         .logs a { color: #00d4ff; }
         .snapshot { max-width: 100%; margin-top: 10px; border-radius: 4px; }
+        .probe { font-size: 11px; color: #ccc; background: #0f0f23; padding: 10px; border-radius: 4px; max-height: 300px; overflow: auto; }
+        .probe:empty { display: none; }
         .toast.show { opacity: 1; }
         .toast.success { background: #00cc66; }
         .toast.error { background: #cc3333; }
@@ -432,6 +460,26 @@ async def index():
                     </label>
                     <div class="hint">PnP only: on-demand camera snapshots below; no bandwidth until requested</div>
                 </div>
+                <div class="field">
+                    <label>PnP Intrinsics Source</label>
+                    <select name="intrinsics_from" data-value="{intrinsics_from}">
+                        <option value="rectified">rectified (calibration + alpha)</option>
+                        <option value="frame">frame (depth frame matrix)</option>
+                        <option value="cam_b">cam_b (raw calibration)</option>
+                        <option value="cam_c">cam_c (raw calibration)</option>
+                    </select>
+                    <div class="hint">PnP only: camera matrix of the rectified-left image. rectified is the matrix the camera rectifies to</div>
+                </div>
+                <div class="field">
+                    <label>PnP Intrinsics Override</label>
+                    <input type="text" name="intrinsics_override" value="{intrinsics_override}" placeholder="fx,fy,cx,cy">
+                    <div class="hint">PnP only: wins over the source; pixels on the width x height grid. Empty = off</div>
+                </div>
+                <div class="field">
+                    <label>PnP Depth Scale</label>
+                    <input type="number" name="depth_scale" value="{depth_scale}" step="0.001" min="0.2" max="5">
+                    <div class="hint">PnP only: multiplies the camera depth, and so the translation (e.g. a correction measured with the depth probe); 1 = none</div>
+                </div>
             </div>
 
             <h2>🌊 Stereo Depth (PnP)</h2>
@@ -475,6 +523,24 @@ async def index():
         </div>
         <div id="snapshot-status" class="hint"></div>
         <img id="snapshot" class="snapshot" alt="">
+
+        <h2>📏 Depth Probe (PnP)</h2>
+        <div class="grid">
+            <div class="field"><label>x (px)</label><input type="number" id="probe-x" placeholder="centre"></div>
+            <div class="field"><label>y (px)</label><input type="number" id="probe-y" placeholder="centre"></div>
+            <div class="field"><label>ROI w (px)</label><input type="number" id="probe-w" placeholder="41" min="1" max="200"></div>
+            <div class="field"><label>ROI h (px)</label><input type="number" id="probe-h" placeholder="41" min="1" max="200"></div>
+            <div class="field"><label>Frames</label><input type="number" id="probe-frames" placeholder="10" min="1" max="50"></div>
+        </div>
+        <div class="hint">Pixel coordinates on the rectified-left image (width × height above). Empty uses the default.</div>
+        <div class="buttons">
+            <button type="button" class="btn-primary" onclick="depthProbe()">Probe depth</button>
+            <button type="button" class="btn-secondary" onclick="aimProbe('rect_left')">Aim on rectified left</button>
+            <button type="button" class="btn-secondary" onclick="aimProbe('depth')">Aim on depth</button>
+            <button type="button" class="btn-secondary" onclick="focalCheck()">Focal check</button>
+        </div>
+        <div id="probe-summary" class="hint"></div>
+        <pre id="probe-result" class="probe"></pre>
 
         <h2>📝 Data Logs</h2>
         <ul id="logs" class="logs"><li>Loading...</li></ul>
@@ -550,6 +616,10 @@ async def index():
             // Convert numbers; an empty field means "auto" (null)
             for (const [key, value] of Object.entries(config)) {
                 if (key === 'vehicle_ip') continue;
+                if (key === 'intrinsics_override') {
+                    config[key] = value.trim() === '' ? null : value.trim();
+                    continue;
+                }
                 if (value === '') {
                     config[key] = null;
                 } else if (!isNaN(value)) {
@@ -591,10 +661,10 @@ async def index():
             }
         }
         
-        async function snapshot(stream) {
+        async function showSnapshot(stream, query) {
             const status = document.getElementById('snapshot-status');
             status.textContent = 'Requesting ' + stream + '...';
-            const res = await fetch('/api/snapshot?stream=' + stream);
+            const res = await fetch('/api/snapshot?stream=' + stream + (query ? '&' + query : ''));
             if (!res.ok) {
                 const error = await res.json().catch(() => ({}));
                 status.textContent = error.detail || ('Error ' + res.status);
@@ -604,6 +674,50 @@ async def index():
             if (img.src) URL.revokeObjectURL(img.src);
             img.src = URL.createObjectURL(await res.blob());
             status.textContent = stream + ' at ' + new Date().toLocaleTimeString();
+        }
+
+        function snapshot(stream) {
+            return showSnapshot(stream, '');
+        }
+
+        function probeParams(names) {
+            const params = new URLSearchParams();
+            for (const name of names) {
+                const value = document.getElementById('probe-' + name).value;
+                if (value !== '') params.set(name, value);
+            }
+            return params;
+        }
+
+        async function showProbeResult(url, busy, summarize) {
+            const summary = document.getElementById('probe-summary');
+            const result = document.getElementById('probe-result');
+            summary.textContent = busy;
+            const res = await fetch(url);
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                summary.textContent = data.detail || ('Error ' + res.status);
+                result.textContent = '';
+                return;
+            }
+            summary.textContent = summarize(data);
+            result.textContent = JSON.stringify(data, null, 2);
+        }
+
+        function depthProbe() {
+            return showProbeResult('/api/depth_probe?' + probeParams(['x', 'y', 'w', 'h', 'frames']),
+                'Probing depth...', data => data.summary);
+        }
+
+        function aimProbe(stream) {
+            const params = probeParams(['x', 'y', 'w', 'h']);
+            params.set('crosshair', '1');
+            return showSnapshot(stream, params.toString());
+        }
+
+        function focalCheck() {
+            return showProbeResult('/api/focal_check', 'Taking rect_left, rect_right and depth snapshots (keep the camera still)...',
+                data => (data.ok ? 'OK: ' : 'CHECK: ') + data.message);
         }
 
         async function resetDefaults() {
@@ -633,7 +747,7 @@ async def index():
     html = html.replace("{stereo_fields}", stereo_form_fields(config))
     # str.format() would choke on the CSS/JS braces in the template
     for key, value in config.items():
-        html = html.replace("{" + key + "}", escape(str(value)))
+        html = html.replace("{" + key + "}", "" if value is None else escape(str(value)))
     
     return HTMLResponse(content=html)
 
@@ -654,8 +768,8 @@ async def set_config(config: VIOConfig):
 
 @app.get("/api/status")
 async def get_status():
-    """Get VIO process status, including automatic restarts and log-only mode"""
-    return {**supervisor.status(), **log_only_status()}
+    """Get VIO process status, including automatic restarts, log-only mode and the PnP camera matrix"""
+    return {**supervisor.status(), **log_only_status(), "camera": snapshots.read_camera_status(SNAPSHOT_DIR)}
 
 
 @app.get("/api/logs")
@@ -673,14 +787,35 @@ async def download_log(name: str):
     return FileResponse(path, media_type="application/x-ndjson", filename=path.name)
 
 
+def vio_image_size():
+    """(width, height) of the rectified-left grid: what the running PnP VIO reported, else the saved config."""
+    camera = snapshots.read_camera_status(SNAPSHOT_DIR)
+    if camera and camera.get("image_size"):
+        return tuple(int(v) for v in camera["image_size"])
+    config = load_config()
+    return int(config["resolution_width"]), int(config["resolution_height"])
+
+
 @app.get("/api/snapshot")
-def get_snapshot(stream: Literal[snapshots.STREAMS], raw: bool = False):
+def get_snapshot(stream: Literal[snapshots.STREAMS], raw: bool = False, crosshair: bool = False,
+                 x: Optional[float] = None, y: Optional[float] = None, w: Optional[int] = None,
+                 h: Optional[int] = None):
     """
     PNG of one fresh frame from the running PnP VIO, without stopping it: rect_left, rect_right,
     depth (colorized, invalid black; raw=1 for 16-bit millimetres) or rgb. Waits up to ~3 s.
+    crosshair=1 draws the depth probe's ROI (x, y, w, h as for /api/depth_probe) on rect_left, rect_right or depth.
     """
     if raw and stream != "depth":
         raise HTTPException(status_code=400, detail="raw=1 only applies to stream=depth")
+    probe_request = None
+    if crosshair:
+        if raw or stream == "rgb":
+            raise HTTPException(status_code=400, detail="crosshair=1 works on rect_left, rect_right and depth, without raw=1")
+        image_size = vio_image_size()
+        try:
+            probe_request, _ = depth_probe.make_request(x, y, w, h, 1, image_size)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
     requested_at = snapshots.request_snapshot(stream, SNAPSHOT_DIR)
     try:
         data, meta = snapshots.wait_for_snapshot(stream, requested_at, raw=raw, timeout=SNAPSHOT_TIMEOUT,
@@ -689,6 +824,8 @@ def get_snapshot(stream: Literal[snapshots.STREAMS], raw: bool = False):
         raise HTTPException(status_code=404, detail=str(e))
     except snapshots.SnapshotTimeout as e:
         raise HTTPException(status_code=504, detail=f"{e}; snapshots need the PnP algorithm running")
+    if probe_request is not None:
+        data = depth_probe.draw_probe_overlay(data, probe_request, image_size)
     headers = {
         "Cache-Control": "no-store",
         "X-Snapshot-Unix-Time": str(meta.get("unix_time")),
@@ -696,6 +833,89 @@ def get_snapshot(stream: Literal[snapshots.STREAMS], raw: bool = False):
         "X-Snapshot-Sequence": str(meta.get("sequence")),
     }
     return Response(content=data, media_type="image/png", headers=headers)
+
+
+def require_pnp_running(what):
+    config = load_config()
+    if config.get("algorithm") != "pnp":
+        raise HTTPException(status_code=503, detail=f"{what} needs the PnP algorithm (current: {config.get('algorithm')})")
+    if not supervisor.status().get("running"):
+        raise HTTPException(status_code=503, detail=f"{what} needs the PnP VIO running; it is stopped")
+    return config
+
+
+@app.get("/api/depth_probe")
+def get_depth_probe(x: Optional[float] = None, y: Optional[float] = None, w: Optional[int] = None,
+                    h: Optional[int] = None, frames: Optional[int] = None):
+    """
+    Depth statistics in a w x h ROI centred on pixel (x, y) of the rectified-left grid, over the next
+    `frames` depth frames of the running PnP VIO (defaults: image centre, 41 x 41, 10 frames).
+    """
+    config = require_pnp_running("the depth probe")
+    try:
+        request, clamped = depth_probe.make_request(x, y, w, h, frames, vio_image_size())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    probe_dir = SNAPSHOT_DIR / "depth_probe"
+    request_id = depth_probe.request_probe(request, probe_dir)
+    timeout = request.frames / max(float(config.get("fps") or 1), 0.5) + PROBE_EXTRA_TIMEOUT
+    try:
+        result = depth_probe.wait_for_probe(request_id, timeout, probe_dir)
+    except depth_probe.ProbeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except depth_probe.ProbeTimeout as e:
+        raise HTTPException(status_code=504, detail=str(e))
+    result["clamped"] = clamped + result.get("clamped", [])
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/focal_check")
+def get_focal_check(tolerance: float = Query(0.15, gt=0.0, lt=1.0)):
+    """
+    Compare fx of the camera matrix in use with the focal length implied by the device depth
+    (f = Z * d / B at row-consistent rect_left/rect_right feature matches). Takes three snapshots
+    about 1 s apart, so the camera and scene must be still.
+    """
+    camera = snapshots.read_camera_status(SNAPSHOT_DIR)
+    if not camera or not camera.get("intrinsics"):
+        raise HTTPException(status_code=503, detail="no camera matrix published: the PnP VIO is not running "
+                                                    "or has not received a frame yet")
+    if not camera.get("baseline_m"):
+        raise HTTPException(status_code=503, detail="the calibration has no stereo baseline")
+    import cv2
+    import numpy as np
+    import rectified_intrinsics  # needs OpenCV; main.py must start without it
+
+    deadline = time.monotonic() + FOCAL_CHECK_TIMEOUT
+    requested = {stream: snapshots.request_snapshot(stream, SNAPSHOT_DIR) for stream in FOCAL_CHECK_STREAMS}
+    images, metas = {}, {}
+    for stream in FOCAL_CHECK_STREAMS:
+        try:
+            data, metas[stream] = snapshots.wait_for_snapshot(
+                stream, requested[stream], raw=stream == "depth", snapshot_dir=SNAPSHOT_DIR,
+                timeout=max(deadline - time.monotonic(), 0.0))
+        except snapshots.SnapshotUnavailable as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except snapshots.SnapshotTimeout as e:
+            raise HTTPException(status_code=504, detail=f"{e}; the focal check needs the PnP algorithm running")
+        images[stream] = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED)
+
+    fx_K = float(camera["intrinsics"][0])
+    measurement = rectified_intrinsics.measure_rectified_focal(
+        images["rect_left"], images["rect_right"], images["depth"], float(camera["baseline_m"]),
+        camera.get("depth_range_mm") or (300, 4000))
+    result = rectified_intrinsics.focal_check(fx_K, measurement, tolerance,
+                                              fx_raw=float(camera["raw"][0]) if camera.get("raw") else None)
+    timestamps = {stream: metas[stream].get("device_timestamp") for stream in FOCAL_CHECK_STREAMS}
+    known = [t for t in timestamps.values() if isinstance(t, (int, float))]
+    result.update(
+        candidates=measurement["candidates"], row_consistent=measurement["row_consistent"],
+        baseline_m=camera["baseline_m"], intrinsics=camera["intrinsics"], intrinsics_source=camera.get("source"),
+        device_timestamps=timestamps, timestamp_spread_s=(max(known) - min(known)) if known else None,
+        note="rect_left, rect_right and depth are separate snapshots about 1 s apart, not one stereo pair: keep the "
+             "camera and the scene still. This checks fx against the focal length the device used for depth; it "
+             "does not check fy, cx or cy.")
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/start")

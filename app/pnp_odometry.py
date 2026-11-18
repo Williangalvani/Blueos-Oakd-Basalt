@@ -61,8 +61,9 @@ class Intrinsics:
 
 def intrinsics_from_frame(matrix, frame_size, image_size):
     """
-    Intrinsics on the image_size (width, height) grid from an ImgFrame's transformation, i.e. the
-    camera matrix of the exact pixel grid the frame is on (rectified left after alpha scaling).
+    Intrinsics on the image_size (width, height) grid from an ImgFrame's transformation. On the
+    OAK-D-W-PoE the depth frame carries the raw CAM_B calibration here, not the rectified matrix
+    (see rectified_intrinsics.py), so callers check it against the raw calibration.
     A frame that is a uniform downscale of image_size (decimated depth) is scaled back up.
     None if the matrix is missing or not a plausible pinhole matrix for that grid.
     """
@@ -114,7 +115,11 @@ class PnPParams:
     depth_window: int = 2
     min_depth_m: float = 0.2
     max_depth_m: float = 15.0
-    depth_scale: float = 0.001
+    # Device depth unit (mm) -> m
+    depth_unit_scale: float = 0.001
+    # User correction (--depth-scale) multiplied into the looked-up depth, so translation scales with it;
+    # min/max_depth_m apply to the uncorrected device depth
+    depth_correction: float = 1.0
     min_valid_depth_fraction: float = 0.3
 
 
@@ -154,8 +159,8 @@ class FrameResult:
 def lookup_depth(depth, uv, params=PnPParams()):
     """
     Depth in metres at each pixel in uv (N x 2), as the median of the valid pixels in a
-    (2w+1)^2 window. Zero and out-of-range depths are ignored; returns NaN where too few
-    window pixels are valid.
+    (2w+1)^2 window, times params.depth_correction. Zero and out-of-range depths are ignored;
+    returns NaN where too few window pixels are valid.
     """
     uv = np.asarray(uv, dtype=np.float64).reshape(-1, 2)
     if len(uv) == 0:
@@ -167,7 +172,7 @@ def lookup_depth(depth, uv, params=PnPParams()):
     cols = np.rint(uv[:, 0])[:, None].astype(np.int64) + du.ravel()[None, :]
     rows = np.rint(uv[:, 1])[:, None].astype(np.int64) + dv.ravel()[None, :]
     inside = (cols >= 0) & (cols < w) & (rows >= 0) & (rows < h)
-    samples = depth[np.clip(rows, 0, h - 1), np.clip(cols, 0, w - 1)].astype(np.float64) * params.depth_scale
+    samples = depth[np.clip(rows, 0, h - 1), np.clip(cols, 0, w - 1)].astype(np.float64) * params.depth_unit_scale
     valid = inside & (samples >= params.min_depth_m) & (samples <= params.max_depth_m)
     samples[~valid] = np.nan
 
@@ -176,7 +181,7 @@ def lookup_depth(depth, uv, params=PnPParams()):
         z = np.nanmedian(samples, axis=1)
     enough = valid.sum(axis=1) >= max(1, math.ceil(params.min_valid_depth_fraction * samples.shape[1]))
     z[~enough] = np.nan
-    return z
+    return z * params.depth_correction
 
 
 def back_project(uv, z, intrinsics):

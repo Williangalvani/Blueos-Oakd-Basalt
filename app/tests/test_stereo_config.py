@@ -227,3 +227,52 @@ def test_every_setting_has_a_flag_and_label():
     flags = [setting.flag for setting in stereo_config.STEREO_SETTINGS]
     assert len(set(flags)) == len(flags)
     assert all(flag.startswith("--stereo-") for flag in flags)
+
+
+def test_main_command_passes_intrinsics_and_depth_scale(client, pnp_vio):
+    main, _ = client
+    default = pnp_vio.parse_args(main.build_vio_command({**main.DEFAULT_CONFIG, "algorithm": "pnp"})[3:])
+    assert default.intrinsics_from == "rectified" and default.intrinsics_override is None and default.depth_scale == 1.0
+    cmd = main.build_vio_command({**main.DEFAULT_CONFIG, "algorithm": "pnp", "intrinsics_from": "frame",
+                                  "intrinsics_override": "163.1,237.1,329.4,199.0", "depth_scale": 1.33})
+    args = pnp_vio.parse_args(cmd[3:])
+    assert args.intrinsics_from == "frame" and args.depth_scale == 1.33
+    assert args.intrinsics_override == (163.1, 237.1, 329.4, 199.0)
+    basalt = main.build_vio_command({**main.DEFAULT_CONFIG, "algorithm": "basalt"})
+    assert "--depth-scale" not in basalt and "--intrinsics-from" not in basalt
+
+
+def test_config_api_validates_intrinsics_and_depth_scale(client):
+    main, http = client
+    body = {**main.DEFAULT_CONFIG, "algorithm": "pnp"}
+    assert http.post("/api/config", json={**body, "intrinsics_override": " 160,230,330,199 ",
+                                          "depth_scale": 1.2}).status_code == 200
+    saved = main.load_config()
+    assert saved["intrinsics_override"] == "160,230,330,199" and saved["depth_scale"] == 1.2
+    assert saved["intrinsics_from"] == "rectified"
+    assert http.post("/api/config", json={**body, "intrinsics_override": ""}).status_code == 200
+    assert main.load_config()["intrinsics_override"] is None
+    for bad in ({"depth_scale": 0.1}, {"depth_scale": 6}, {"intrinsics_override": "1,2,3"},
+                {"intrinsics_override": "1,2,-3,4"}, {"intrinsics_from": "sideways"}):
+        assert http.post("/api/config", json={**body, **bad}).status_code == 422, bad
+
+
+def test_web_form_renders_intrinsics_and_depth_scale(client):
+    main, http = client
+    main.save_config({**main.DEFAULT_CONFIG})
+    page = http.get("/").text
+    assert 'name="intrinsics_from" data-value="rectified"' in page
+    assert 'name="intrinsics_override" value=""' in page and 'name="depth_scale" value="1.0"' in page
+    main.save_config({**main.DEFAULT_CONFIG, "intrinsics_override": "1,2,3,4", "depth_scale": 0.8})
+    page = http.get("/").text
+    assert 'name="intrinsics_override" value="1,2,3,4"' in page and 'name="depth_scale" value="0.8"' in page
+
+
+def test_status_reports_the_camera_matrix(client, monkeypatch, tmp_path):
+    main, http = client
+    monkeypatch.setattr(main, "SNAPSHOT_DIR", tmp_path / "snapshots")
+    assert http.get("/api/status").json()["camera"] is None
+    import snapshots
+    snapshots.write_camera_status({"source": "rectified", "intrinsics": [163.1, 237.1, 329.4, 199.0]},
+                                  tmp_path / "snapshots")
+    assert http.get("/api/status").json()["camera"]["source"] == "rectified"

@@ -26,6 +26,8 @@ import numpy as np
 
 SNAPSHOT_DIR = Path("/app/data/snapshots")
 STREAMS = ("rect_left", "rect_right", "depth", "rgb")
+# Camera matrix and calibration the running PnP VIO uses, for /api/status and /api/focal_check
+CAMERA_STATUS = "camera.json"
 
 
 class SnapshotUnavailable(Exception):
@@ -36,12 +38,28 @@ class SnapshotTimeout(Exception):
     pass
 
 
-def _atomic_write(path, data):
+def atomic_write(path, data):
     path = Path(path)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     with open(tmp, "wb") as f:
         f.write(data)
     os.replace(tmp, path)
+
+
+def write_camera_status(status, snapshot_dir=SNAPSHOT_DIR):
+    Path(snapshot_dir).mkdir(parents=True, exist_ok=True)
+    atomic_write(Path(snapshot_dir) / CAMERA_STATUS, json.dumps(status).encode())
+
+
+def clear_camera_status(snapshot_dir=SNAPSHOT_DIR):
+    (Path(snapshot_dir) / CAMERA_STATUS).unlink(missing_ok=True)
+
+
+def read_camera_status(snapshot_dir=SNAPSHOT_DIR):
+    try:
+        return json.loads((Path(snapshot_dir) / CAMERA_STATUS).read_text())
+    except (OSError, ValueError):
+        return None
 
 
 def _check_stream(stream):
@@ -57,7 +75,7 @@ def request_snapshot(stream, snapshot_dir=SNAPSHOT_DIR, clock=time.time):
     request_dir = Path(snapshot_dir) / "requests"
     request_dir.mkdir(parents=True, exist_ok=True)
     requested_at = clock()
-    _atomic_write(request_dir / stream, json.dumps({"stream": stream, "requested_at": requested_at}).encode())
+    atomic_write(request_dir / stream, json.dumps({"stream": stream, "requested_at": requested_at}).encode())
     return requested_at
 
 
@@ -107,7 +125,7 @@ def colorize_depth(depth_mm, min_mm=300, max_mm=4000):
     return color
 
 
-def _encode_png(image):
+def encode_png(image):
     import cv2
     ok, data = cv2.imencode(".png", image)
     if not ok:
@@ -122,21 +140,21 @@ def write_snapshot(snapshot_dir, stream, image, meta, depth_range_mm=(300, 4000)
     image = np.asarray(image)
     files = [f"{stream}.png"]
     if stream == "depth":
-        _atomic_write(snapshot_dir / "depth_raw.png", _encode_png(image.astype(np.uint16)))
-        _atomic_write(snapshot_dir / "depth.png", _encode_png(colorize_depth(image, *depth_range_mm)))
+        atomic_write(snapshot_dir / "depth_raw.png", encode_png(image.astype(np.uint16)))
+        atomic_write(snapshot_dir / "depth.png", encode_png(colorize_depth(image, *depth_range_mm)))
         files.append("depth_raw.png")
     else:
-        _atomic_write(snapshot_dir / f"{stream}.png", _encode_png(image))
+        atomic_write(snapshot_dir / f"{stream}.png", encode_png(image))
     record = {**meta, "stream": stream, "width": int(image.shape[1]), "height": int(image.shape[0]),
               "written_at": clock(), "files": files}
-    _atomic_write(snapshot_dir / f"{stream}.json", json.dumps(record).encode())
+    atomic_write(snapshot_dir / f"{stream}.json", json.dumps(record).encode())
 
 
 def write_error(snapshot_dir, stream, requested_at, error, clock=time.time):
     snapshot_dir = Path(snapshot_dir)
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     record = {"stream": stream, "requested_at": requested_at, "error": error, "written_at": clock()}
-    _atomic_write(snapshot_dir / f"{stream}.json", json.dumps(record).encode())
+    atomic_write(snapshot_dir / f"{stream}.json", json.dumps(record).encode())
 
 
 class SnapshotWriter:

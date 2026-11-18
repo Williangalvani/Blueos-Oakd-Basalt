@@ -8,6 +8,7 @@ rotation prior (pnp_odometry.py), then sends VISION_POSITION_DELTA over MAVLink.
 """
 
 import argparse
+import os
 import signal
 import sys
 import time
@@ -21,14 +22,16 @@ import depthai as dai
 import numpy as np
 from loguru import logger
 
+import depth_probe
 import snapshots
 from autopilot_params import AutopilotParams
 from device_open import DEFAULT_TIMEOUT, DeviceOpenTimeout, open_oak_device
 from mavlink_sender import MavlinkSender
 from pnp_odometry import (Intrinsics, PnPOdometry, PnPParams, camera_to_body_frd, integrate_gyro,
                           intrinsics_from_frame)
-from stereo_config import (add_stereo_arguments, apply_stereo_config, effective_stereo_config,
-                           resolve_stereo_settings, stereo_warnings)
+from rectified_intrinsics import StereoCalibration, as_list, choose_intrinsics, rectified_for_settings
+from stereo_config import (INTRINSICS_SOURCES, add_stereo_arguments, apply_stereo_config, effective_stereo_config,
+                           parse_depth_scale, parse_intrinsics_override, resolve_stereo_settings, stereo_warnings)
 from tracking_recovery import FeatureTrackerReinit, TrackingRecovery, feature_id_counts
 from vio_log import LOG_ONLY_BANNER, env_forces_log_only, open_vio_log, resolve_log_only, setup_autopilot_output
 
@@ -51,6 +54,15 @@ INTRINSICS_SOCKETS = {
 }
 
 
+def _argument_type(parse):
+    def convert(text):
+        try:
+            return parse(text)
+        except ValueError as e:
+            raise argparse.ArgumentTypeError(str(e))
+    return convert
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description='BlueOS OAK-D PnP VIO')
 
@@ -62,9 +74,17 @@ def parse_args(argv=None):
     parser.add_argument('--num-features', type=int, default=300,
                         help='Target number of features tracked on the camera')
     parser.add_argument('--corner-detector', choices=sorted(CORNER_DETECTORS), default='harris')
-    parser.add_argument('--intrinsics-from', choices=['frame', *sorted(INTRINSICS_SOCKETS)], default='frame',
-                        help='Rectified-left camera matrix: "frame" reads it from the depth frame (matches alpha '
-                             'scaling), cam_b/cam_c use the raw calibration (see NOTES_OPTION_D.md)')
+    parser.add_argument('--intrinsics-from', choices=INTRINSICS_SOURCES, default='rectified',
+                        help='Rectified-left camera matrix: "rectified" computes it from the CAM_B calibration and the '
+                             'stereo alpha (what the device rectifies to), "frame" reads the depth frame (which '
+                             'carries the raw calibration on RVC2), cam_b/cam_c use the raw calibration '
+                             '(see NOTES_OPTION_D.md)')
+    parser.add_argument('--intrinsics-override', type=_argument_type(parse_intrinsics_override), default=None,
+                        metavar='FX,FY,CX,CY',
+                        help='Camera matrix in pixels on the width x height grid; wins over --intrinsics-from')
+    parser.add_argument('--depth-scale', type=_argument_type(parse_depth_scale), default=1.0,
+                        help='Multiplies the device depth before back-projection, so translation scales with it '
+                             '(e.g. a measured refraction correction); 0.2-5')
 
     parser.add_argument('--min-inliers', type=int, default=15)
     parser.add_argument('--reprojection-error', type=float, default=2.0, help='RANSAC threshold (px)')
@@ -193,44 +213,96 @@ def log_device_info(device):
     return {label: str(value) for label, value in info.items()}
 
 
-def load_calibration(device, args):
-    """Raw calibration intrinsics (cam_b unless --intrinsics-from cam_c) and the IMU -> CAM_B rotation."""
-    calib = device.readCalibration()
-    socket = args.intrinsics_from if args.intrinsics_from in INTRINSICS_SOCKETS else "cam_b"
-    K = calib.getCameraIntrinsics(INTRINSICS_SOCKETS[socket], args.width, args.height)
-    intrinsics = Intrinsics.from_matrix(K)
-    logger.info(f"Calibration intrinsics ({socket} @ {args.width}x{args.height}): "
-                f"fx={intrinsics.fx:.1f} fy={intrinsics.fy:.1f} cx={intrinsics.cx:.1f} cy={intrinsics.cy:.1f}")
+def format_intrinsics(intrinsics):
+    if intrinsics is None:
+        return "none"
+    return f"fx={intrinsics.fx:.1f} fy={intrinsics.fy:.1f} cx={intrinsics.cx:.1f} cy={intrinsics.cy:.1f}"
 
-    R_cam_imu = None
+
+def load_calibration(device, args):
+    """
+    StereoCalibration: raw CAM_B (stereo left) intrinsics and distortion on the width x height grid,
+    the raw socket matrix --intrinsics-from cam_b/cam_c asks for, the stereo baseline and the IMU -> CAM_B rotation.
+    """
+    calib = device.readCalibration()
+    left = dai.CameraBoardSocket.CAM_B
+    raw = Intrinsics.from_matrix(calib.getCameraIntrinsics(left, args.width, args.height))
+    logger.info(f"Calibration intrinsics (cam_b @ {args.width}x{args.height}): {format_intrinsics(raw)}")
+    calibration = StereoCalibration(raw=raw, sockets={"cam_b": raw})
+    try:
+        calibration.distortion = [float(v) for v in calib.getDistortionCoefficients(left)]
+        logger.info(f"CAM_B distortion coefficients: {np.round(calibration.distortion, 5).tolist()}")
+    except Exception as e:
+        logger.warning(f"No CAM_B distortion coefficients ({e})")
+    if args.intrinsics_from == "cam_c":
+        calibration.sockets["cam_c"] = Intrinsics.from_matrix(
+            calib.getCameraIntrinsics(INTRINSICS_SOCKETS["cam_c"], args.width, args.height))
+        logger.info(f"Calibration intrinsics (cam_c): {format_intrinsics(calibration.sockets['cam_c'])}")
+    try:
+        # Default useSpecTranslation=True is the board design value (CalibrationHandler.hpp)
+        calibration.baseline_m = calib.getBaselineDistance(dai.CameraBoardSocket.CAM_C, left, False) / 100.0
+        calibration.baseline_spec_m = calib.getBaselineDistance(dai.CameraBoardSocket.CAM_C, left, True) / 100.0
+        logger.info(f"Stereo baseline: {calibration.baseline_m * 100:.3f} cm calibrated, "
+                    f"{calibration.baseline_spec_m * 100:.3f} cm design")
+    except Exception as e:
+        logger.warning(f"No stereo baseline ({e})")
+
     if args.gyro_gate > 0:
         try:
-            extrinsics = np.array(calib.getImuToCameraExtrinsics(dai.CameraBoardSocket.CAM_B, True))
-            R_cam_imu = extrinsics[:3, :3]
-            logger.info(f"IMU -> CAM_B rotation:\n{np.array2string(R_cam_imu, precision=3)}")
+            extrinsics = np.array(calib.getImuToCameraExtrinsics(left, True))
+            calibration.R_cam_imu = extrinsics[:3, :3]
+            logger.info(f"IMU -> CAM_B rotation:\n{np.array2string(calibration.R_cam_imu, precision=3)}")
         except Exception as e:
             logger.warning(f"No IMU-to-camera extrinsics ({e}); gyro prior disabled")
-    return intrinsics, R_cam_imu
+    return calibration
 
 
-def select_intrinsics(args, calibration_intrinsics, depth_msg):
-    """
-    (intrinsics, source, problem). With --intrinsics-from frame the camera matrix comes from the depth
-    frame's transformation: the rectified-left grid the features and depth are on, including alpha
-    scaling. Falls back to the calibration (problem says why) if the frame carries no usable matrix.
-    """
-    if args.intrinsics_from != "frame":
-        return calibration_intrinsics, args.intrinsics_from, None
+def frame_intrinsics(depth_msg, image_size):
+    """(Intrinsics or None, problem) from the depth frame's transformation, on the image_size grid."""
     try:
         transformation = depth_msg.getTransformation()
-        intrinsics = intrinsics_from_frame(transformation.getIntrinsicMatrix(), transformation.getSize(),
-                                           (args.width, args.height))
-        problem = None if intrinsics else f"implausible depth frame camera matrix for {args.width}x{args.height}"
+        intrinsics = intrinsics_from_frame(transformation.getIntrinsicMatrix(), transformation.getSize(), image_size)
     except Exception as e:
-        intrinsics, problem = None, f"no depth frame camera matrix ({e})"
+        return None, f"no depth frame camera matrix ({e})"
     if intrinsics is None:
-        return calibration_intrinsics, "cam_b (fallback)", problem
-    return intrinsics, "frame", None
+        return None, f"implausible depth frame camera matrix for {image_size[0]}x{image_size[1]}"
+    return intrinsics, None
+
+
+def select_intrinsics(args, calibration, depth_msg, rectified, rectified_problem=None):
+    """
+    IntrinsicsChoice for the first depth frame. --intrinsics-override wins; the default "rectified"
+    uses the K computed from the calibration and only reads the frame matrix to log whether it matches.
+    """
+    override = None if args.intrinsics_override is None else Intrinsics(*args.intrinsics_override)
+    frame, frame_problem = frame_intrinsics(depth_msg, (args.width, args.height))
+    return choose_intrinsics(args.intrinsics_from, calibration.raw, rectified, frame, frame_problem, override,
+                             calibration.sockets if args.intrinsics_from in INTRINSICS_SOCKETS else None,
+                             rectified_problem)
+
+
+def camera_status(args, calibration, rectified, choice, stereo_settings):
+    """What /api/status and /api/focal_check read about the camera matrix in use."""
+    return {
+        "pid": os.getpid(),
+        "unix_time": time.time(),
+        "image_size": [args.width, args.height],
+        "source": choice.source,
+        "requested_source": args.intrinsics_from,
+        "intrinsics": as_list(choice.intrinsics),
+        "raw": as_list(calibration.raw),
+        "rectified": as_list(rectified),
+        "frame": as_list(choice.frame),
+        "frame_matches": choice.frame_matches,
+        "override": None if args.intrinsics_override is None else list(args.intrinsics_override),
+        "alpha": stereo_settings["stereo_alpha"],
+        "distortion_correction": stereo_settings["stereo_distortion_correction"],
+        "baseline_m": calibration.baseline_m,
+        "baseline_spec_m": calibration.baseline_spec_m,
+        "depth_scale": args.depth_scale,
+        "depth_range_mm": [stereo_settings["stereo_depth_min_mm"], stereo_settings["stereo_depth_max_mm"]],
+        "warnings": choice.warnings,
+    }
 
 
 def configure_feature_tracker(config, args, maintainer=True):
@@ -357,12 +429,15 @@ def main(argv=None):
           f"min inliers {args.min_inliers}, gyro gate {args.gyro_gate}°, max reference age {args.max_reference_age} s, "
           f"recovery after {args.recovery_frames} failures")
     print(f"🌊 Stereo: {', '.join(f'{k[7:]}={v}' for k, v in stereo_settings.items())}")
+    print(f"📏 Intrinsics from {args.intrinsics_from}"
+          f"{f', override {args.intrinsics_override}' if args.intrinsics_override else ''}, depth scale {args.depth_scale}")
     print(f"📡 MAVLink: {'disabled (log-only)' if log_only else args.vehicle_ip}")
 
     data_log = open_vio_log()
     logger.info(f"Data log: {data_log.path}")
     data_log.event("start", algorithm="pnp", args=vars(args), stereo=stereo_settings, log_only=log_only,
-                   log_only_forced_by_env=env_forces_log_only())
+                   log_only_forced_by_env=env_forces_log_only(), depth_scale=args.depth_scale,
+                   intrinsics_from=args.intrinsics_from, intrinsics_override=args.intrinsics_override)
     exit_code = 0
     try:
         run(args, log_only, data_log, stereo_settings)
@@ -393,6 +468,7 @@ def run(args, log_only, data_log, stereo_settings):
         max_reference_age_s=args.max_reference_age,
         min_depth_m=args.min_depth,
         max_depth_m=args.max_depth,
+        depth_correction=args.depth_scale,
     )
     quality_interval = 1.0 / args.quality_rate if args.quality_rate > 0 else float('inf')
 
@@ -420,12 +496,24 @@ def run(args, log_only, data_log, stereo_settings):
             data_log.event("stereo_config", requested=stereo_settings, effective=handles.stereo_effective,
                            warnings=warnings)
             data_log.event("device", **log_device_info(device))
-            calibration_intrinsics, R_cam_imu = load_calibration(device, args)
-            data_log.event("calibration",
-                           intrinsics=[calibration_intrinsics.fx, calibration_intrinsics.fy,
-                                       calibration_intrinsics.cx, calibration_intrinsics.cy],
+            calibration = load_calibration(device, args)
+            R_cam_imu = calibration.R_cam_imu
+            rectified, rectified_problem = rectified_for_settings(calibration, stereo_settings, (args.width, args.height))
+            logger.info(f"Rectified intrinsics (alpha {stereo_settings['stereo_alpha']}, distortion correction "
+                        f"{stereo_settings['stereo_distortion_correction']}): {format_intrinsics(rectified)}"
+                        f"{f' ({rectified_problem})' if rectified_problem else ''}")
+            data_log.event("calibration", intrinsics=as_list(calibration.raw), distortion=calibration.distortion,
+                           rectified=as_list(rectified), rectified_problem=rectified_problem,
+                           alpha=stereo_settings["stereo_alpha"],
+                           distortion_correction=stereo_settings["stereo_distortion_correction"],
+                           baseline_m=calibration.baseline_m, baseline_spec_m=calibration.baseline_spec_m,
                            R_cam_imu=R_cam_imu)
+            snapshots.clear_camera_status(args.snapshot_dir)
             odometry = None  # created on the first frame, once the rectified intrinsics are known
+            probe = depth_probe.DepthProbeService(
+                args.snapshot_dir / "depth_probe",
+                (stereo_settings["stereo_depth_min_mm"], stereo_settings["stereo_depth_max_mm"]),
+                args.depth_scale, (args.width, args.height), log=logger.warning)
             gyro = GyroBuffer()
             stats = Stats(device)
             tracking = None
@@ -472,14 +560,24 @@ def run(args, log_only, data_log, stereo_settings):
                                    f"depth {depth_msg.getSequenceNum()}")
 
                 if odometry is None:
-                    intrinsics, source, problem = select_intrinsics(args, calibration_intrinsics, depth_msg)
-                    if problem:
-                        log_warning(f"{problem}; using the CAM_B calibration, which is wrong if alpha scaling is set")
-                    logger.info(f"Intrinsics ({source}): fx={intrinsics.fx:.1f} fy={intrinsics.fy:.1f} "
-                                f"cx={intrinsics.cx:.1f} cy={intrinsics.cy:.1f}")
-                    data_log.event("intrinsics", source=source,
-                                   intrinsics=[intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy])
+                    choice = select_intrinsics(args, calibration, depth_msg, rectified, rectified_problem)
+                    for message in choice.warnings:
+                        log_warning(f"Intrinsics: {message}")
+                    intrinsics = choice.intrinsics
+                    logger.info(f"Intrinsics ({choice.source}): {format_intrinsics(intrinsics)}; raw cam_b "
+                                f"{format_intrinsics(calibration.raw)}, rectified {format_intrinsics(rectified)}, "
+                                f"depth frame {format_intrinsics(choice.frame)} (matches {choice.frame_matches}), "
+                                f"alpha {stereo_settings['stereo_alpha']}")
+                    status = camera_status(args, calibration, rectified, choice, stereo_settings)
+                    data_log.event("intrinsics", **{key: status[key] for key in (
+                        "source", "requested_source", "intrinsics", "raw", "rectified", "frame", "frame_matches",
+                        "override", "alpha", "distortion_correction", "baseline_m", "depth_scale", "warnings")})
+                    try:
+                        snapshots.write_camera_status(status, args.snapshot_dir)
+                    except OSError as e:
+                        logger.warning(f"Camera status not written: {e}")
                     odometry = PnPOdometry(intrinsics, params, image_size=(args.width, args.height))
+                    probe.set_intrinsics(intrinsics, choice.source)
 
                 t = timestamp_seconds(depth_msg, exposure_middle=True)
                 tracked = features_msg.trackedFeatures
@@ -538,6 +636,8 @@ def run(args, log_only, data_log, stereo_settings):
                     if snapshot_msg is not None:
                         snapshot_service.on_frame(lambda stream, m=snapshot_msg: snapshot_frame(m, stream),
                                                   timestamp_seconds(snapshot_msg), snapshot_msg.getSequenceNum())
+                probe.tick()
+                probe.on_depth(depth, t, depth_msg.getSequenceNum())
                 proc_ms = (time.perf_counter() - start) * 1000.0
 
                 data_log.step(

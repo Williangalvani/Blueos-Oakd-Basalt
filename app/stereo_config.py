@@ -1,6 +1,7 @@
 """
 StereoDepth settings for the PnP VIO, shared by main.py (config, web form, command line) and
-pnp_vio.py (argparse, device configuration).
+pnp_vio.py (argparse, device configuration), plus the validators of the camera-model settings
+(intrinsics override, depth scale) both sides check.
 
 The defaults favour sparse but trustworthy depth at the tracked features over dense depth: a preset
 first, then LR check, a confidence threshold, speckle and range filters, no spatial/temporal
@@ -9,6 +10,8 @@ tracker runs on. depthai is passed in by the caller so this module can be unit t
 """
 
 import argparse
+import math
+import re
 from dataclasses import dataclass
 
 PRESETS = ("ROBOTICS", "DEFAULT", "DENSITY", "ACCURACY", "HIGH_DETAIL", "FACE", "NONE")
@@ -68,6 +71,31 @@ STEREO_SETTINGS = (
 SETTINGS_BY_KEY = {setting.key: setting for setting in STEREO_SETTINGS}
 STEREO_DEFAULTS = {setting.key: setting.default for setting in STEREO_SETTINGS}
 
+INTRINSICS_SOURCES = ("rectified", "frame", "cam_b", "cam_c")
+# Multiplicative correction of the device depth; outside this range it is almost certainly a typo
+DEPTH_SCALE_RANGE = (0.2, 5.0)
+
+
+def parse_depth_scale(value):
+    scale = float(value)
+    low, high = DEPTH_SCALE_RANGE
+    if not (math.isfinite(scale) and low <= scale <= high):
+        raise ValueError(f"depth scale must be between {low} and {high}, got {value!r}")
+    return scale
+
+
+def parse_intrinsics_override(text):
+    """'fx,fy,cx,cy' (pixels on the configured rectified-left grid) -> (fx, fy, cx, cy); None if empty."""
+    if text is None or not str(text).strip():
+        return None
+    parts = [part for part in re.split(r"[,\s]+", str(text).strip()) if part]
+    if len(parts) != 4:
+        raise ValueError(f"intrinsics override needs four numbers fx,fy,cx,cy, got {text!r}")
+    values = tuple(float(part) for part in parts)
+    if not all(math.isfinite(v) and v > 0 for v in values):
+        raise ValueError(f"intrinsics override values must be positive, got {text!r}")
+    return values
+
 
 def add_stereo_arguments(parser):
     group = parser.add_argument_group("stereo depth")
@@ -108,7 +136,7 @@ def stereo_command_args(config):
     return args
 
 
-def stereo_warnings(settings, intrinsics_from="frame"):
+def stereo_warnings(settings, intrinsics_from="rectified"):
     warnings = []
     if settings["stereo_median"] != "off" and settings["stereo_subpixel"] and settings["stereo_subpixel_bits"] != 3:
         warnings.append(f"median filter {settings['stereo_median']} needs 3 subpixel bits, "
@@ -116,9 +144,9 @@ def stereo_warnings(settings, intrinsics_from="frame"):
     if settings["stereo_decimation"] != 1:
         warnings.append(f"decimation {settings['stereo_decimation']}: depth is coarser than the feature grid, "
                         "feature depth lookups are scaled down to it")
-    if settings["stereo_alpha"] is not None and intrinsics_from != "frame":
+    if settings["stereo_alpha"] is not None and intrinsics_from in ("cam_b", "cam_c"):
         warnings.append(f"alpha scaling {settings['stereo_alpha']} changes the rectified camera matrix, but "
-                        f"intrinsics come from the {intrinsics_from} calibration; use --intrinsics-from frame")
+                        f"intrinsics come from the raw {intrinsics_from} calibration; use --intrinsics-from rectified")
     return warnings
 
 

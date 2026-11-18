@@ -14,6 +14,10 @@ Prototype on branch `option-d-pnp`. **Not run on hardware yet.**
 | `app/stereo_config.py` | depthai-free table of the `StereoDepth` settings: defaults, argparse flags, the `main.py` command line and form, `apply_stereo_config`, and the effective-config readback. |
 | `app/snapshots.py` | depthai-free snapshot IPC: request files written by `main.py`, `SnapshotService` (polling, throttling, one in flight) and `SnapshotWriter` (PNG thread) in the VIO process. |
 | `app/tracking_recovery.py` | `TrackingRecovery` (N failures, then reset with backoff), `FeatureTrackerReinit` (two-step config resend), `feature_id_counts`. |
+| `app/rectified_intrinsics.py` | depthai-free: `rectified_intrinsics()` (the device's rectified-left K from calibration + alpha), `choose_intrinsics()` (source, fallbacks, warnings), and the focal self-check (`measure_rectified_focal`, `focal_check`). |
+| `app/depth_probe.py` | depthai-free depth probe: request/result files, `DepthProbeService` in the VIO loop, statistics, crosshair overlay. |
+| `app/tools/check_rectified_focal.py` | Offline focal check on snapshot PNGs. |
+| `app/tests/test_rectified_intrinsics.py`, `test_depth_probe.py` | Rectified K against the dumped calibration (`app/tests/data/calib_oakd_w_poe.json`), source selection, focal check on synthetic and real frames (`app/tests/data/snap4/`), and the probe service and endpoints. |
 | `app/tests/test_stereo_config.py`, `test_snapshots.py`, `test_tracking_recovery.py` | Plumbing, IPC/endpoint, and recovery tests. These include a `pnp_vio.run()` with a fake device that replays the collapse seen in the pool test. |
 | `app/tests/test_pnp_odometry.py` | pytest unit tests on synthetic scenes. |
 | `app/tests/test_device_open.py`, `app/tests/test_vio_supervisor.py` | Backoff and restart-policy tests (fake clock, and real subprocesses that exit or SIGSEGV). |
@@ -31,7 +35,19 @@ python /app/pnp_vio.py --fps 15 --width 640 --height 400 --num-features 300 --ve
   - On RVC2, ROBOTICS is DENSITY plus decimation 2, the spatial filter, speckle range 200, confidence 15 and LR threshold 10 (`StereoDepth.cpp`). That is why decimation and the spatial filter have to be set explicitly after it.
   - Extended disparity is forced off, since it is incompatible with subpixel. The median filter is turned off, with a warning, if subpixel bits ≠ 3.
 - Depth is aligned to `RECTIFIED_LEFT`, so it shares a pixel grid with `stereo.rectifiedLeft`. If decimation is set anyway, `PnPOdometry(image_size=...)` scales the feature pixels to the depth grid for the lookup only; back-projection stays on the full grid.
-- **Intrinsics** come from the first depth frame's `getTransformation().getIntrinsicMatrix()` (`--intrinsics-from frame`). That is the matrix of the grid the depth is actually on, including any alpha scaling (a calibration matrix would be wrong with alpha ≠ device default). `intrinsics_from_frame` scales a uniformly downscaled frame back up, and rejects a non-finite matrix, an aspect-ratio mismatch, fx/fy ≤ 0 or a principal point outside the image. In those cases it falls back to the CAM_B calibration with a warning. `cam_b`/`cam_c` force the calibration.
+- **Intrinsics** (`--intrinsics-from rectified`, the default since task 8) are computed on the host: `cv2.getOptimalNewCameraMatrix(K_camB, D_camB[:8], (w, h), alpha)`. This is the matrix the device rectifies onto; see [Rectified intrinsics](#rectified-intrinsics).
+  - The depth frame's `getTransformation().getIntrinsicMatrix()` turned out to carry the *raw* CAM_B K. It is only logged, with `frame_matches` (`raw`/`rectified`/`neither`).
+  - `--intrinsics-from frame` still uses the frame matrix, but ignores it with a warning when it equals the raw K and a rectified K is known.
+  - If alpha is unset or distortion correction is off, the rectified K is unknown. PnP then falls back to the frame matrix, with a warning.
+  - `intrinsics_from_frame` scales a uniformly downscaled frame back up, keeping fx and fy separate. It rejects:
+    - a non-finite matrix;
+    - an aspect-ratio mismatch;
+    - fx/fy ≤ 0;
+    - a principal point outside the image.
+  - `cam_b`/`cam_c` force the raw calibration. `--intrinsics-override fx,fy,cx,cy` wins over everything.
+  - The choice is in the `intrinsics` event, the container log and `/api/status` → `camera`.
+- **fx ≠ fy audit** (task 8): `back_project` uses `(u − cx)/fx` and `(v − cy)/fy`. `Intrinsics.matrix()` builds a full K for `solvePnPRansac`, and the frame scaling uses separate x and y factors. The depth probe's range and the focal check use fx only where they mean fx (the check is horizontal disparity). Nothing assumed a single focal length, so no change was needed. Regression tests: an anisotropic K recovers lateral, vertical and forward motion at 1.0×, and the raw K reproduces the 0.572 / 0.832 / 1.0 error.
+- **Depth scale** (`--depth-scale`, 0.2–5, default 1): `lookup_depth` multiplies the median depth by `PnPParams.depth_correction` after the range check. The device's min/max depth apply to the uncorrected depth. The unit conversion is now `depth_unit_scale` (0.001, mm → m). Translation scales linearly with it (tested).
 - **Confidence gating** of depth is not implemented. The `confidenceMap` output is RAW8 on the stereo input grid; it gets no LR check, alignment or post-processing, so it doesn't line up with the RECTIFIED_LEFT depth. Streaming it through `Sync` would add ~20 Mbit/s to the ~45 used on the 100 Mbit PoE link. The device's `confidenceThreshold` already invalidates the same pixels before depth leaves the camera, so a stricter host gate is just a lower threshold.
 - `rectifiedLeft` feeds `FeatureTracker`: Harris (or `--corner-detector shi-tomasi`), 300 target features, motion estimator on with Lucas-Kanade optical flow (persistent ids), and the feature maintainer on.
 - `outputFeatures` and `depth` are paired by an on-device `Sync` node (threshold of half a frame period).
@@ -39,7 +55,7 @@ python /app/pnp_vio.py --fps 15 --width 640 --height 400 --num-features 300 --ve
 
 **Host (Pi), for each synced group:**
 1. Drain the IMU queue into a gyro buffer.
-2. Look up depth at each feature: the median of the valid pixels in a 5×5 window. 0 and out-of-range values are rejected, and at least 30% of the window must be valid. Valid features are back-projected with the rectified-left intrinsics.
+2. Look up depth at each feature: the median of the valid pixels in a 5×5 window. 0 and out-of-range values are rejected, and at least 30% of the window must be valid. The median is multiplied by `--depth-scale`, and valid features are back-projected with the rectified-left intrinsics.
 3. Match the features to the reference frame by id: the last good frame, usually the previous one. The reference supplies the 3D points, the current frame the 2D points.
 4. Integrate the gyro between the reference and current timestamps to get the rotation prior `R_01`. The gyro buffer keeps 2 s before the older of the two (capped at 10000 samples), and `integrate_gyro` returns no prior if there is a hole over 0.1 s in the interval.
 5. Run `cv2.solvePnPRansac`, seeded with the gyro rotation (EPnP minimal sets, then LM refine on the inliers).
@@ -52,6 +68,15 @@ python /app/pnp_vio.py --fps 15 --width 640 --height 400 --num-features 300 --ve
 9. After `--recovery-frames` (20) consecutive failures (`no_reference` frames don't count), `PnPOdometry.reset()` drops the reference. A `FeatureTrackerConfig` with the maintainer off goes to `feature_tracker.inputConfig`, then the normal config the next frame. The next recovery waits twice as long, up to 16×; a success resets the wait.
 
 **Snapshots.** A `Script` node gets `rectifiedLeft`, `rectifiedRight`, `depth` and, if the device has CAM_A, a 640×400 NV12 output at 5 fps. Each goes into a non-blocking size-1 input, so it holds just the latest frame. A `dai.Buffer` on its `request` input, with the stream index as sequence number, makes it forward one frame. `stereo.setNumFramesPool(4)` (default 3) covers the frame each gate input keeps. On the host, `SnapshotService.tick()` and one `tryGet()` run each frame. They are counted in `proc_ms`. The PNG work runs on the `SnapshotWriter` thread. The request/response files are described in the README.
+
+**Depth probe.** It needs no device-side gate, because the host already gets every depth frame.
+- `DepthProbeService.tick()` lists `snapshots/depth_probe/requests/` at most every 0.2 s and claims the oldest request: rename, read, unlink. It drops requests older than 30 s and writes an error result for invalid ones.
+- While a probe is active, `on_depth()` copies the ROI of each frame, scaled to the depth grid if decimated.
+- After N frames, a thread computes the statistics and writes `results/<id>.json` atomically.
+- One probe at a time. Results not collected within 300 s are deleted.
+- `main.py` waits frames/fps + 3 s. On a timeout it withdraws the request if it is still unclaimed.
+- Measured on a desktop: 0.0005 ms/frame idle, 0.024 ms/frame while copying a 200×200 ROI. The final statistics (54 ms for 50×200×200) run off the loop thread.
+- `/api/status` and the probe's image size come from `snapshots/camera.json`, which `pnp_vio.run()` writes after choosing the intrinsics and removes at startup.
 
 **Logging.**
 - Every frame gets a `logger.debug` line with timing, counts and the failure reason. Loguru's default sink shows DEBUG.
@@ -98,24 +123,79 @@ python /app/pnp_vio.py --fps 15 --width 640 --height 400 --num-features 300 --ve
   - the recovery state machine;
   - `pnp_vio.run()` replaying the collapse with a fake pipeline. That run checks two recoveries, maintainer off/on configs, the `intrinsics` event `source: frame`, and a snapshot served mid-run.
 - Reference held across failed frames (task 6): 129 tests, adding a slanted-wall run where frame 1 fails and frame 2's delta and `dt` cover 0 → 2, the per-interval translation gate, the age cap (and 0 = no cap), a dying reference, timestamps that go backwards, gyro integration over long intervals with holes, recovery clearing a held reference, and `pnp_vio.run()` runs checking `time_delta_us` and the gyro prior over a 2.6 s gap.
+- Rectified intrinsics, depth scale and depth probe (task 8): 228 tests. They add:
+  - the rectified K against the dumped OAK-D-W-PoE calibration (within 0.5% of the values below);
+  - source selection and fallbacks, including a raw frame matrix being rejected;
+  - per-axis translation with the right and the wrong K;
+  - depth scale;
+  - the focal check on a synthetic pair and on the real `snap4` frames (f ≈ 167.7);
+  - probe statistics, the service under a fake clock, and a micro-benchmark;
+  - the endpoints, and a `pnp_vio.run()` serving a probe mid-run.
 - Snapshot host overhead on a desktop with a 300-feature PnP frame: 0.9 ms/frame without snapshots, 1.0 ms with a request every frame (`/tmp/bench_snapshots.py`, not in the repo).
 
 ## To verify on hardware
 
 1. **The pipeline starts:** `Sync` runs on the device with `FeatureTracker` + `StereoDepth` + subpixel at 640×400 / 15 fps. `setHardwareResources(1, 2)` must allow 300 features next to stereo. Watch for "Sequence mismatch" warnings, which mean the sync pairs the wrong frames.
-2. **Rectified-left intrinsics:** the script reads the matrix from the depth frame (`intrinsics` event, `source: frame`). Compare it with the `calibration` event. With alpha 0 they should differ; if the frame matrix equals the raw calibration, the depth frame's `ImgTransformation` doesn't carry the rectification, and the alpha-scaled matrix must come from elsewhere. Check by holding the camera still in front of a flat wall at a measured distance: back-projected features should lie on a plane at the right depth.
+2. **Rectified-left intrinsics:**
+   - The `intrinsics` event should show `source: rectified` and `frame_matches: raw`.
+   - `/api/focal_check` should give a ratio of about 1.0 (it was 1.03 offline on snap4).
+   - fy and cy are not covered by the check. Move the camera a measured distance sideways and vertically: both deltas should match. Before task 8 they came out at 0.57× and 0.83×.
+   - If the ratio is off by more than a few percent, measure with the override. Likely causes are the R1 rotation, CAM_C vs CAM_B, or the firmware's OpenCV version.
 3. **Depth alignment:** `RECTIFIED_LEFT` alignment should put depth on the feature pixel grid. The other checkout uses `setDepthAlign(CAM_B)`, which may warp depth to the *unrectified* left camera and offset it from the feature pixels.
 4. **Rotation sign/frame:** the IMU→CAM_B rotation ignores the small rectification rotation (R1). Rotate the camera by hand: the per-frame `gyro_diff` in the debug log should stay well under 1–2°. If it's large and grows with rotation speed, the extrinsics or the axis convention are wrong.
 5. **Sign check, as in HANDOFF:** forward/right/down motion should give +x/+y/+z `position_delta`, and yawing right should give +z `angle_delta`.
 6. **Pi CPU and processing time:** compare the 10 s summaries with RTABMap and Basalt. The Python per-feature loops (building `ids`/`uv` from `trackedFeatures`) are the likely hot spot.
 7. **mavlink2rest message format:** check that `NAMED_VALUE_FLOAT` with a char-list name and `VISION_POSITION_DELTA` are accepted. Check `/mavlink2rest/mavlink/vehicles/1/components/195/messages/...`.
 8. **ArduSub's response to `confidence`:** check how ArduPilot uses it (the quality threshold in `AP_VisualOdom`), and tune the formula or `--min-inliers`.
-9. **Underwater behaviour:** low texture, backscatter and refraction (the in-air calibration makes depth scale wrong behind a flat port).
+9. **Underwater behaviour:** low texture, backscatter and refraction. The in-air calibration makes depth scale wrong behind a flat port; measure it with `/api/depth_probe` against a tape and set `--depth-scale`. Refraction also changes the effective fx/fy, which a depth scale doesn't correct (`--intrinsics-override`).
 10. **Two OpenCVs in one process:** the image installs `opencv-python-headless` from PyPI (4.14 abi3 aarch64 wheel with numpy 2.x on trixie's Python 3.13), while the depthai bindings link the system/vcpkg OpenCV. The wheel bundles its own renamed libraries, so they shouldn't clash. Still, check that `import depthai, cv2` works in the container and that the first PnP frames solve.
 11. **Stereo config:** compare `effective` in the `stereo_config` event with the requested settings. Check that the preset's `setPostProcessingHardwareResources(3, 3)` and `FeatureTracker.setHardwareResources(1, 2)` fit together (the pipeline starts), and look at the fraction of valid depth on features (`valid_depth / features`) against the old 20–30%.
 12. **Snapshots:** each stream from the page, while watching the 10 s fps summary and `proc_ms`; RGB on a device with CAM_A, and a 404 on one without. Check that `NumFramesPool(4)` doesn't cause frame drops or "pool exhausted" stalls on the stereo outputs, and how much CAM_A at 5 fps costs the camera.
 13. **Recovery:** after a recovery, `new_features` should jump (re-detection) and `features` return towards 300. If the count stays low, the maintainer toggle doesn't reset the tracker's corner thresholds. The next things to try then are sending a config with explicit `CornerDetector.Thresholds` (e.g. a low `initialValue`), or re-sending `setNumTargetFeatures`.
 14. **Min inliers vs sparse depth:** at the end of the pool test, frames had 7–12 consistent matches and were all rejected by `--min-inliers 15`. Look at whether 8–10 with a tighter reprojection threshold is safe underwater.
+15. **Depth probe and focal check on hardware:**
+    - The probe's `proc_ms` cost while active.
+    - That `x, y` on the crosshair snapshot match the probed pixels.
+    - The focal check's match count on typical scenes (the three snapshots are about 1 s apart).
+
+## Rectified intrinsics
+
+Found in task 8 (review 7). PnP used the depth frame's camera matrix, which is the *raw* CAM_B K: fx 285.11, fy 285.05, cx 323.22, cy 199.08 at 640×400. With distortion correction on and alpha 0, the image is rectified onto a different matrix. Lateral translation came out at 0.572× and vertical at 0.832×; forward was unaffected.
+
+What the device does, from `../blueos-oakd-basalt/depthai-core` (commit `4d4a8c159`, v3.0.0-rc.2-1605). The RVC2 stereo firmware is closed, so these are its documented contracts plus depthai-core's own host-side model of the output:
+
+| Where | What |
+|---|---|
+| `include/depthai/properties/StereoDepthProperties.hpp:132-142`, `include/depthai/pipeline/node/StereoDepth.hpp:316-325` | `useHomographyRectification`: with distortion correction, rectification is a mesh generated on the device, "same as opencv's initUndistortRectifyMap"; "Only the first 8 distortion coefficients are used". AUTO uses the mesh for lenses over 85° FOV. |
+| `src/pipeline/node/StereoDepth.cpp:161-163` | `enableDistortionCorrection(x)` is `useHomographyRectification(!x)`. |
+| `StereoDepthProperties.hpp:181-189`, `StereoDepth.hpp:371-377` | `alphaScaling`: free scaling "See getOptimalNewCameraMatrix from opencv". |
+| `src/pipeline/node/StereoDepth.cpp:185-187` | `setAlphaScaling` only stores the property; the mesh is built in firmware. |
+| `src/rtabmap/CalibrationHandler.cpp:14-30` | `getRTABMapCameraModel`, depthai-core's model of the rectified stereo output (used by `RTABMapVIO.cpp:156` with the rectified-left instance). It takes the camera's own K (`getCameraIntrinsics(cameraId, w, h)`), D[:8] for Perspective (26-27), and `getOptimalNewCameraMatrix(K, D, size, alpha)` when alpha > −1 (29-30). It does not apply R1. |
+| `StereoDepthProperties.hpp:126-130` | `focalLengthFromCalibration = true`: the focal length for disparity → depth comes from calibration on the device. The measured f ≈ 167 shows it is the rectified fx, not the raw one. |
+| `src/pipeline/node/Rectification.cpp:76, 107, 173, 188` | The host `Rectification` node is RVC4-only. It calls `stereoRectify` without alpha ("todo expose alpha") and uses the left K for both outputs. It doesn't describe RVC2 `StereoDepth`. |
+| `include/depthai/device/CalibrationHandler.hpp:307-309` | `getBaselineDistance` defaults to `useSpecTranslation = true` (design value); `load_calibration` passes `False` for the calibrated one, and logs both. |
+| `src/device/CalibrationHandler.cpp:393-415` | `getDistortionCoefficients` returns all 14 Perspective coefficients; `rectified_intrinsics` keeps the first 8. |
+
+For the dumped calibration (`app/tests/data/calib_oakd_w_poe.json`) at 640×400, the rectified K is computed as follows:
+
+| | fx | fy | cx | cy |
+|---|---|---|---|---|
+| Raw CAM_B | 285.11 | 285.05 | 323.22 | 199.08 |
+| Rectified, alpha 0, D[:8] (used) | 163.10 | 237.09 | 329.37 | 198.98 |
+| Rectified, alpha 0, all 14 coefficients | 163.12 | 237.09 | 328.65 | 197.98 |
+| CAM_C rectified, alpha 0 | 161.9 | 236.0 | 326.1 | 196.4 |
+
+Measured:
+- On snap4, f = Z·d/B gives a median of 167.7 px. That is from 39 SIFT matches with valid depth (54 candidates, 46 on the same row); a dense estimate gives 166.9. That is 3% from 163.1 and 41% from the raw 285.1.
+- The baseline is 7.496 cm calibrated and 7.5 cm by design.
+- An RGB fit of the rectified left gave cx 334–342. That weakly favours CAM_B over CAM_C, whose fx differs by less than 1%.
+
+Not verifiable from the sources (closed firmware):
+- whether the firmware folds the R1 rectification rotation into the new matrix;
+- the exact OpenCV version it uses;
+- whether a different left/right reference is chosen.
+
+Any of these could move K by a few percent. `/api/focal_check` checks fx on the device. fy and cy have no device-side check besides motion tests.
 
 ## Tracking degradation in the first pool test
 
@@ -141,7 +221,7 @@ Conclusion: the collapse is in the camera's `FeatureTracker`, which never repopu
 
 ## Running it in the extension
 
-Select *PnP* as the algorithm on the configuration page (or POST `"algorithm": "pnp"` to `/api/config`). `main.py` then starts `python -u /app/pnp_vio.py` with the FPS, camera angle, resolution, vehicle IP, quality rate, *PnP Features*, *PnP Recovery After*, *PnP Max Reference Age*, *Snapshots* and *Stereo Depth (PnP)* settings. Output is unbuffered and goes to the container log. The web UI is on port 8095 (8080 is taken by mavlink-server on BlueOS 1.4.x). At startup the log shows the device name, IMU and USB speed. Every 10 s it prints fps, ok/total, mean/max processing time, mean features, mean inliers, failure reasons and the chip temperature.
+Select *PnP* as the algorithm on the configuration page (or POST `"algorithm": "pnp"` to `/api/config`). `main.py` then starts `python -u /app/pnp_vio.py` with the FPS, camera angle, resolution, vehicle IP, quality rate, *PnP Features*, *PnP Recovery After*, *PnP Max Reference Age*, *Snapshots*, *PnP Intrinsics Source*, *PnP Intrinsics Override*, *PnP Depth Scale* and *Stereo Depth (PnP)* settings. Output is unbuffered and goes to the container log. The web UI is on port 8095 (8080 is taken by mavlink-server on BlueOS 1.4.x). At startup the log shows the device name, IMU and USB speed. Every 10 s it prints fps, ok/total, mean/max processing time, mean features, mean inliers, failure reasons and the chip temperature.
 
 ## Device open and restarts
 
