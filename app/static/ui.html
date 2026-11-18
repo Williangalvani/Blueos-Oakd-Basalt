@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OAK-D VIO (Option D)</title>
+<!--UI_CSS-->
+</head>
+<body>
+<header>
+  <h1>OAK-D VIO <span class="muted">(Option D)</span></h1>
+  <span id="pill-camera" class="pill">camera ?</span>
+  <span id="pill-vio" class="pill">VIO ?</span>
+  <span id="pill-output" class="pill">output ?</span>
+  <span id="pill-algorithm" class="pill dim">algorithm ?</span>
+  <span id="header-right" class="muted header-right">vehicle: ? · uptime – · CPU –</span>
+</header>
+<div id="log-only-banner" class="log-only" hidden></div>
+
+<main>
+<section class="c4" id="panel-status">
+  <h2>Live status</h2>
+  <div id="status-message" class="panel-message" hidden></div>
+  <div class="big">
+    <div><b id="big-fps">–</b>fps</div>
+    <div><b id="big-inliers">–</b>inliers</div>
+    <div><b id="big-ok">–</b><span id="big-ok-label">frames ok</span></div>
+    <div><b id="big-proc">–</b>proc ms</div>
+  </div>
+  <div class="kv" id="status-kv">
+    <span>features / valid depth</span><span id="kv-features">–</span>
+    <span>matches</span><span id="kv-matches">–</span>
+    <span>refractive_index n</span><span id="kv-n">–</span>
+    <span>depth_scale</span><span id="kv-depth-scale">–</span>
+    <span>effective K</span><span id="kv-k">–</span>
+    <span>reference resets / gap frames</span><span id="kv-resets">–</span>
+    <span>tracking recoveries</span><span id="kv-recoveries">–</span>
+    <span>Pi CPU</span><span id="kv-cpu">–</span>
+    <span>camera temp</span><span id="kv-temp">–</span>
+  </div>
+  <div id="camera-status" class="hint"></div>
+
+  <h2 class="sub">Failures <span class="muted" id="failures-window">(last 5 min)</span></h2>
+  <div class="kv" id="failures-kv"><span class="muted">–</span><span></span></div>
+
+  <h2 class="sub">Output</h2>
+  <div class="kv">
+    <span>mode</span><span id="out-mode">–</span>
+    <span>messages sent</span><span id="out-sent">–</span>
+    <span>rate</span><span id="out-rate">–</span>
+    <span>last error</span><span id="out-error">–</span>
+  </div>
+  <div class="buttons">
+    <button type="button" class="s" id="btn-log-only" onclick="toggleLogOnly()">Log-only: ?</button>
+    <button type="button" class="s" onclick="resetVIO()" title="Restart the VIO process (PnP reference, trajectory and history start over)">Reset VIO</button>
+    <button type="button" class="s" onclick="startVIO()">Start</button>
+    <button type="button" class="s" onclick="stopVIO()">Stop</button>
+  </div>
+  <div id="process-status" class="hint"></div>
+</section>
+
+<section class="c8" id="panel-views">
+  <h2>Live views <span class="muted">(on-demand snapshots)</span></h2>
+  <div class="controls">
+    <label class="inline"><input type="checkbox" id="view-auto"> auto-refresh (~1 Hz)</label>
+    <button type="button" class="s small" onclick="refreshViews(true)">Refresh</button>
+    <label class="inline">left
+      <select id="view-left-stream">
+        <option value="rect_left">rect_left</option>
+        <option value="rect_right">rect_right</option>
+        <option value="rgb">rgb</option>
+      </select></label>
+    <label class="inline"><input type="checkbox" id="view-overlay" checked> features (green inlier, red outlier, grey unmatched)</label>
+    <label class="inline"><input type="checkbox" id="view-depth" checked> depth</label>
+    <label class="inline"><input type="checkbox" id="view-crosshair"> probe ROI</label>
+  </div>
+  <div class="imgs">
+    <figure class="view" id="view-left"><img alt=""><figcaption class="muted">rect_left: press Refresh or enable auto-refresh</figcaption></figure>
+    <figure class="view" id="view-right"><img alt=""><figcaption class="muted">depth (colormap, near red, far blue, invalid black)</figcaption></figure>
+  </div>
+  <div class="hint">Click the left image to aim the depth probe there.</div>
+
+  <h2 class="sub">Depth probe</h2>
+  <div class="probe-row">
+    <label>x <input type="number" id="probe-x" placeholder="centre"></label>
+    <label>y <input type="number" id="probe-y" placeholder="centre"></label>
+    <label>w <input type="number" id="probe-w" placeholder="41" min="1" max="200"></label>
+    <label>h <input type="number" id="probe-h" placeholder="41" min="1" max="200"></label>
+    <label>frames <input type="number" id="probe-frames" placeholder="10" min="1" max="50"></label>
+    <button type="button" onclick="depthProbe()">Probe</button>
+    <button type="button" class="s" onclick="focalCheck()">Focal check</button>
+  </div>
+  <div class="hint">Pixel coordinates on the rectified-left image (the configured width × height). Empty uses the default.</div>
+  <div id="probe-summary" class="summary muted"></div>
+  <details><summary class="muted">probe / focal check result (JSON)</summary><pre id="probe-result" class="probe"></pre></details>
+</section>
+
+<section class="c4" id="panel-trajectory">
+  <h2>Trajectory <span class="muted">(integrated VIO, x–y m, <span id="traj-window">60 s</span>; integrated, drifts)</span></h2>
+  <svg id="plot-trajectory" class="plot" viewBox="0 0 300 300" role="img" aria-label="integrated trajectory"></svg>
+  <div class="hint">Forward (x) up, right (y) to the right, from where the window starts. Body deltas rotated by the gyro yaw; dropped deltas (reference resets) are missing.</div>
+</section>
+
+<section class="c8" id="panel-velocity">
+  <h2>Velocity — body frame <span class="muted">(A50-style)</span></h2>
+  <div class="velocity">
+    <svg id="plot-dial" class="dial" viewBox="0 0 240 250" role="img" aria-label="horizontal velocity"></svg>
+    <svg id="plot-vbar" class="vbar" viewBox="0 0 70 250" role="img" aria-label="vertical velocity"></svg>
+    <div class="kv velocity-kv">
+      <span>vx</span><span id="vel-vx">–</span>
+      <span>vy</span><span id="vel-vy">–</span>
+      <span>vz</span><span id="vel-vz">–</span>
+      <span>speed</span><span id="vel-speed">–</span>
+      <span>direction of motion</span><span id="vel-dir">–</span>
+      <span>valid</span><span id="vel-valid">–</span>
+      <span>ring scale</span><span>
+        <select id="vel-scale">
+          <option value="0.25">0.25 m/s</option>
+          <option value="0.5" selected>0.5 m/s</option>
+          <option value="1">1 m/s</option>
+        </select></span>
+    </div>
+  </div>
+  <div class="muted">Dial: forward = up, arrow = current vx/vy with a 2.5 s fading trail, dot = vehicle nose; bar = vz (down +). Same layout as the Water Linked DVL A50 "Horizontal / Vertical velocity" widgets.</div>
+</section>
+
+<section class="c6" id="panel-vxvy">
+  <h2>vx / vy over time <span class="muted">(m/s)</span>
+    <select id="hist-window" class="small">
+      <option value="30">30 s</option>
+      <option value="60" selected>60 s</option>
+      <option value="120">2 min</option>
+      <option value="300">5 min</option>
+      <option value="600">10 min</option>
+    </select></h2>
+  <svg id="plot-vxvy" class="plot" viewBox="0 0 600 220" role="img" aria-label="vx and vy over time"></svg>
+  <div class="muted" id="dvl-hint">DVL overlay: –</div>
+</section>
+
+<section class="c6" id="panel-inliers">
+  <h2>Inliers over time</h2>
+  <svg id="plot-inliers" class="plot" viewBox="0 0 600 220" role="img" aria-label="inliers over time"></svg>
+  <div class="muted">dashed red = min_inliers (<span id="min-inliers">–</span>); red ticks = rejected frames</div>
+</section>
+
+<section class="c6" id="panel-settings">
+  <h2>Settings</h2>
+  <form id="config-form" novalidate>
+    <details open><summary>PnP (option D)</summary><div class="fields">
+<!--FIELDS_PNP-->
+    </div></details>
+    <details open><summary>Camera</summary><div class="fields">
+<!--FIELDS_CAMERA-->
+    </div></details>
+    <details><summary>Stereo depth (PnP)</summary><div class="fields">
+<!--FIELDS_STEREO-->
+    </div></details>
+    <details><summary>MAVLink output</summary><div class="fields">
+<!--FIELDS_OUTPUT-->
+    </div></details>
+    <details><summary>Basalt VIO</summary><div class="fields">
+<!--FIELDS_BASALT-->
+    </div></details>
+    <div class="buttons">
+      <button type="submit">Apply (restarts VIO)</button>
+      <button type="button" class="s" onclick="resetDefaults()">Reset all to defaults</button>
+      <span class="muted" id="settings-state">validated client + server</span>
+    </div>
+    <div id="settings-errors" class="errors" hidden></div>
+  </form>
+</section>
+
+<section class="c6" id="panel-autopilot">
+  <h2>ArduPilot parameters <span class="muted">(via mavlink2rest)</span></h2>
+  <div class="warn">Writing is blocked unless the vehicle is <b>DISARMED</b> (a fresh HEARTBEAT's armed bit is re-checked by the server at write time) and you confirm. Nothing is written automatically.</div>
+  <div id="ap-message" class="panel-message" hidden></div>
+  <div class="table-wrap">
+  <table id="ap-table">
+    <thead><tr><th></th><th>Param</th><th>Current</th><th>Suggested (editable)</th><th>Status</th><th>Why</th></tr></thead>
+    <tbody><tr><td colspan="6" class="muted">Reading…</td></tr></tbody>
+  </table>
+  </div>
+  <div class="buttons">
+    <button type="button" class="s" onclick="readAutopilot()">Re-read</button>
+    <button type="button" class="w" id="ap-write" onclick="openWriteDialog()">Write selected… (confirm dialog)</button>
+    <span class="muted" id="ap-armed">vehicle: ?</span>
+  </div>
+</section>
+
+<section class="c12" id="panel-logs">
+  <h2>Data logs</h2>
+  <ul id="logs" class="logs"><li>Loading...</li></ul>
+</section>
+</main>
+
+<dialog id="ap-dialog">
+  <h2 id="ap-dialog-title">Write parameters?</h2>
+  <div id="ap-dialog-armed" class="warn"></div>
+  <ul id="ap-dialog-list" class="changes"></ul>
+  <div id="ap-dialog-result"></div>
+  <div class="buttons">
+    <button type="button" class="s" id="ap-dialog-cancel" onclick="closeWriteDialog()">Cancel</button>
+    <button type="button" class="w" id="ap-dialog-confirm" onclick="confirmWrite()">Write</button>
+  </div>
+</dialog>
+
+<div id="toast" class="toast"></div>
+<!--UI_JS-->
+</body>
+</html>

@@ -1,0 +1,1051 @@
+'use strict';
+// OAK-D VIO web UI: vanilla JS, inline SVG, no external resources (works offline on a boat).
+// Polling: /api/status and /api/history once a second while the tab is visible, snapshots only
+// while auto-refresh is on, the ArduPilot parameters on load and on demand.
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const $ = id => document.getElementById(id);
+const ui = {
+  schema: null, fields: {}, initial: {}, status: null, history: null, historyEtag: null, historyKey: '',
+  autopilot: null, busy: {}, pendingWrite: null,
+};
+const COLORS = { vx: '#6fa8d6', vy: '#e67e22', dvlx: '#c4e3fb', dvly: '#ffd7a8', grid: '#2c3647', axis: '#34425a',
+                 text: '#8fa3bd', bad: '#e74c3c', ok: '#2ecc71', inl: '#e67e22', ring: '#2c3647', vehicle: '#8a97a8' };
+const TRAIL_S = 2.5;
+
+// --- helpers ------------------------------------------------------------------------------------
+
+const visible = () => document.visibilityState === 'visible';
+const isNum = v => typeof v === 'number' && isFinite(v);
+const fmt = (v, digits = 1, suffix = '') => isNum(v) ? v.toFixed(digits) + suffix : '–';
+const signed = (v, digits = 2, suffix = '') => {
+  if (!isNum(v)) return '–';
+  const text = v.toFixed(digits);
+  return (Number(text) === 0 ? '+' + (0).toFixed(digits) : (v > 0 ? '+' : '') + text) + suffix;
+};
+
+function setText(id, text) {
+  const node = $(id);
+  if (node) node.textContent = text;
+}
+
+function showToast(message, type) {
+  const toast = $('toast');
+  toast.textContent = message;
+  toast.className = 'toast show ' + type;
+  clearTimeout(showToast.timer);
+  showToast.timer = setTimeout(() => toast.className = 'toast', 3500);
+}
+
+function svg(tag, attrs, parent) {
+  const node = document.createElementNS(SVG_NS, tag);
+  for (const [key, value] of Object.entries(attrs || {})) node.setAttribute(key, value);
+  if (parent) parent.appendChild(node);
+  return node;
+}
+
+function svgText(parent, x, y, text, attrs) {
+  const node = svg('text', { x, y, fill: COLORS.text, 'font-size': 11, ...attrs }, parent);
+  node.textContent = text;
+  return node;
+}
+
+function errorText(data, status) {
+  if (!data) return 'Error ' + status;
+  if (typeof data.detail === 'string') return data.detail;
+  if (data.message) return data.message;
+  if (Array.isArray(data.detail)) return data.detail.map(d => d.msg).join('; ');
+  return 'Error ' + status;
+}
+
+async function fetchJSON(url, options) {
+  const res = await fetch(url, options);
+  const data = await res.json().catch(() => null);
+  return { ok: res.ok, status: res.status, data, res };
+}
+
+async function once(name, fn) {
+  if (ui.busy[name]) return;
+  ui.busy[name] = true;
+  try { await fn(); } finally { ui.busy[name] = false; }
+}
+
+function niceStep(span) {
+  const raw = Math.max(span, 1e-9);
+  const power = Math.pow(10, Math.floor(Math.log10(raw)));
+  const unit = raw / power;
+  return (unit >= 5 ? 5 : unit >= 2 ? 2 : 1) * power;
+}
+
+function niceCeil(value) {
+  const step = niceStep(value / 2);
+  return Number((Math.ceil(value / step) * step).toPrecision(6));
+}
+
+function duration(seconds) {
+  if (!isNum(seconds)) return '–';
+  const s = Math.floor(seconds);
+  return [Math.floor(s / 3600), Math.floor(s / 60) % 60, s % 60].map(v => String(v).padStart(2, '0')).join(':');
+}
+
+// Segments of finite points: a rejected frame (null) breaks the line
+function pathData(xs, ys, sx, sy) {
+  let d = '', pen = false;
+  for (let i = 0; i < xs.length; i++) {
+    if (!isNum(xs[i]) || !isNum(ys[i])) { pen = false; continue; }
+    d += (pen ? 'L' : 'M') + sx(xs[i]).toFixed(1) + ',' + sy(ys[i]).toFixed(1);
+    pen = true;
+  }
+  return d;
+}
+
+function emptyPlot(node, width, height, message) {
+  node.replaceChildren();
+  svgText(node, width / 2, height / 2, message, { 'text-anchor': 'middle', 'font-size': 13 });
+}
+
+// --- status -------------------------------------------------------------------------------------
+
+function pill(id, text, cls) {
+  const node = $(id);
+  node.textContent = text;
+  node.className = 'pill ' + cls;
+}
+
+function cameraSummary(camera) {
+  if (!camera || !camera.intrinsics) return '';
+  const k = values => values.map(v => v.toFixed(1)).join(', ');
+  let text = 'PnP camera matrix (' + camera.source + ', in air) fx, fy, cx, cy = ' + k(camera.intrinsics);
+  if (camera.effective_intrinsics && camera.refractive_index !== undefined) {
+    text += ' · n ' + camera.refractive_index + ' × depth scale ' + camera.depth_scale
+      + ' → effective ' + k(camera.effective_intrinsics) + ', depth × ' + camera.total_depth_scale.toFixed(4);
+  }
+  return text;
+}
+
+function statusMessage(s, t) {
+  if (!s.running) {
+    if (s.restart_in !== null && s.restart_in !== undefined) {
+      return ['VIO exited (code ' + s.last_exit_code + '), restarting in ' + Math.ceil(s.restart_in) + ' s', ''];
+    }
+    return ['VIO stopped: values below are from its last run (if any). Start it with Start or Apply.', ''];
+  }
+  if (s.algorithm !== 'pnp') return ['Live telemetry needs the PnP algorithm (current: ' + s.algorithm + ')', 'info'];
+  if (!t) return ['Waiting for the VIO process to publish…', 'info'];
+  if (t.stale) return ['VIO not publishing (last update ' + fmt(t.age_s, 0) + ' s ago)', ''];
+  if (t.phase === 'opening_device') return ['Opening the camera…', 'info'];
+  if (t.phase !== 'running') return ['VIO ' + t.phase + '…', 'info'];
+  if (t.last_frame_age_s === null || t.last_frame_age_s > 3) return ['No frames from the camera for ' + fmt(t.last_frame_age_s, 0) + ' s', ''];
+  return null;
+}
+
+function renderStatus(s) {
+  const t = s.telemetry;
+  const live = !!(t && !t.stale);
+  const cam = s.camera || {};
+  if (s.running) pill('pill-vio', 'VIO running', 'g');
+  else if (s.restart_in !== null && s.restart_in !== undefined) pill('pill-vio', 'VIO restarting', 'y');
+  else pill('pill-vio', 'VIO stopped', 'r');
+  if (s.camera_connected === true) pill('pill-camera', 'camera connected', 'g');
+  else if (s.camera_connected === false) pill('pill-camera', 'camera not connected', 'r');
+  else pill('pill-camera', 'camera ?', 'dim');
+  if (s.log_only) pill('pill-output', 'LOG-ONLY (no MAVLink output)', 'y');
+  else pill('pill-output', 'sending MAVLink', 'g');
+  pill('pill-algorithm', 'algorithm: ' + s.algorithm, 'dim');
+
+  const vehicle = s.vehicle || {};
+  const armed = vehicle.armed === true ? 'ARMED' : vehicle.armed === false ? 'DISARMED' : '?';
+  const checked = vehicle.checked_at ? ' (' + fmt(s.server_time - vehicle.checked_at, 0) + ' s ago)' : '';
+  setText('header-right', 'vehicle: ' + armed + checked + ' · uptime ' + duration(s.uptime_s) + ' · CPU '
+    + fmt(s.cpu_percent, 0, ' %'));
+
+  const banner = $('log-only-banner');
+  banner.hidden = !s.log_only;
+  banner.textContent = s.log_only_forced_by_env
+    ? 'LOG-ONLY (forced by OAKD_LOG_ONLY on the container): nothing is sent to the autopilot'
+    : 'LOG-ONLY: nothing is sent to the autopilot';
+  setText('camera-status', cameraSummary(s.camera));
+
+  const message = statusMessage(s, t);
+  const box = $('status-message');
+  box.hidden = !message;
+  if (message) { box.textContent = message[0]; box.className = 'panel-message ' + message[1]; }
+  for (const id of ['status-kv', 'failures-kv']) $(id).classList.toggle('stale', !live);
+  document.querySelector('#panel-status .big').classList.toggle('stale', !live);
+
+  const last = (t && t.last_frame) || {};
+  const recent = (t && t.recent) || {};
+  setText('big-fps', fmt(recent.fps, 1));
+  setText('big-inliers', isNum(last.inliers) ? String(last.inliers) : '–');
+  setText('big-ok', fmt(recent.ok_percent, 0, '%'));
+  setText('big-ok-label', 'frames ok (' + (recent.window_s || 10) + ' s)');
+  setText('big-proc', fmt(recent.proc_ms_mean, 0));
+  setText('kv-features', isNum(last.features) ? last.features + ' / ' + last.valid_depth : '–');
+  setText('kv-matches', isNum(last.matches) ? String(last.matches) : '–');
+  setText('kv-n', isNum(cam.refractive_index) ? String(cam.refractive_index) : '–');
+  setText('kv-depth-scale', isNum(cam.depth_scale)
+    ? cam.depth_scale.toFixed(3) + ' (effective ×' + fmt(cam.total_depth_scale, 3) + ')' : '–');
+  const k = cam.effective_intrinsics;
+  setText('kv-k', k ? 'fx ' + k[0].toFixed(1) + ' fy ' + k[1].toFixed(1) + ' cx ' + k[2].toFixed(1) + ' cy ' + k[3].toFixed(1) : '–');
+  setText('kv-resets', t ? t.reference_resets + ' / ' + t.gap_frames_total : '–');
+  setText('kv-recoveries', t ? String(t.recoveries) : '–');
+  setText('kv-cpu', fmt(s.cpu_percent, 0, ' %'));
+  setText('kv-temp', isNum(s.chip_temperature_c) ? s.chip_temperature_c.toFixed(1) + ' °C' : 'n/a');
+
+  const failures = $('failures-kv');
+  failures.replaceChildren();
+  const f = t && t.failures;
+  if (f && f.frames) {
+    setText('failures-window', '(last ' + Math.round(f.window_s / 60) + ' min: ' + f.failed + ' of ' + f.frames
+      + ' frames, ' + fmt(f.failed_percent, 0, '%') + ')');
+    if (!f.by_reason.length) failures.append(Object.assign(document.createElement('span'), { textContent: 'no failures' }), document.createElement('span'));
+    for (const r of f.by_reason) {
+      const name = document.createElement('span');
+      name.textContent = r.reason;
+      const value = document.createElement('span');
+      value.textContent = r.percent_of_frames.toFixed(r.percent_of_frames < 10 ? 1 : 0) + '% · ' + r.count;
+      value.title = r.count + ' frames: ' + r.percent_of_frames.toFixed(1) + '% of all frames, '
+        + r.percent_of_failures.toFixed(1) + '% of the failures';
+      failures.append(name, value);
+    }
+  } else {
+    setText('failures-window', '(last 5 min)');
+    failures.append(Object.assign(document.createElement('span'), { textContent: 'no data' }), document.createElement('span'));
+  }
+
+  const out = (t && t.output) || {};
+  setText('out-mode', out.mode || (s.log_only ? 'log-only' : 'sending'));
+  setText('out-sent', isNum(out.messages_sent) ? String(out.messages_sent) : '–');
+  setText('out-rate', isNum(out.rate_hz) ? out.rate_hz.toFixed(1) + ' Hz' : '–');
+  setText('out-error', out.last_error || '–');
+  const button = $('btn-log-only');
+  button.textContent = 'Log-only: ' + (s.log_only ? 'ON' : 'OFF');
+  button.disabled = !!s.log_only_forced_by_env;
+  button.title = s.log_only_forced_by_env ? 'Forced on by OAKD_LOG_ONLY on the container'
+    : 'Saved in the configuration; restarts VIO';
+
+  const restarts = s.restart_count ? ' · ' + s.restart_count + ' automatic restart(s), last exit code ' + s.last_exit_code : '';
+  setText('process-status', s.running ? 'VIO Running (PID: ' + s.pid + ')' + restarts : 'VIO Stopped' + restarts);
+}
+
+async function updateStatus() {
+  await once('status', async () => {
+    try {
+      const r = await fetchJSON('/api/status');
+      if (!r.ok) throw new Error(errorText(r.data, r.status));
+      ui.status = r.data;
+      renderStatus(r.data);
+    } catch (e) {
+      pill('pill-vio', 'web server not reachable', 'r');
+    }
+  });
+}
+
+// --- history plots ------------------------------------------------------------------------------
+
+async function updateHistory() {
+  await once('history', async () => {
+    const seconds = Number($('hist-window').value);
+    const key = 'seconds=' + seconds + '&tail=' + TRAIL_S;
+    const headers = ui.historyEtag && ui.historyKey === key ? { 'If-None-Match': ui.historyEtag } : {};
+    let res;
+    try { res = await fetch('/api/history?' + key, { headers }); } catch (e) { return; }
+    if (res.status === 304) return;
+    if (!res.ok) return;
+    ui.historyEtag = res.headers.get('ETag');
+    ui.historyKey = key;
+    ui.history = await res.json();
+    renderHistory();
+  });
+}
+
+function renderHistory() {
+  const h = ui.history;
+  if (!h) return;
+  const empty = !h.points ? (h.vio_running ? 'waiting for data…' : 'no data (VIO stopped)') : null;
+  setText('traj-window', h.seconds + ' s');
+  setText('min-inliers', String(h.min_inliers));
+  renderTrajectory(h, empty);
+  renderVelocity(h);
+  renderTimeSeries(h, empty);
+  renderInliers(h, empty);
+}
+
+function renderTrajectory(h, empty) {
+  const node = $('plot-trajectory');
+  const c = h.columns;
+  const idx = c.x.map((v, i) => i).filter(i => isNum(c.x[i]) && isNum(c.y[i]));
+  if (empty || idx.length < 2) return emptyPlot(node, 300, 300, empty || 'no valid motion in this window');
+  node.replaceChildren();
+  const x0 = c.x[idx[0]], y0 = c.y[idx[0]];
+  const xs = idx.map(i => c.x[i] - x0), ys = idx.map(i => c.y[i] - y0);
+  const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
+  const span = Math.max(maxX - minX, maxY - minY, 0.2) * 1.2;
+  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2, scale = 260 / span;
+  const px = y => 150 + (y - cy) * scale, py = x => 150 - (x - cx) * scale;
+  const step = niceStep(span / 4);
+  for (let g = Math.ceil((cy - span / 2) / step) * step; g <= cy + span / 2; g += step) {
+    svg('line', { x1: px(g), x2: px(g), y1: 10, y2: 290, stroke: COLORS.grid, 'stroke-width': Math.abs(g) < 1e-9 ? 1.2 : 0.6 }, node);
+  }
+  for (let g = Math.ceil((cx - span / 2) / step) * step; g <= cx + span / 2; g += step) {
+    svg('line', { x1: 10, x2: 290, y1: py(g), y2: py(g), stroke: COLORS.grid, 'stroke-width': Math.abs(g) < 1e-9 ? 1.2 : 0.6 }, node);
+  }
+  svg('path', { d: pathData(ys, xs, px, py), fill: 'none', stroke: '#3498db', 'stroke-width': 2, 'stroke-linejoin': 'round' }, node);
+  svg('circle', { cx: px(0), cy: py(0), r: 4, fill: 'none', stroke: COLORS.text, 'stroke-width': 1.5 }, node);
+  const last = idx[idx.length - 1], yaw = c.yaw[last] || 0;
+  const tipX = px(ys[ys.length - 1]), tipY = py(xs[xs.length - 1]);
+  const fx = Math.sin(yaw), fy = -Math.cos(yaw);
+  const points = [[tipX + fx * 10, tipY + fy * 10], [tipX - fx * 5 - fy * 6, tipY - fy * 5 + fx * 6],
+                  [tipX - fx * 5 + fy * 6, tipY - fy * 5 - fx * 6]];
+  svg('polygon', { points: points.map(p => p.map(v => v.toFixed(1)).join(',')).join(' '), fill: '#dde3ea' }, node);
+  svg('line', { x1: 14, x2: 14 + step * scale, y1: 286, y2: 286, stroke: '#dde3ea', 'stroke-width': 2 }, node);
+  svgText(node, 14, 280, step < 1 ? (step * 100).toFixed(0) + ' cm' : step + ' m');
+  svgText(node, 150, 22, '+x fwd', { 'text-anchor': 'middle' });
+  svgText(node, 286, 154, '+y', { 'text-anchor': 'end' });
+}
+
+function currentVelocity(h) {
+  const tail = h.tail && h.tail.t.length ? h.tail : h.columns;
+  const n = tail.t.length;
+  if (!n) return null;
+  const lastOk = tail.ok[n - 1] === 1;
+  for (let i = n - 1; i >= 0; i--) {
+    if (isNum(tail.vx[i]) && isNum(tail.vy[i])) {
+      return { vx: tail.vx[i], vy: tail.vy[i], vz: tail.vz[i], t: tail.t[i], inliers: tail.inliers[i],
+               fresh: lastOk && tail.t[n - 1] - tail.t[i] < 1.0 && tail.t[n - 1] > -2.0, tail };
+    }
+  }
+  return { fresh: false, tail };
+}
+
+function renderVelocity(h) {
+  const dial = $('plot-dial'), bar = $('plot-vbar');
+  const scale = Number($('vel-scale').value);
+  dial.replaceChildren();
+  bar.replaceChildren();
+  const C = { x: 120, y: 112 }, R = 88;
+  svg('circle', { cx: C.x, cy: C.y, r: R, fill: 'none', stroke: COLORS.ring, 'stroke-width': 14 }, dial);
+  svg('circle', { cx: C.x, cy: C.y, r: R / 2, fill: 'none', stroke: COLORS.ring, 'stroke-dasharray': '3 4' }, dial);
+  svg('line', { x1: C.x - R + 8, x2: C.x + R - 8, y1: C.y, y2: C.y, stroke: COLORS.grid, 'stroke-width': 0.6 }, dial);
+  svg('line', { x1: C.x, x2: C.x, y1: C.y - R + 8, y2: C.y + R - 8, stroke: COLORS.grid, 'stroke-width': 0.6 }, dial);
+  svg('circle', { cx: C.x, cy: C.y - R, r: 4, fill: '#7fd1a8' }, dial);
+  svg('polygon', { points: `${C.x - 9},${C.y + R + 22} ${C.x + 9},${C.y + R + 22} ${C.x + 6},${C.y + R + 8} ${C.x - 6},${C.y + R + 8}`, fill: COLORS.vehicle }, dial);
+  svgText(dial, C.x + 6, C.y - R + 22, '+x fwd', { 'font-size': 10 });
+  svgText(dial, C.x + R - 26, C.y - 4, '+y', { 'font-size': 10 });
+  svgText(dial, 4, 246, 'ring = ' + scale + ' m/s', { 'font-size': 10 });
+  svgText(dial, C.x + 4, C.y - R / 2 + 12, (scale / 2) + '', { 'font-size': 9 });
+
+  const top = 22, bottom = 222, mid = (top + bottom) / 2, half = (bottom - top) / 2;
+  svg('rect', { x: 18, y: top, width: 34, height: bottom - top, fill: 'none', stroke: COLORS.ring, 'stroke-width': 8 }, bar);
+  svg('line', { x1: 22, x2: 48, y1: mid, y2: mid, stroke: COLORS.grid }, bar);
+  svgText(bar, 35, 14, 'vz ↓+', { 'font-size': 10, 'text-anchor': 'middle' });
+  svgText(bar, 35, 246, '±' + scale, { 'font-size': 10, 'text-anchor': 'middle' });
+
+  const v = h.points ? currentVelocity(h) : null;
+  const k = R / scale;
+  if (v && v.tail) {
+    const tail = v.tail, n = tail.t.length, tEnd = n ? tail.t[n - 1] : 0;
+    let prev = null;
+    for (let i = 0; i < n; i++) {
+      if (tail.t[i] < tEnd - TRAIL_S || !isNum(tail.vx[i]) || !isNum(tail.vy[i])) { prev = null; continue; }
+      const p = clampToRing(tail.vy[i] * k, -tail.vx[i] * k, R);
+      if (prev) {
+        const age = (tEnd - tail.t[i]) / TRAIL_S;
+        svg('line', { x1: C.x + prev[0], y1: C.y + prev[1], x2: C.x + p[0], y2: C.y + p[1], stroke: COLORS.vx,
+                      'stroke-opacity': (0.75 * (1 - age)).toFixed(2), 'stroke-width': 2, 'stroke-linecap': 'round' }, dial);
+      }
+      prev = p;
+    }
+  }
+  if (v && isNum(v.vx)) {
+    const raw = [v.vy * k, -v.vx * k];
+    const tip = clampToRing(raw[0], raw[1], R);
+    const clipped = Math.hypot(raw[0], raw[1]) > R;
+    const color = !v.fresh ? '#5d6b80' : clipped ? '#f1c40f' : COLORS.vx;
+    arrow(dial, C.x, C.y, C.x + tip[0], C.y + tip[1], color, 4);
+    if (isNum(v.vz)) {
+      const len = Math.max(-half, Math.min(half, v.vz / scale * half));
+      if (Math.abs(len) > 1) arrow(bar, 35, mid, 35, mid + len, color, 4);
+    }
+  } else {
+    svgText(dial, C.x, C.y + 30, 'no valid velocity', { 'text-anchor': 'middle', 'font-size': 11 });
+  }
+  svg('circle', { cx: C.x, cy: C.y, r: 3, fill: '#dde3ea' }, dial);
+
+  const fresh = v && isNum(v.vx) && v.fresh;
+  document.querySelector('.velocity-kv').classList.toggle('stale', !fresh);
+  setText('vel-vx', v && isNum(v.vx) ? signed(v.vx, 2, ' m/s') : '–');
+  setText('vel-vy', v && isNum(v.vy) ? signed(v.vy, 2, ' m/s') : '–');
+  setText('vel-vz', v && isNum(v.vz) ? signed(v.vz, 2, ' m/s') : '–');
+  const speed = v && isNum(v.vx) ? Math.hypot(v.vx, v.vy) : null;
+  setText('vel-speed', isNum(speed) ? speed.toFixed(2) + ' m/s (xy)' : '–');
+  if (isNum(speed) && speed >= 0.01) {
+    const deg = Math.atan2(v.vy, v.vx) * 180 / Math.PI;
+    setText('vel-dir', Math.abs(deg).toFixed(0) + '° ' + (Math.abs(deg) < 0.5 ? 'ahead' : deg > 0 ? 'stbd' : 'port'));
+  } else {
+    setText('vel-dir', '–');
+  }
+  const valid = $('vel-valid');
+  const last = ui.status && ui.status.telemetry && ui.status.telemetry.last_frame;
+  if (fresh) {
+    valid.textContent = '✔ ' + (isNum(v.inliers) ? v.inliers + ' inl.' : '');
+    valid.className = 'ok';
+  } else {
+    valid.textContent = '✖ ' + (last && last.reason ? last.reason : 'no recent valid frame');
+    valid.className = 'bad';
+  }
+}
+
+function clampToRing(x, y, R) {
+  const m = Math.hypot(x, y);
+  return m > R ? [x * R / m, y * R / m] : [x, y];
+}
+
+function arrow(parent, x1, y1, x2, y2, color, width) {
+  const dx = x2 - x1, dy = y2 - y1, len = Math.hypot(dx, dy);
+  if (len < 1) return;
+  const ux = dx / len, uy = dy / len, head = Math.min(12, len * 0.6);
+  const bx = x2 - ux * head, by = y2 - uy * head;
+  svg('line', { x1, y1, x2: bx, y2: by, stroke: color, 'stroke-width': width, 'stroke-linecap': 'round' }, parent);
+  svg('polygon', { points: `${x2},${y2} ${bx - uy * head * 0.5},${by + ux * head * 0.5} ${bx + uy * head * 0.5},${by - ux * head * 0.5}`, fill: color }, parent);
+}
+
+function timeAxis(node, W, left, right, bottom, top) {
+  const step = niceStep(W / 6);
+  for (let s = 0; s <= W + 1e-9; s += step) {
+    const x = right - s / W * (right - left);
+    svg('line', { x1: x, x2: x, y1: top, y2: bottom, stroke: COLORS.grid, 'stroke-width': 0.5 }, node);
+    svgText(node, x, bottom + 14, s ? '-' + (s >= 60 && s % 60 === 0 ? s / 60 + ' min' : s + ' s') : 'now',
+            { 'text-anchor': 'middle', 'font-size': 10 });
+  }
+}
+
+function renderTimeSeries(h, empty) {
+  const node = $('plot-vxvy');
+  const dvl = h.dvl || {};
+  const hint = $('dvl-hint');
+  if (dvl.available && dvl.source) {
+    hint.textContent = 'DVL overlay (dashed): ' + dvl.message + ' from system ' + dvl.source.system_id + ', component '
+      + dvl.source.component_id + (dvl.hint ? ' · ' + dvl.hint : '');
+  } else {
+    hint.textContent = dvl.hint || 'DVL not found';
+  }
+  if (empty) return emptyPlot(node, 600, 220, empty);
+  node.replaceChildren();
+  const left = 46, right = 592, top = 22, bottom = 196, W = h.seconds;
+  const c = h.columns;
+  const values = [...c.vx, ...c.vy, ...(dvl.available ? [...dvl.vx, ...dvl.vy] : [])].filter(isNum).map(Math.abs);
+  const ymax = niceCeil(Math.max(0.1, ...values));
+  const sx = t => right + t / W * (right - left), sy = v => (top + bottom) / 2 - v / ymax * (bottom - top) / 2;
+  timeAxis(node, W, left, right, bottom, top);
+  for (const v of [ymax, ymax / 2, 0, -ymax / 2, -ymax]) {
+    svg('line', { x1: left, x2: right, y1: sy(v), y2: sy(v), stroke: v === 0 ? COLORS.axis : COLORS.grid,
+                  'stroke-width': v === 0 ? 1.2 : 0.5, 'stroke-dasharray': v === 0 ? '' : '3 4' }, node);
+    svgText(node, left - 4, sy(v) + 4, signed(v, ymax < 0.5 ? 2 : 1), { 'text-anchor': 'end', 'font-size': 10 });
+  }
+  svg('path', { d: pathData(c.t, c.vx, sx, sy), fill: 'none', stroke: COLORS.vx, 'stroke-width': 1.8 }, node);
+  svg('path', { d: pathData(c.t, c.vy, sx, sy), fill: 'none', stroke: COLORS.vy, 'stroke-width': 1.8 }, node);
+  if (dvl.available) {
+    for (const [key, color] of [['vx', COLORS.dvlx], ['vy', COLORS.dvly]]) {
+      svg('path', { d: pathData(dvl.t, dvl[key], sx, sy), fill: 'none', stroke: color, 'stroke-width': 1.6,
+                    'stroke-dasharray': '5 3' }, node);
+    }
+  }
+  svgText(node, left + 4, 14, 'vx (fwd)', { fill: COLORS.vx });
+  svgText(node, left + 64, 14, 'vy (right)', { fill: COLORS.vy });
+  if (dvl.available) {
+    svgText(node, left + 134, 14, '- - DVL vx', { fill: COLORS.dvlx });
+    svgText(node, left + 204, 14, '- - DVL vy', { fill: COLORS.dvly });
+  }
+  svgText(node, right, 14, '±' + ymax + ' m/s, ' + W + ' s', { 'text-anchor': 'end', 'font-size': 10 });
+}
+
+function renderInliers(h, empty) {
+  const node = $('plot-inliers');
+  if (empty) return emptyPlot(node, 600, 220, empty);
+  node.replaceChildren();
+  const left = 46, right = 592, top = 22, bottom = 196, W = h.seconds, c = h.columns;
+  const ymax = niceCeil(Math.max(h.min_inliers * 2, ...c.inliers.filter(isNum)) * 1.05);
+  const sx = t => right + t / W * (right - left), sy = v => bottom - v / ymax * (bottom - top);
+  timeAxis(node, W, left, right, bottom, top);
+  for (const v of [0, ymax / 2, ymax]) {
+    svg('line', { x1: left, x2: right, y1: sy(v), y2: sy(v), stroke: COLORS.grid, 'stroke-width': 0.5 }, node);
+    svgText(node, left - 4, sy(v) + 4, String(Math.round(v)), { 'text-anchor': 'end', 'font-size': 10 });
+  }
+  let ticks = '';
+  c.ok.forEach((ok, i) => { if (ok === 0) ticks += 'M' + sx(c.t[i]).toFixed(1) + ',' + bottom + 'v-7'; });
+  if (ticks) svg('path', { d: ticks, stroke: COLORS.bad, 'stroke-width': 1, 'stroke-opacity': 0.7 }, node);
+  svg('path', { d: pathData(c.t, c.inliers, sx, sy), fill: 'none', stroke: COLORS.inl, 'stroke-width': 1.6 }, node);
+  svg('line', { x1: left, x2: right, y1: sy(h.min_inliers), y2: sy(h.min_inliers), stroke: COLORS.bad, 'stroke-dasharray': '5 4' }, node);
+  svgText(node, right, sy(h.min_inliers) - 4, 'min_inliers ' + h.min_inliers, { 'text-anchor': 'end', fill: COLORS.bad, 'font-size': 10 });
+  svgText(node, left + 4, 14, 'inliers', { fill: COLORS.inl });
+}
+
+// --- live views and depth probe -----------------------------------------------------------------
+
+function imageSize() {
+  const camera = ui.status && ui.status.camera;
+  if (camera && camera.image_size) return camera.image_size;
+  const form = $('config-form');
+  return [Number(form.elements.resolution_width.value) || 320, Number(form.elements.resolution_height.value) || 200];
+}
+
+function probeParams(names) {
+  const params = new URLSearchParams();
+  for (const name of names) {
+    const value = $('probe-' + name).value;
+    if (value !== '') params.set(name, value);
+  }
+  return params;
+}
+
+async function loadView(which) {
+  const figure = $(which === 'left' ? 'view-left' : 'view-right');
+  const caption = figure.querySelector('figcaption');
+  const img = figure.querySelector('img');
+  const stream = which === 'left' ? $('view-left-stream').value : 'depth';
+  let query = '';
+  if (stream === 'rect_left' && $('view-overlay').checked) query += '&overlay=1';
+  if ($('view-crosshair').checked && stream !== 'rgb') query += '&crosshair=1&' + probeParams(['x', 'y', 'w', 'h']);
+  if (!img.getAttribute('src')) caption.textContent = 'requesting ' + stream + '…';
+  let res;
+  try {
+    res = await fetch('/api/snapshot?stream=' + stream + query);
+  } catch (e) {
+    caption.textContent = stream + ': web server not reachable';
+    return;
+  }
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({}));
+    caption.textContent = stream + ': ' + (error.detail || ('Error ' + res.status));
+    return;
+  }
+  if (img.src) URL.revokeObjectURL(img.src);
+  img.src = URL.createObjectURL(await res.blob());
+  figure.classList.remove('empty');
+  let text = stream + ' at ' + new Date().toLocaleTimeString() + ' · seq ' + res.headers.get('X-Snapshot-Sequence');
+  if (res.headers.get('X-Overlay') === 'features') {
+    text += ' · ' + res.headers.get('X-Overlay-Inliers') + ' inliers, ' + res.headers.get('X-Overlay-Outliers')
+      + ' outliers, ' + res.headers.get('X-Overlay-Unmatched') + ' unmatched (frame ' + res.headers.get('X-Overlay-Frame-Sequence') + ')';
+  } else if (res.headers.get('X-Overlay') === 'unavailable') {
+    text += ' · no feature overlay yet';
+  }
+  caption.textContent = text;
+}
+
+async function refreshViews(manual) {
+  await once('views', async () => {
+    await loadView('left');
+    if ($('view-depth').checked) await loadView('right');
+  });
+  if (manual && !$('view-depth').checked) $('view-right').querySelector('figcaption').textContent = 'depth view off';
+}
+
+function aimAt(event) {
+  const img = event.currentTarget;
+  if (!img.clientWidth) return;
+  const [width, height] = imageSize();
+  $('probe-x').value = Math.round(event.offsetX / img.clientWidth * width);
+  $('probe-y').value = Math.round(event.offsetY / img.clientHeight * height);
+  $('view-crosshair').checked = true;
+  refreshViews(true);
+}
+
+async function showProbeResult(url, busy, summarize) {
+  const summary = $('probe-summary');
+  const result = $('probe-result');
+  summary.textContent = busy;
+  let r;
+  try { r = await fetchJSON(url); } catch (e) { summary.textContent = 'web server not reachable'; return; }
+  if (!r.ok) {
+    summary.textContent = errorText(r.data, r.status);
+    result.textContent = '';
+    return;
+  }
+  summary.textContent = summarize(r.data);
+  result.textContent = JSON.stringify(r.data, null, 2);
+}
+
+function depthProbe() {
+  return showProbeResult('/api/depth_probe?' + probeParams(['x', 'y', 'w', 'h', 'frames']),
+    'Probing depth...', data => '→ ' + data.summary + (data.clamped && data.clamped.length ? ' (clamped: ' + data.clamped.join(', ') + ')' : ''));
+}
+
+function focalCheck() {
+  return showProbeResult('/api/focal_check', 'Taking rect_left, rect_right and depth snapshots (keep the camera still)...',
+    data => (data.ok ? 'OK: ' : 'CHECK: ') + data.message);
+}
+
+// --- process control ----------------------------------------------------------------------------
+
+async function post(url, body, okMessage) {
+  const r = await fetchJSON(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                   body: body === undefined ? undefined : JSON.stringify(body) });
+  if (r.ok) showToast(okMessage, 'success');
+  else showToast(errorText(r.data, r.status), 'error');
+  setTimeout(updateStatus, 800);
+  return r;
+}
+
+function startVIO() { return post('/api/start', undefined, 'VIO started'); }
+function stopVIO() { return post('/api/stop', undefined, 'VIO stopped'); }
+
+function resetVIO() {
+  if (!confirm('Restart the VIO process? The PnP reference, trajectory and plots start over.')) return;
+  return post('/api/start', undefined, 'VIO restarting');
+}
+
+async function toggleLogOnly() {
+  const on = !(ui.status && ui.status.log_only);
+  const what = on ? 'Turn LOG-ONLY on (stop sending MAVLink)' : 'Turn LOG-ONLY off (start sending VISION_POSITION_DELTA to the autopilot)';
+  if (!confirm(what + '? This is saved and restarts VIO.')) return;
+  const r = await post('/api/log_only', { log_only: on }, 'Log-only ' + (on ? 'on' : 'off') + ', VIO restarting');
+  if (r.ok) {
+    const box = $('config-form').elements.log_only;
+    box.checked = on;
+    ui.initial.log_only = on;
+    markChanged();
+  }
+}
+
+// --- settings editor ----------------------------------------------------------------------------
+
+const VEHICLE_IP = /^[A-Za-z0-9.\-:\[\]]+$/;
+
+function fieldInput(name) {
+  return $('config-form').elements[name];
+}
+
+function rawValue(f) {
+  const input = fieldInput(f.name);
+  if (!input) return undefined;
+  return f.type === 'bool' ? input.checked : input.value;
+}
+
+function numbers(text) {
+  return String(text).trim().split(/[\s,]+/).filter(Boolean).map(Number);
+}
+
+// [value to post, error message or '']
+function parseField(f) {
+  const raw = rawValue(f);
+  if (raw === undefined) return [undefined, ''];
+  if (f.type === 'bool') return [raw, ''];
+  const text = String(raw).trim();
+  const range = () => (f.min !== null && f.max !== null) ? ' between ' + f.min + ' and ' + f.max : '';
+  if (f.type === 'int' || f.type === 'float') {
+    if (text === '') return f.nullable ? [null, ''] : [null, 'required'];
+    const value = Number(text);
+    if (!isFinite(value)) return [null, 'must be a number'];
+    if (f.type === 'int' && !Number.isInteger(value)) return [null, 'must be a whole number'];
+    if ((f.min !== null && value < f.min) || (f.max !== null && value > f.max)) return [value, 'must be' + range()];
+    return [value, ''];
+  }
+  if (f.type === 'choice') {
+    const numeric = f.choices.every(c => typeof c === 'number');
+    const value = numeric ? Number(text) : text;
+    return f.choices.some(c => String(c) === text) ? [value, ''] : [value, 'must be one of ' + f.choices.join(', ')];
+  }
+  if (f.type === 'lever_arm') {
+    const values = numbers(text);
+    if (values.length !== 3 || !values.every(isFinite)) return [text, 'needs three numbers x,y,z'];
+    if (!values.every(v => Math.abs(v) <= f.max)) return [text, 'values must be within ±' + f.max + ' m'];
+    return [text, ''];
+  }
+  if (f.type === 'intrinsics') {
+    if (text === '') return [null, ''];
+    const values = numbers(text);
+    if (values.length !== 4 || !values.every(v => isFinite(v) && v > 0)) return [text, 'needs four positive numbers fx,fy,cx,cy'];
+    return [text, ''];
+  }
+  if (f.name === 'vehicle_ip' && !VEHICLE_IP.test(text)) return [text, 'must be a host name or IP address, optionally with :port'];
+  return [text, ''];
+}
+
+function showFieldError(name, message) {
+  const container = document.querySelector('.field[data-field="' + name + '"]');
+  if (!container) return;
+  container.querySelector('.error').textContent = message;
+  const input = fieldInput(name);
+  if (input) input.classList.toggle('invalid', !!message);
+}
+
+function crossFieldErrors(config) {
+  const errors = {};
+  if (isNum(config.stereo_depth_min_mm) && isNum(config.stereo_depth_max_mm)
+      && config.stereo_depth_min_mm >= config.stereo_depth_max_mm) {
+    errors.stereo_depth_max_mm = 'must be above Min depth (' + config.stereo_depth_min_mm + ')';
+  }
+  return errors;
+}
+
+function collectConfig() {
+  const config = {}, errors = {};
+  for (const f of ui.schema.fields) {
+    const [value, error] = parseField(f);
+    if (value === undefined) continue;
+    config[f.name] = value;
+    if (error) errors[f.name] = error;
+  }
+  Object.assign(errors, crossFieldErrors(config));
+  return { config, errors };
+}
+
+function showErrors(errors) {
+  for (const f of ui.schema.fields) showFieldError(f.name, errors[f.name] || '');
+  const box = $('settings-errors');
+  const names = Object.keys(errors);
+  box.hidden = !names.length;
+  box.textContent = names.map(name => (ui.fields[name] ? ui.fields[name].label : name) + ' (' + name + '): ' + errors[name]).join(' · ');
+  for (const name of names) {
+    const container = document.querySelector('.field[data-field="' + name + '"]');
+    if (container) container.closest('details').open = true;
+  }
+}
+
+function formValue(f, value) {
+  if (f.type === 'bool') return !!value;
+  if (value === null || value === undefined) return '';
+  if (f.type === 'lever_arm') return Array.isArray(value) ? value.join(',') : String(value);
+  return String(value);
+}
+
+function setField(f, value) {
+  const input = fieldInput(f.name);
+  if (!input) return;
+  if (f.type === 'bool') input.checked = !!value;
+  else input.value = formValue(f, value);
+}
+
+function currentKey(f) {
+  const raw = rawValue(f);
+  return f.type === 'bool' ? !!raw : String(raw).trim();
+}
+
+function markChanged() {
+  let changed = 0;
+  for (const f of ui.schema.fields) {
+    const input = fieldInput(f.name);
+    if (!input) continue;
+    const differs = currentKey(f) !== ui.initial[f.name];
+    input.classList.toggle('changed', differs);
+    changed += differs;
+  }
+  setText('settings-state', changed ? changed + ' unsaved change(s) — Apply to save and restart VIO' : 'validated client + server');
+}
+
+async function initSettings() {
+  const r = await fetchJSON('/api/config/schema');
+  if (!r.ok) { setText('settings-state', 'schema unavailable: ' + errorText(r.data, r.status)); return; }
+  ui.schema = r.data;
+  for (const f of ui.schema.fields) {
+    ui.fields[f.name] = f;
+    const container = document.querySelector('.field[data-field="' + f.name + '"]');
+    const input = fieldInput(f.name);
+    if (!container || !input) continue;
+    const reset = document.createElement('button');
+    reset.type = 'button';
+    reset.className = 'reset-one';
+    reset.textContent = '↺';
+    reset.title = 'Reset to default (' + (formValue(f, f.default) === '' ? 'empty' : formValue(f, f.default)) + ')';
+    reset.addEventListener('click', () => { setField(f, f.default); showFieldError(f.name, parseField(f)[1]); markChanged(); });
+    container.appendChild(reset);
+    const error = document.createElement('div');
+    error.className = 'error';
+    container.appendChild(error);
+    if (input.type === 'number') {
+      if (f.min !== null) input.min = f.min;
+      if (f.max !== null) input.max = f.max;
+      if (f.nullable) input.placeholder = 'auto';
+    }
+    input.addEventListener('input', () => { showFieldError(f.name, parseField(f)[1]); markChanged(); });
+    input.addEventListener('change', () => { showFieldError(f.name, parseField(f)[1]); markChanged(); });
+    ui.initial[f.name] = currentKey(f);
+  }
+  markChanged();
+}
+
+async function applySettings(event) {
+  event.preventDefault();
+  if (!ui.schema) return showToast('Settings schema not loaded', 'error');
+  const { config, errors } = collectConfig();
+  showErrors(errors);
+  if (Object.keys(errors).length) return showToast('Fix the highlighted settings first', 'error');
+  const r = await fetchJSON('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                             body: JSON.stringify(config) });
+  if (r.ok) {
+    showToast('Configuration saved! Restarting VIO...', 'success');
+    for (const f of ui.schema.fields) if (fieldInput(f.name)) ui.initial[f.name] = currentKey(f);
+    markChanged();
+    setTimeout(updateStatus, 1500);
+    return;
+  }
+  if (r.status === 422 && r.data && Array.isArray(r.data.detail)) {
+    const serverErrors = {};
+    for (const d of r.data.detail) serverErrors[d.field || (d.loc || []).slice(-1)[0]] = d.msg;
+    showErrors(serverErrors);
+  }
+  showToast('Not saved: ' + errorText(r.data, r.status), 'error');
+}
+
+async function resetDefaults() {
+  if (!confirm('Reset every setting to its default and restart VIO?')) return;
+  const r = await fetchJSON('/api/reset', { method: 'POST' });
+  if (r.ok) {
+    showToast('Reset to defaults. Reloading...', 'success');
+    setTimeout(() => location.reload(), 1000);
+  } else {
+    showToast(errorText(r.data, r.status), 'error');
+  }
+}
+
+// --- ArduPilot parameters -----------------------------------------------------------------------
+
+function paramText(value) {
+  if (!isNum(value)) return '–';
+  return Number.isInteger(value) ? String(value) : String(Number(value.toPrecision(6)));
+}
+
+function armedText(heartbeat) {
+  if (!heartbeat) return 'vehicle: ?';
+  if (heartbeat.armed === true) return 'vehicle ARMED ✖ (writing refused)';
+  if (heartbeat.armed === false) return 'vehicle disarmed ✔';
+  return 'vehicle armed state unknown (' + (heartbeat.detail || 'no HEARTBEAT') + ')';
+}
+
+async function readAutopilot() {
+  const body = $('ap-table').tBodies[0];
+  body.innerHTML = '<tr><td colspan="6" class="muted">Reading parameters (PARAM_REQUEST_READ only)…</td></tr>';
+  let r;
+  try { r = await fetchJSON('/api/autopilot/params'); } catch (e) { r = { ok: false, status: 0, data: null }; }
+  if (!r.ok) {
+    body.innerHTML = '';
+    const message = $('ap-message');
+    message.hidden = false;
+    message.textContent = 'Could not read: ' + errorText(r.data, r.status);
+    return;
+  }
+  ui.autopilot = r.data;
+  renderAutopilot();
+}
+
+function renderAutopilot() {
+  const data = ui.autopilot;
+  const heartbeat = data.heartbeat || {};
+  const message = $('ap-message');
+  const unreadable = data.params.every(p => p.status === 'unreadable');
+  message.hidden = !unreadable;
+  message.textContent = unreadable ? 'No parameters read: ' + (heartbeat.detail || 'no reply') + ' (' + data.mavlink2rest + ')' : '';
+  const armed = $('ap-armed');
+  armed.textContent = armedText(heartbeat);
+  armed.className = heartbeat.armed === false ? 'ok' : 'bad';
+  const body = $('ap-table').tBodies[0];
+  body.replaceChildren();
+  for (const p of data.params) {
+    const row = body.insertRow();
+    row.className = p.status;
+    row.dataset.name = p.name;
+    const select = document.createElement('input');
+    select.type = 'checkbox';
+    select.className = 'ap-select';
+    select.checked = p.status === 'differs' && !p.keep_current;
+    select.disabled = p.status === 'unreadable';
+    select.title = 'Include in "Write selected"';
+    row.insertCell().appendChild(select);
+    row.insertCell().innerHTML = '<b></b>';
+    row.cells[1].firstChild.textContent = p.name;
+    row.insertCell().textContent = paramText(p.current);
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'ap-value';
+    input.value = isNum(p.suggested) ? paramText(p.suggested) : '';
+    input.title = 'Allowed: ' + (p.allowed ? p.allowed.join(', ') : p.min + ' to ' + p.max) + (p.integer ? ' (whole number)' : '');
+    input.addEventListener('input', () => {
+      input.classList.toggle('invalid', !!paramError(p, input.value));
+      select.checked = !select.disabled && !paramError(p, input.value) && !sameParam(p.current, Number(input.value));
+    });
+    row.insertCell().appendChild(input);
+    const status = row.insertCell();
+    status.className = 'status';
+    status.textContent = p.status + (p.keep_current ? ' (keep)' : '');
+    const why = row.insertCell();
+    why.className = 'why';
+    why.appendChild(Object.assign(document.createElement('div'), { className: 'why-text', textContent: p.rationale,
+                                                                   title: p.rationale }));
+    if (p.needs_reboot) why.appendChild(Object.assign(document.createElement('span'), { className: 'tag reboot', textContent: 'reboot' }));
+    if (p.error) why.appendChild(Object.assign(document.createElement('div'), { className: 'bad', textContent: p.error }));
+  }
+}
+
+function sameParam(a, b) {
+  return isNum(a) && isNum(b) && Math.abs(a - b) <= Math.max(1e-6, 1e-6 * Math.abs(b));
+}
+
+function paramError(p, text) {
+  if (String(text).trim() === '') return 'empty';
+  const value = Number(text);
+  if (!isFinite(value)) return 'not a number';
+  if (value < p.min || value > p.max) return 'outside ' + p.min + '..' + p.max;
+  if (p.integer && !Number.isInteger(value)) return 'must be a whole number';
+  if (p.allowed && !p.allowed.includes(value)) return 'must be one of ' + p.allowed.join(', ');
+  return '';
+}
+
+function openWriteDialog() {
+  if (!ui.autopilot) return showToast('Read the parameters first', 'error');
+  const changes = [], problems = [];
+  for (const row of $('ap-table').tBodies[0].rows) {
+    if (!row.querySelector('.ap-select').checked) continue;
+    const p = ui.autopilot.params.find(q => q.name === row.dataset.name);
+    const text = row.querySelector('.ap-value').value;
+    const error = paramError(p, text);
+    if (error) { problems.push(p.name + ': ' + error); continue; }
+    const value = Number(text);
+    if (sameParam(p.current, value)) continue;
+    changes.push({ name: p.name, old: p.current, new: value, reboot: p.needs_reboot });
+  }
+  if (problems.length) return showToast('Invalid: ' + problems.join('; '), 'error');
+  if (!changes.length) return showToast('Nothing selected differs from the vehicle', 'error');
+  ui.pendingWrite = changes;
+  const heartbeat = ui.autopilot.heartbeat || {};
+  setText('ap-dialog-title', 'Write ' + changes.length + ' parameter(s) to the autopilot?');
+  const armed = $('ap-dialog-armed');
+  armed.textContent = (heartbeat.armed === false ? 'Vehicle DISARMED at the last read. '
+    : heartbeat.armed === true ? 'Vehicle ARMED at the last read: the server will refuse. '
+    : 'Armed state unknown at the last read: the server will refuse unless a fresh HEARTBEAT says disarmed. ')
+    + 'The server checks a new HEARTBEAT again right before writing and refuses (HTTP 409) if armed or unknown.';
+  const list = $('ap-dialog-list');
+  list.replaceChildren();
+  for (const c of changes) {
+    const item = document.createElement('li');
+    item.innerHTML = '<b></b> <span></span>';
+    item.firstChild.textContent = c.name;
+    item.lastChild.textContent = paramText(c.old) + ' → ' + paramText(c.new) + (c.reboot ? '  (needs an autopilot reboot)' : '');
+    list.appendChild(item);
+  }
+  $('ap-dialog-result').replaceChildren();
+  const confirmButton = $('ap-dialog-confirm');
+  confirmButton.hidden = false;
+  confirmButton.disabled = false;
+  confirmButton.textContent = 'Write ' + changes.length + ' parameter(s)';
+  setText('ap-dialog-cancel', 'Cancel');
+  $('ap-dialog').showModal();
+}
+
+function closeWriteDialog() {
+  $('ap-dialog').close();
+}
+
+function resultList(title, items, format) {
+  const block = document.createElement('div');
+  const heading = document.createElement('h2');
+  heading.textContent = title;
+  heading.className = 'sub';
+  const list = document.createElement('ul');
+  list.className = 'changes';
+  for (const item of items) list.appendChild(Object.assign(document.createElement('li'), { textContent: format(item) }));
+  block.append(heading, list);
+  return block;
+}
+
+async function confirmWrite() {
+  const changes = ui.pendingWrite;
+  if (!changes) return;
+  const confirmButton = $('ap-dialog-confirm');
+  confirmButton.disabled = true;
+  confirmButton.textContent = 'Writing…';
+  const params = {};
+  for (const c of changes) params[c.name] = c.new;
+  let r;
+  try {
+    r = await fetchJSON('/api/autopilot/params', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                                    body: JSON.stringify({ confirm: true, params }) });
+  } catch (e) {
+    r = { ok: false, status: 0, data: { detail: 'web server not reachable' } };
+  }
+  ui.pendingWrite = null;
+  confirmButton.hidden = true;
+  setText('ap-dialog-cancel', 'Close');
+  const result = $('ap-dialog-result');
+  result.replaceChildren();
+  if (!r.ok) {
+    const box = document.createElement('div');
+    box.className = 'panel-message';
+    box.textContent = (r.status === 409 ? 'Refused, nothing written (HTTP 409): ' : 'Not written (HTTP ' + r.status + '): ')
+      + errorText(r.data, r.status);
+    result.appendChild(box);
+    if (r.data && r.data.heartbeat) { ui.autopilot.heartbeat = r.data.heartbeat; renderAutopilotArmed(); }
+    return;
+  }
+  const data = r.data;
+  if (data.changed.length) result.appendChild(resultList('Changed (read back)', data.changed,
+    c => c.name + ': ' + paramText(c.old) + ' → ' + paramText(c.new) + ', read back ' + paramText(c.readback)));
+  if (data.unchanged.length) result.appendChild(resultList('Already set', data.unchanged, c => c.name + ' = ' + paramText(c.value)));
+  if (data.failed.length) result.appendChild(resultList('Failed', data.failed, c => c.name + ': ' + c.error));
+  if (data.reboot_required.length) {
+    result.appendChild(Object.assign(document.createElement('div'), { className: 'warn',
+      textContent: 'Reboot the autopilot for ' + data.reboot_required.join(', ') + ' to take effect (not done automatically).' }));
+  }
+  for (const c of data.changed) {
+    const p = ui.autopilot.params.find(q => q.name === c.name);
+    if (p) { p.current = c.readback; p.status = sameParam(p.current, p.suggested) ? 'ok' : 'differs'; }
+  }
+  ui.autopilot.heartbeat = data.heartbeat;
+  renderAutopilot();
+  showToast(data.changed.length + ' parameter(s) changed' + (data.failed.length ? ', ' + data.failed.length + ' failed' : ''),
+            data.failed.length ? 'error' : 'success');
+}
+
+function renderAutopilotArmed() {
+  const armed = $('ap-armed');
+  armed.textContent = armedText(ui.autopilot.heartbeat);
+  armed.className = ui.autopilot.heartbeat.armed === false ? 'ok' : 'bad';
+}
+
+// --- data logs ----------------------------------------------------------------------------------
+
+async function updateLogs() {
+  let logs;
+  try { logs = await (await fetch('/api/logs')).json(); } catch (e) { return; }
+  const list = $('logs');
+  list.replaceChildren();
+  if (!logs.length) {
+    const item = document.createElement('li');
+    item.textContent = 'No logs yet';
+    list.appendChild(item);
+  }
+  for (const log of logs) {
+    const item = document.createElement('li');
+    const link = document.createElement('a');
+    link.href = '/api/logs/' + encodeURIComponent(log.name);
+    link.textContent = log.name;
+    link.download = log.name;
+    item.appendChild(link);
+    item.append(' · ' + (log.size / 1024).toFixed(1) + ' KiB · ' + new Date(log.mtime * 1000).toLocaleString());
+    list.appendChild(item);
+  }
+}
+
+// --- start --------------------------------------------------------------------------------------
+
+function tick() {
+  if (!visible()) return;
+  updateStatus();
+  updateHistory();
+}
+
+$('config-form').addEventListener('submit', applySettings);
+$('view-left').querySelector('img').addEventListener('click', aimAt);
+$('vel-scale').addEventListener('change', () => ui.history && renderVelocity(ui.history));
+$('hist-window').addEventListener('change', () => { ui.historyEtag = null; updateHistory(); });
+$('view-left-stream').addEventListener('change', () => refreshViews(true));
+document.addEventListener('visibilitychange', () => { if (visible()) tick(); });
+for (const figure of document.querySelectorAll('.view')) figure.classList.add('empty');
+
+initSettings();
+tick();
+setInterval(tick, 1000);
+setInterval(() => { if ($('view-auto').checked && visible()) refreshViews(false); }, 1000);
+updateLogs();
+setInterval(() => visible() && updateLogs(), 15000);
+readAutopilot();
