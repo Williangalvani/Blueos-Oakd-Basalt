@@ -219,6 +219,10 @@ The page is backed by a small HTTP API:
 | GET | `/api/depth_probe?x=&y=&w=&h=&frames=` | PnP only: depth statistics in an ROI over the next frames. See [Depth probe](#depth-probe-pnp). |
 | GET | `/api/focal_check` | PnP only: checks fx against the focal length the device depth implies. See [Focal check](#focal-check-pnp). |
 | GET | `/api/stream/depth` | PnP only: live depth as `multipart/x-mixed-replace` MJPEG (grayscale, encoded on the camera); 503 when PnP is stopped or the stream is off. `?frames=N` ends after N frames. See [Live depth stream](#live-depth-stream). |
+| GET | `/api/stream/features` | Server-sent events for the [Cockpit widget](#cockpit-widget): `features` (the PnP tracker's features, about 5 per second) and `status` (once a second; `problem` says why there is nothing to show). Always 200. `?events=N` ends after N events. |
+| GET | `/api/features` | PnP only: the latest `features` object once; 404 until the VIO process has published one (it starts on request) |
+| GET | `/widget/depth` | The [Cockpit widget](#cockpit-widget) page |
+| GET | `/register_service`, `/cockpit_extras.json` | BlueOS service metadata and the Cockpit extras that declare the widget |
 
 ### Snapshots (PnP)
 
@@ -324,6 +328,27 @@ The depth is made 8-bit and JPEG-encoded on the camera; the Pi only forwards the
 - With nobody watching, the Script blocks on its control input, so it converts, encodes and sends nothing. Each `/api/stream/depth` client touches `depth_stream.lease` in the telemetry directory every second. The VIO loop checks the lease every 0.5 s and sends the Script on/off. The stream stops about 4 s after the last client leaves.
 - The VIO loop takes the newest encoded frame (`tryGetAll`, non-blocking) and writes it atomically to `/dev/shm/oakd-vio-telemetry/depth_stream.jpg`. `main.py` polls the file every 50 ms and sends each new one as a multipart part. The centre depth goes to `depth_stream.json` once a second while streaming.
 - Cost: on the Pi, one file write per streamed frame and a 5×5 median once a second. A sparse depth frame from the stage-1 snapshots (`snap4`, 13 % valid) is 26 KB as a quality-70 JPEG (OpenCV's encoder), so about 130 KB/s (1 Mbit/s) on the link at 5 fps. The Script logs its own conversion time on the camera every 150 frames ("depth stream: … ms"); it has not been measured on hardware yet. If it competes with the VIO, lower *Depth stream fps* or turn *Live depth stream* off, which removes the Script and encoder from the pipeline.
+
+### Cockpit widget
+
+The extension offers a Cockpit widget, *OAK-D VIO depth*. It shows the live depth with the PnP tracker's features drawn on top and a status line. In Cockpit, open Edit mode; the widget is in the widget list, offered by BlueOS. It is also the page `widget/depth`, linked from the *Live depth* panel.
+
+- **Discovery:** `GET /register_service` declares `works_in_relative_paths` (BlueOS proxies the extension at `/extensionv2/oakdvio/`) and `extras.cockpit: /cockpit_extras.json`. Cockpit fetches the extras JSON through that proxy. The widget entry uses `useExtensionPathAsBaseUrl`, so the iframe is `http://<vehicle>/extensionv2/oakdvio/widget/depth` and works from a remote Cockpit too. Every URL in both pages is relative, so they work on port 8095 and behind the proxy.
+- **Depth:** the same MJPEG as the *Live depth* panel, colorized on a canvas, with the depth-range legend.
+- **Features**, coloured by state:
+  - *inlier* (green): matched to the reference and kept by RANSAC;
+  - *rejected* (magenta square): matched and rejected by RANSAC;
+  - *matched* (white ring): matched, no RANSAC result;
+  - *depth* (light blue): not in the reference, with valid depth;
+  - *no depth* (grey ring).
+  Positions are on the depth image's pixel grid (scaled when the depth is decimated).
+- **Status line:** VIO fps, ok %, inliers, features with depth, VISION_POSITION_DELTA messages sent, the log-only flag and the last failure's reason. When there is nothing to show, it says why (VIO stopped, not PnP, depth stream off).
+- **Cost on the Pi:** nothing is decoded or drawn on the Pi.
+  - While a widget is connected, `/api/stream/features` touches `features.lease`. The VIO loop then writes `features.json` (about 4 KB for 300 features, one line of JSON) at most every 0.2 s. That took 0.22 ms per write on the x86 desktop.
+  - The web server forwards the bytes unchanged and adds one small status event per second.
+  - With nobody watching, the VIO loop does one clock comparison per frame and one stat every 0.5 s.
+  - The page closes both streams while it is hidden.
+- **Options** (in the iframe URL): `?colorize=0` shows gray depth, `?features=0` hides the features, `?status=0` hides the status line.
 
 ### DVL overlay
 
@@ -466,6 +491,10 @@ The image is built in two stages so that the slow part only runs once:
 |---|---|
 | `app/main.py` | Web UI and API; starts and stops the VIO process |
 | `app/static/ui.html`, `ui.css`, `ui.js` | The web page (inlined into one page by `main.py`) |
+| `app/static/widget.html`, `widget.css`, `widget.js`, `widget_icon.svg` | The Cockpit widget page (inlined the same way) and its icon |
+| `app/cockpit_widget.py` | BlueOS service metadata, the Cockpit extras JSON and the widget's status line |
+| `app/depth_stream.py` | Live depth stream: on-camera 8-bit conversion Script, VIO-side service, `main.py` reader |
+| `app/feature_stream.py` | Tracked features for the widget: VIO-side lease-gated publisher, `main.py` reader and SSE framing |
 | `app/config_schema.py` | Every setting: schema, defaults, server-side validation, form fields |
 | `app/vio_telemetry.py` | PnP live status and plot history: ring buffer and publisher (VIO process), readers (`main.py`) |
 | `app/dvl_source.py` | Optional DVL velocity overlay read from mavlink2rest |

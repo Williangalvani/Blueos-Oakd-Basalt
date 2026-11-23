@@ -120,7 +120,8 @@ td.why { color: #8fa3bd; font-size: 12px; max-width: 360px; }
 
 .logs { list-style: none; padding: 0; margin: 0; columns: 2 420px; }
 .logs li { padding: 4px 0; border-bottom: 1px solid #222a36; font-size: 13px; break-inside: avoid; }
-.logs a { color: #6fa8d6; }
+.logs a, .widget-link a { color: #6fa8d6; }
+.widget-link { margin-top: 8px; }
 
 dialog { background: #1b2230; color: #dde3ea; border: 1px solid #34425a; border-radius: 8px; max-width: 640px; width: 92vw; }
 dialog::backdrop { background: rgba(0, 0, 0, .6); }

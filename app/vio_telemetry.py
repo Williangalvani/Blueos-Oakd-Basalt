@@ -192,6 +192,7 @@ class Telemetry:
         self.frames_total = self.ok_total = self.sent_total = 0
         self.reference_resets = self.bridged = self.gap_frames_total = self.recoveries = 0
         self.last = None
+        self.last_failure = None  # (t, reason) of the newest rejected frame
         self.chip_temperature = None
         self.chip_temperature_at = None
         self.extra = {}
@@ -229,6 +230,8 @@ class Telemetry:
                 if gap_frames:
                     self.bridged += 1
                     self.gap_frames_total += gap_frames
+            else:
+                self.last_failure = (t, reason)
             if reference_reset:
                 self.reference_resets += 1
             if sent:
@@ -292,7 +295,7 @@ class Telemetry:
             recent = self.history.ordered(last=int(RECENT_WINDOW_S * MAX_HISTORY_FPS) + 1)
             failures = self.failures.summary()
             sent_recent = [t for t in self.sent_times if now - t <= SEND_RATE_WINDOW_S]
-            last = self.last
+            last, last_failure = self.last, self.last_failure
             counters = {"frames_total": self.frames_total, "ok_total": self.ok_total, "sent_total": self.sent_total,
                         "reference_resets": self.reference_resets, "bridged_frames": self.bridged,
                         "gap_frames_total": self.gap_frames_total, "recoveries": self.recoveries}
@@ -315,6 +318,8 @@ class Telemetry:
                 "unix_time": last[0], "ok": bool(last[1]), "reason": last[2] or None, "features": int(last[3]),
                 "valid_depth": int(last[4]), "matches": int(last[5]), "inliers": int(last[6]),
                 "proc_ms": _finite(last[7]), "gap_frames": int(last[8])},
+            "last_failure": None if last_failure is None else {
+                "unix_time": last_failure[0], "reason": last_failure[1] or "unknown"},
             "recent": recent_summary(recent, now),
             "failures": failures,
             "output": {"mode": self.mode, "messages_sent": counters["sent_total"],

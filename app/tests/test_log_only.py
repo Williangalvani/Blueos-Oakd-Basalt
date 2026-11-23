@@ -288,4 +288,4 @@ def test_config_api_accepts_log_only(client, monkeypatch):
     page = http.get("/").text
     assert "Log only: do not send anything to the autopilot" in page
     assert 'name="log_only" checked' in page
-    assert "/api/logs/" in page
+    assert "'api/logs/'" in page

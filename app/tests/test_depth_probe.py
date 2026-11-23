@@ -394,5 +394,5 @@ def test_api_depth_probe_times_out_without_vio(client, monkeypatch, tmp_path):
 def test_index_page_has_the_depth_probe(client):
     main, http = client
     page = http.get("/").text
-    assert "/api/depth_probe?" in page and "crosshair" in page and "/api/focal_check" in page
+    assert "'api/depth_probe?" in page and "crosshair" in page and "'api/focal_check'" in page
     assert 'id="probe-frames"' in page

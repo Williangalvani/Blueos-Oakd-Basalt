@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import depth_probe  # noqa: E402
 import depth_stream  # noqa: E402
+import feature_stream  # noqa: E402
 import snapshots  # noqa: E402
 import vio_log  # noqa: E402
 from pnp_odometry import Intrinsics, PnPOdometry, PnPParams, back_project, camera_to_body_matrix  # noqa: E402
@@ -534,6 +535,42 @@ def test_run_without_a_watcher_keeps_the_stream_off(pnp_vio, monkeypatch, tmp_pa
                         depth_stream_info={"fps_target": 5.0})
     assert [m.setSequenceNum.call_args[0][0] for m in control.sent] == [0]
     assert not (tmp_path / "snapshots" / "telemetry" / depth_stream.FRAME_FILE).exists()
+
+
+def test_run_publishes_the_tracked_features_while_leased(pnp_vio, monkeypatch, tmp_path):
+    telemetry_dir = tmp_path / "snapshots" / "telemetry"
+    feature_stream.touch_lease(telemetry_dir)
+    written = []
+    real = pnp_vio.feature_stream.FeatureStreamService
+
+    class EveryFrame(real):
+        def __init__(self, directory, image_size, **kwargs):
+            super().__init__(directory, image_size, **{**kwargs, "interval": 0.0})
+
+        def tick(self, *args, **kwargs):
+            if super().tick(*args, **kwargs):
+                written.append(json.loads((self.directory / feature_stream.FEATURES_FILE).read_text()))
+
+    monkeypatch.setattr(pnp_vio.feature_stream, "FeatureStreamService", EveryFrame)
+    lines, _ = run_fake(pnp_vio, monkeypatch, tmp_path, scenario(n_good=4, n_lost=3, n_back=0), [])
+    steps = [line for line in lines if line["type"] == "step"]
+    assert len(written) == len(steps)
+    for step, features in zip(steps, written):
+        counts = features["counts"]
+        assert features["frame_size"] == [WIDTH, HEIGHT] and features["image_size"] == [WIDTH, HEIGHT]
+        assert sum(counts.values()) == step["features"] == len(features["points"])
+        assert counts["inlier"] == step["inliers"] and features["ok"] == (step["status"] == "ok")
+        assert features["reason"] == step["reason"]
+    # The first frame has no reference: valid depth only; good frames: every feature an inlier
+    assert written[0]["counts"]["depth"] == len(GOOD_UV) and written[1]["counts"]["inlier"] == len(GOOD_UV)
+    # The lost frames' features are in the strip without depth (x < 40), drawn where the tracker saw them
+    lost = written[4]
+    assert lost["counts"]["no_depth"] == 8 and all(p[0] < 40 for p in lost["points"])
+
+
+def test_run_without_a_feature_watcher_writes_nothing(pnp_vio, monkeypatch, tmp_path):
+    run_fake(pnp_vio, monkeypatch, tmp_path, scenario(n_good=4, n_lost=0, n_back=0), [])
+    assert not (tmp_path / "snapshots" / "telemetry" / feature_stream.FEATURES_FILE).exists()
 
 
 def test_run_with_the_depth_stream_disabled_logs_it(pnp_vio, monkeypatch, tmp_path):

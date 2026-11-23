@@ -19,10 +19,12 @@ from typing import Literal, Optional
 import uvicorn
 
 import autopilot_params
+import cockpit_widget
 import config_schema
 import depth_probe
 import depth_stream
 import dvl_source
+import feature_stream
 import snapshots
 import system_stats
 import vio_log
@@ -54,6 +56,8 @@ CAMERA_FRAME_TIMEOUT_S = 3.0
 # /api/stream/depth: how often each client checks for a new frame and renews the stream lease
 DEPTH_STREAM_POLL_S = 0.05
 DEPTH_STREAM_LEASE_REFRESH_S = 1.0
+# /api/stream/features: the same polling and lease renewal, plus the widget's status line this often
+WIDGET_STATUS_INTERVAL_S = 1.0
 # ArduPilot panel: per-request timeout and attempts of each parameter read, and how long a write waits
 # for a new HEARTBEAT to prove the vehicle is live and disarmed
 AUTOPILOT_TIMEOUT = 1.0
@@ -266,6 +270,35 @@ def render_page(config: dict) -> str:
 def index():
     """Serve the web UI"""
     return HTMLResponse(content=render_page(load_config()), headers={"Cache-Control": "no-cache"})
+
+
+def render_widget() -> str:
+    """widget.html with widget.css and widget.js inlined, like render_page."""
+    html = (STATIC_DIR / "widget.html").read_text()
+    html = html.replace("<!--WIDGET_CSS-->", f"<style>\n{(STATIC_DIR / 'widget.css').read_text()}\n</style>")
+    return html.replace("<!--WIDGET_JS-->", f"<script>\n{(STATIC_DIR / 'widget.js').read_text()}\n</script>")
+
+
+@app.get(cockpit_widget.WIDGET_PATH, response_class=HTMLResponse)
+def widget_depth():
+    """
+    The Cockpit widget page: live depth with the tracked features drawn on top and a status line. Always
+    200 (Cockpit only mounts the iframe after a successful GET); the page shows why it has no data.
+    """
+    return HTMLResponse(content=render_widget(), headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/register_service")
+def register_service():
+    """BlueOS service metadata: name, relative-path support and the Cockpit extras (cockpit_widget.py)"""
+    return JSONResponse(cockpit_widget.service_metadata(), headers={"Access-Control-Allow-Origin": "*"})
+
+
+@app.get(cockpit_widget.EXTRAS_PATH)
+def get_cockpit_extras():
+    """Cockpit extras: the external widget Cockpit offers in its widget list"""
+    return JSONResponse(cockpit_widget.cockpit_extras(),
+                        headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache"})
 
 
 @app.get("/api/config")
@@ -544,6 +577,71 @@ async def stream_depth(frames: int = Query(0, ge=0, le=100000)):
     return StreamingResponse(depth_stream_parts(directory, frames),
                              media_type=f"multipart/x-mixed-replace; boundary={depth_stream.BOUNDARY}",
                              headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+
+def widget_status_now() -> dict:
+    now = time.time()
+    process = supervisor.status()
+    config = load_config()
+    telemetry = live_telemetry(process, now)
+    return cockpit_widget.widget_status(cockpit_widget.widget_problem(config, process, telemetry), telemetry,
+                                        depth_stream_status(config, process, now),
+                                        log_only_status(config)["log_only"], now)
+
+
+async def feature_events(directory: Path, limit: int):
+    """Server-sent events: each new features.json as it is, and the widget status once a second."""
+    reader = feature_stream.LatestFile(directory / feature_stream.FEATURES_FILE)
+    sent, leased, status_at = 0, float("-inf"), float("-inf")
+    yield b"retry: 3000\n\n"
+    while True:
+        now = time.monotonic()
+        if now - leased >= DEPTH_STREAM_LEASE_REFRESH_S:
+            feature_stream.touch_lease(directory)
+            vio_telemetry.touch_lease(vio_telemetry.STATUS_LEASE, directory)
+            leased = now
+        events = []
+        if now - status_at >= WIDGET_STATUS_INTERVAL_S:
+            status_at = now
+            events.append(feature_stream.sse_event("status", json.dumps(widget_status_now())))
+        data = reader.read_new()
+        if data is not None:
+            events.append(feature_stream.sse_event("features", data))
+        for event in events:
+            yield event
+            sent += 1
+            if limit and sent >= limit:
+                return
+        await asyncio.sleep(DEPTH_STREAM_POLL_S)
+
+
+@app.get("/api/stream/features")
+async def stream_features(events: int = Query(0, ge=0, le=100000)):
+    """
+    text/event-stream for the Cockpit widget. "features": the PnP tracker's features of a recent frame,
+    about 5 per second, as the VIO process wrote them (feature_stream.py: points [u, v, state] on the
+    depth stream's pixel grid). "status": the widget's status line (cockpit_widget.widget_status) once a
+    second, with "problem" set while there is nothing to show. Always 200, so EventSource keeps
+    reconnecting. The VIO process only publishes features while a client is connected. events > 0 stops
+    after that many events.
+    """
+    directory = telemetry_dir()
+    feature_stream.touch_lease(directory)
+    return StreamingResponse(feature_events(directory, events), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+
+@app.get("/api/features")
+def get_features():
+    """The latest tracked features (as in /api/stream/features); 404 until the VIO process has published them."""
+    require_pnp_running("the tracked features")
+    directory = telemetry_dir()
+    feature_stream.touch_lease(directory)
+    data = feature_stream.LatestFile(directory / feature_stream.FEATURES_FILE).read_new()
+    if data is None:
+        raise HTTPException(status_code=404, detail="no tracked features published yet: the VIO process publishes "
+                                                    "them while asked, from its next frame on; retry")
+    return Response(content=data, media_type="application/json", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/depth_probe")

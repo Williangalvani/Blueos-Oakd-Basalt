@@ -1,0 +1,31 @@
+html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
+body { color: #e8eef6; font: 11px/1.35 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+       font-variant-numeric: tabular-nums; user-select: none; }
+#view { position: absolute; inset: 0; overflow: hidden; }
+#depth-img { position: absolute; top: 0; left: 0; visibility: hidden; }
+#depth-canvas, #overlay { position: absolute; inset: 0; width: 100%; height: 100%; }
+#depth-canvas { object-fit: contain; image-rendering: auto; }
+#depth-canvas.off { visibility: hidden; }
+#overlay { pointer-events: none; }
+#message { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); max-width: 90%;
+           padding: 4px 10px; border-radius: 4px; background: rgba(0, 0, 0, 0.6); color: #c9d6e6;
+           text-align: center; font-size: 12px; }
+#message:empty { display: none; }
+.bar { position: absolute; left: 0; right: 0; display: flex; flex-wrap: wrap; gap: 2px 10px; align-items: center;
+       padding: 2px 6px; background: rgba(0, 0, 0, 0.55); white-space: nowrap; overflow: hidden; }
+.bar.top { top: 0; }
+.bar.bottom { bottom: 0; justify-content: space-between; }
+.bar .warn { color: #ffcc4d; font-weight: 600; }
+.bar .bad { color: #ff7a7a; }
+.bar .good { color: #7dff9b; }
+.muted { color: #8fa0b5; }
+.legend { display: inline-flex; align-items: center; gap: 4px; }
+#depth-legend { width: 96px; height: 8px; border-radius: 2px; image-rendering: pixelated; }
+.keys { display: inline-flex; flex-wrap: wrap; gap: 0 8px; }
+.key { display: inline-flex; align-items: center; gap: 3px; }
+.dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; box-shadow: 0 0 0 1px #000; }
+.dot.inlier { background: #00ff66; }
+.dot.outlier { background: #ff2bd6; border-radius: 1px; }
+.dot.matched { background: transparent; box-shadow: inset 0 0 0 2px #fff, 0 0 0 1px #000; }
+.dot.depth { background: #8fd3ff; width: 5px; height: 5px; }
+.dot.no_depth { background: transparent; box-shadow: inset 0 0 0 1px #9aa4b0; width: 5px; height: 5px; }

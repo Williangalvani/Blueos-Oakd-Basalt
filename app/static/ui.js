@@ -232,7 +232,7 @@ function renderStatus(s) {
 async function updateStatus() {
   await once('status', async () => {
     try {
-      const r = await fetchJSON('/api/status');
+      const r = await fetchJSON('api/status');
       if (!r.ok) throw new Error(errorText(r.data, r.status));
       ui.status = r.data;
       renderStatus(r.data);
@@ -250,7 +250,7 @@ async function updateHistory() {
     const key = 'seconds=' + seconds + '&tail=' + TRAIL_S;
     const headers = ui.historyEtag && ui.historyKey === key ? { 'If-None-Match': ui.historyEtag } : {};
     let res;
-    try { res = await fetch('/api/history?' + key, { headers }); } catch (e) { return; }
+    try { res = await fetch('api/history?' + key, { headers }); } catch (e) { return; }
     if (res.status === 304) return;
     if (!res.ok) return;
     ui.historyEtag = res.headers.get('ETag');
@@ -511,7 +511,7 @@ async function loadView(which) {
   if (!img.getAttribute('src')) caption.textContent = 'requesting ' + stream + '…';
   let res;
   try {
-    res = await fetch('/api/snapshot?stream=' + stream + query);
+    res = await fetch('api/snapshot?stream=' + stream + query);
   } catch (e) {
     caption.textContent = stream + ': web server not reachable';
     return;
@@ -568,12 +568,12 @@ async function showProbeResult(url, busy, summarize) {
 }
 
 function depthProbe() {
-  return showProbeResult('/api/depth_probe?' + probeParams(['x', 'y', 'w', 'h', 'frames']),
+  return showProbeResult('api/depth_probe?' + probeParams(['x', 'y', 'w', 'h', 'frames']),
     'Probing depth...', data => '→ ' + data.summary + (data.clamped && data.clamped.length ? ' (clamped: ' + data.clamped.join(', ') + ')' : ''));
 }
 
 function focalCheck() {
-  return showProbeResult('/api/focal_check', 'Taking rect_left, rect_right and depth snapshots (keep the camera still)...',
+  return showProbeResult('api/focal_check', 'Taking rect_left, rect_right and depth snapshots (keep the camera still)...',
     data => (data.ok ? 'OK: ' : 'CHECK: ') + data.message);
 }
 
@@ -623,7 +623,7 @@ function drawDepthLegend(scale) {
   setText('legend-far', m(scale.max) + ' far');
 }
 
-const STREAM_URL = '/api/stream/depth';
+const STREAM_URL = 'api/stream/depth';
 const BLANK_GIF = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
 const depthStreaming = () => ($('depth-stream-img').getAttribute('src') || '').startsWith(STREAM_URL);
 
@@ -749,19 +749,19 @@ async function post(url, body, okMessage) {
   return r;
 }
 
-function startVIO() { return post('/api/start', undefined, 'VIO started'); }
-function stopVIO() { return post('/api/stop', undefined, 'VIO stopped'); }
+function startVIO() { return post('api/start', undefined, 'VIO started'); }
+function stopVIO() { return post('api/stop', undefined, 'VIO stopped'); }
 
 function resetVIO() {
   if (!confirm('Restart the VIO process? The PnP reference, trajectory and plots start over.')) return;
-  return post('/api/start', undefined, 'VIO restarting');
+  return post('api/start', undefined, 'VIO restarting');
 }
 
 async function toggleLogOnly() {
   const on = !(ui.status && ui.status.log_only);
   const what = on ? 'Turn LOG-ONLY on (stop sending MAVLink)' : 'Turn LOG-ONLY off (start sending VISION_POSITION_DELTA to the autopilot)';
   if (!confirm(what + '? This is saved and restarts VIO.')) return;
-  const r = await post('/api/log_only', { log_only: on }, 'Log-only ' + (on ? 'on' : 'off') + ', VIO restarting');
+  const r = await post('api/log_only', { log_only: on }, 'Log-only ' + (on ? 'on' : 'off') + ', VIO restarting');
   if (r.ok) {
     const box = $('config-form').elements.log_only;
     box.checked = on;
@@ -897,7 +897,7 @@ function markChanged() {
 }
 
 async function initSettings() {
-  const r = await fetchJSON('/api/config/schema');
+  const r = await fetchJSON('api/config/schema');
   if (!r.ok) { setText('settings-state', 'schema unavailable: ' + errorText(r.data, r.status)); return; }
   ui.schema = r.data;
   for (const f of ui.schema.fields) {
@@ -933,7 +933,7 @@ async function applySettings(event) {
   const { config, errors } = collectConfig();
   showErrors(errors);
   if (Object.keys(errors).length) return showToast('Fix the highlighted settings first', 'error');
-  const r = await fetchJSON('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+  const r = await fetchJSON('api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' },
                                              body: JSON.stringify(config) });
   if (r.ok) {
     showToast('Configuration saved! Restarting VIO...', 'success');
@@ -952,7 +952,7 @@ async function applySettings(event) {
 
 async function resetDefaults() {
   if (!confirm('Reset every setting to its default and restart VIO?')) return;
-  const r = await fetchJSON('/api/reset', { method: 'POST' });
+  const r = await fetchJSON('api/reset', { method: 'POST' });
   if (r.ok) {
     showToast('Reset to defaults. Reloading...', 'success');
     setTimeout(() => location.reload(), 1000);
@@ -979,7 +979,7 @@ async function readAutopilot() {
   const body = $('ap-table').tBodies[0];
   body.innerHTML = '<tr><td colspan="6" class="muted">Reading parameters (PARAM_REQUEST_READ only)…</td></tr>';
   let r;
-  try { r = await fetchJSON('/api/autopilot/params'); } catch (e) { r = { ok: false, status: 0, data: null }; }
+  try { r = await fetchJSON('api/autopilot/params'); } catch (e) { r = { ok: false, status: 0, data: null }; }
   if (!r.ok) {
     body.innerHTML = '';
     const message = $('ap-message');
@@ -1120,7 +1120,7 @@ async function confirmWrite() {
   for (const c of changes) params[c.name] = c.new;
   let r;
   try {
-    r = await fetchJSON('/api/autopilot/params', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    r = await fetchJSON('api/autopilot/params', { method: 'POST', headers: { 'Content-Type': 'application/json' },
                                                     body: JSON.stringify({ confirm: true, params }) });
   } catch (e) {
     r = { ok: false, status: 0, data: { detail: 'web server not reachable' } };
@@ -1168,7 +1168,7 @@ function renderAutopilotArmed() {
 
 async function updateLogs() {
   let logs;
-  try { logs = await (await fetch('/api/logs')).json(); } catch (e) { return; }
+  try { logs = await (await fetch('api/logs')).json(); } catch (e) { return; }
   const list = $('logs');
   list.replaceChildren();
   if (!logs.length) {
@@ -1179,7 +1179,7 @@ async function updateLogs() {
   for (const log of logs) {
     const item = document.createElement('li');
     const link = document.createElement('a');
-    link.href = '/api/logs/' + encodeURIComponent(log.name);
+    link.href = 'api/logs/' + encodeURIComponent(log.name);
     link.textContent = log.name;
     link.download = log.name;
     item.appendChild(link);

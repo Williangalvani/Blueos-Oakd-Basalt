@@ -156,7 +156,7 @@ def test_web_form_renders_stereo_settings(client):
     assert 'name="stereo_spatial_filter" checked>' in page
     assert 'name="stereo_p2" value="120"' in page
     assert 'name="snapshots" checked' in page
-    assert "{stereo_fields}" not in page and "/api/snapshot?stream=" in page
+    assert "{stereo_fields}" not in page and "'api/snapshot?stream='" in page
 
 
 def test_apply_sets_preset_first_then_overrides():

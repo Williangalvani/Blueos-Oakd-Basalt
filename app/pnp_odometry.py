@@ -171,6 +171,8 @@ class FrameResult:
     reference_reset: bool = False
     # Indices into this frame's ids/uv of the features matched to the reference (pose.inlier_index refers to these)
     matched_index: Optional[np.ndarray] = None
+    # Per feature of this frame's ids/uv: True where the depth lookup gave a valid depth
+    depth_valid: Optional[np.ndarray] = None
     extra: Dict = field(default_factory=dict)
 
 
@@ -442,7 +444,7 @@ class PnPOdometry:
         current = dict(zip(ids[valid].tolist(), points))
 
         frame = FrameResult(pose=PoseResult(ok=False, reason="no_reference"), timestamp=timestamp,
-                            features=len(ids), valid_depth=int(valid.sum()))
+                            features=len(ids), valid_depth=int(valid.sum()), depth_valid=valid)
         if self.prev_points is None:
             self._set_reference(current, timestamp)
             return frame

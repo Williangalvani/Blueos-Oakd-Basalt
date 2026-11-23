@@ -25,6 +25,7 @@ from loguru import logger
 
 import depth_probe
 import depth_stream
+import feature_stream
 import snapshots
 import vio_telemetry
 from autopilot_params import AutopilotParams
@@ -711,6 +712,8 @@ def run_pipeline(args, log_only, data_log, stereo_settings, telemetry):
                 logger.info(f"Depth stream: on demand, {handles.depth_stream_info['fps_target']:.1f} fps MJPEG "
                             f"quality {args.depth_stream_quality}, encoded on the camera")
             data_log.event("depth_stream", enabled=stream is not None, **handles.depth_stream_info)
+            features_out = feature_stream.FeatureStreamService(telemetry.directory, (args.width, args.height),
+                                                               log=logger.info)
 
             p.start()
             telemetry.set_phase("running")
@@ -777,6 +780,8 @@ def run_pipeline(args, log_only, data_log, stereo_settings, telemetry):
                 frame = odometry.process(ids, uv, depth, t, R_prior)
                 pose = frame.pose
                 overlay.update(ids, uv, frame, depth_msg.getSequenceNum())
+                features_out.tick(uv, depth.shape, depth_msg.getSequenceNum(), pose.ok, pose.reason,
+                                  frame.depth_valid, frame.matched_index, pose.inlier_index)
 
                 angle_delta = position_delta = time_delta_us = yaw_delta = None
                 sent = False

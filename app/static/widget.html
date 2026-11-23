@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OAK-D VIO depth</title>
+<!--WIDGET_CSS-->
+</head>
+<body>
+<div id="view">
+  <img id="depth-img" alt="">
+  <canvas id="depth-canvas" class="off" width="640" height="400"></canvas>
+  <canvas id="overlay"></canvas>
+  <div id="message">connecting…</div>
+  <div class="bar top" id="status-line"><span class="muted">waiting for status…</span></div>
+  <div class="bar bottom">
+    <span class="legend" id="depth-legend-box">
+      <span id="legend-near">near</span>
+      <canvas id="depth-legend" width="128" height="1"></canvas>
+      <span id="legend-far">far</span>
+      <span class="muted" id="depth-rate"></span>
+    </span>
+    <span class="keys" id="feature-keys">
+      <span class="key"><i class="dot inlier"></i><span id="n-inlier">–</span> inlier</span>
+      <span class="key"><i class="dot outlier"></i><span id="n-outlier">–</span> rejected</span>
+      <span class="key"><i class="dot matched"></i><span id="n-matched">–</span> matched</span>
+      <span class="key"><i class="dot depth"></i><span id="n-depth">–</span> depth</span>
+      <span class="key"><i class="dot no_depth"></i><span id="n-no_depth">–</span> no depth</span>
+    </span>
+  </div>
+</div>
+<!--WIDGET_JS-->
+</body>
+</html>
