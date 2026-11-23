@@ -180,6 +180,11 @@ python /app/pnp_vio.py --fps 15 --width 640 --height 400 --num-features 300 --ve
     - Whether mavlink2rest lists the Water Linked DVL's `VISION_POSITION_DELTA`, and which system/component it comes from.
     - That the feature overlay's inliers line up with the image (the overlay is from the last processed frame, one or two frames older than the snapshot).
     - A guarded parameter write on a disarmed vehicle on the bench, and the 409 while armed.
+17. **Live depth stream (task 11):**
+    - The pipeline starts with the stream Script and the MJPEG `VideoEncoder` fed by a GRAY8 `ImgFrame` built in the Script (the setters, `getData()` as bytes/memoryview, and `bytes.translate` on the device Python are untested on hardware).
+    - The Script's "depth stream: N frames, convert + send mean X ms" log: the conversion must stay well under the stream interval (200 ms at 5 fps), and the 10 s VIO fps summary and `proc_ms` should not change with the page's stream on.
+    - `NumFramesPool(6)` on the stereo outputs: no pool stalls.
+    - JPEG size and the browser's colours against `/api/depth_probe` at a few distances.
 
 ## Rectified intrinsics
 

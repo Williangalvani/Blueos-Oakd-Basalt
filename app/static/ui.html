@@ -95,6 +95,41 @@
   <details><summary class="muted">probe / focal check result (JSON)</summary><pre id="probe-result" class="probe"></pre></details>
 </section>
 
+<section class="c12" id="panel-depth-stream">
+  <h2>Live depth <span class="muted">(stereo depth encoded on the camera as MJPEG, only sent while streaming)</span></h2>
+  <div class="controls">
+    <label class="inline"><input type="checkbox" id="depth-stream-on"> stream</label>
+    <label class="inline"><input type="checkbox" id="depth-stream-color" checked> colorize (near red, far blue, no depth black)</label>
+    <span class="muted" id="depth-stream-state">off</span>
+  </div>
+  <div class="depth-stream">
+    <figure class="view empty" id="depth-stream-view">
+      <div class="depth-frame">
+        <img id="depth-stream-img" alt="">
+        <canvas id="depth-stream-canvas" width="640" height="400" hidden></canvas>
+        <div class="depth-crosshair" id="depth-stream-crosshair" hidden></div>
+      </div>
+      <figcaption class="muted" id="depth-stream-caption">Tick "stream" to watch the depth the VIO uses, live.</figcaption>
+    </figure>
+    <div class="depth-side">
+      <canvas id="depth-legend" class="depth-legend" width="256" height="1"></canvas>
+      <div class="legend-labels"><span id="legend-near">–</span><span id="legend-mid">–</span><span id="legend-far">–</span></div>
+      <div class="kv">
+        <span>centre depth (raw, 5×5 median)</span><span id="ds-center">–</span>
+        <span>centre pixel (raw)</span><span id="ds-center-pixel">–</span>
+        <span>range (stereo min..max)</span><span id="ds-range">–</span>
+        <span>quantization</span><span id="ds-quant">–</span>
+        <span>rate</span><span id="ds-rate">–</span>
+        <span>bandwidth</span><span id="ds-kbps">–</span>
+        <span>JPEG</span><span id="ds-jpeg">–</span>
+      </div>
+      <div class="hint">The camera turns the VIO's depth (after the stereo filters and the min/max depth thresholds) into
+        8-bit gray, linear in depth, and encodes it; the Pi only forwards the JPEGs. Raw = device depth in air, before
+        the refractive index and depth scale. The crosshair marks the centre pixel.</div>
+    </div>
+  </div>
+</section>
+
 <section class="c4" id="panel-trajectory">
   <h2>Trajectory <span class="muted">(integrated VIO, x–y m, <span id="traj-window">60 s</span>; integrated, drifts)</span></h2>
   <svg id="plot-trajectory" class="plot" viewBox="0 0 300 300" role="img" aria-label="integrated trajectory"></svg>

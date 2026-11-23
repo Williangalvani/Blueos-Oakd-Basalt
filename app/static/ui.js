@@ -226,6 +226,7 @@ function renderStatus(s) {
 
   const restarts = s.restart_count ? ' · ' + s.restart_count + ' automatic restart(s), last exit code ' + s.last_exit_code : '';
   setText('process-status', s.running ? 'VIO Running (PID: ' + s.pid + ')' + restarts : 'VIO Stopped' + restarts);
+  renderDepthStream(s);
 }
 
 async function updateStatus() {
@@ -574,6 +575,167 @@ function depthProbe() {
 function focalCheck() {
   return showProbeResult('/api/focal_check', 'Taking rect_left, rect_right and depth snapshots (keep the camera still)...',
     data => (data.ok ? 'OK: ' : 'CHECK: ') + data.message);
+}
+
+// --- live depth stream --------------------------------------------------------------------------
+// The camera encodes gray, linear in depth (depth_stream.py): 0 = no depth, gray_far (max_mm) ..
+// gray_near (min_mm). The page colorizes it with a 256-entry lookup table on a canvas.
+
+const depthStream = { on: false, retry: null, timer: null, lut: null, lutKey: '', scale: null };
+
+function jet(x) {
+  const c = v => Math.round(255 * Math.max(0, Math.min(1, v)));
+  return [c(1.5 - Math.abs(4 * x - 3)), c(1.5 - Math.abs(4 * x - 2)), c(1.5 - Math.abs(4 * x - 1))];
+}
+
+function streamScale(d) {
+  const range = (d && d.depth_range_mm) || [300, 4000];
+  return { min: range[0], max: range[1], far: (d && d.gray_far) || 16, near: (d && d.gray_near) || 255,
+           invalid: (d && d.gray_invalid_below) || 8 };
+}
+
+function depthLut(scale) {
+  const key = [scale.far, scale.near, scale.invalid].join(',');
+  if (depthStream.lutKey === key) return depthStream.lut;
+  const lut = new Uint8ClampedArray(256 * 3);
+  for (let g = 0; g < 256; g++) {
+    const rgb = g < scale.invalid ? [0, 0, 0] : jet((g - scale.far) / (scale.near - scale.far));
+    lut.set(rgb, g * 3);
+  }
+  depthStream.lut = lut;
+  depthStream.lutKey = key;
+  return lut;
+}
+
+function drawDepthLegend(scale) {
+  const canvas = $('depth-legend');
+  const ctx = canvas.getContext('2d');
+  const lut = depthLut(scale), image = ctx.createImageData(canvas.width, 1);
+  for (let i = 0; i < canvas.width; i++) {
+    const g = Math.round(scale.near - (scale.near - scale.far) * i / (canvas.width - 1));
+    image.data.set(lut.subarray(g * 3, g * 3 + 3), i * 4);
+    image.data[i * 4 + 3] = 255;
+  }
+  ctx.putImageData(image, 0, 0);
+  const m = mm => (mm / 1000).toFixed(2) + ' m';
+  setText('legend-near', m(scale.min) + ' near');
+  setText('legend-mid', m((scale.min + scale.max) / 2));
+  setText('legend-far', m(scale.max) + ' far');
+}
+
+const STREAM_URL = '/api/stream/depth';
+const BLANK_GIF = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+const depthStreaming = () => ($('depth-stream-img').getAttribute('src') || '').startsWith(STREAM_URL);
+
+function colorizeDepth() {
+  const img = $('depth-stream-img'), canvas = $('depth-stream-canvas');
+  const color = $('depth-stream-color').checked && depthStreaming();
+  canvas.hidden = !color;
+  img.classList.toggle('under', color);
+  if (!color || !img.naturalWidth) return;
+  if (canvas.width !== img.naturalWidth || canvas.height !== img.naturalHeight) {
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+  }
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  try { ctx.drawImage(img, 0, 0); } catch (e) { return; }
+  const frame = ctx.getImageData(0, 0, canvas.width, canvas.height), px = frame.data;
+  const lut = depthLut(depthStream.scale || streamScale(null));
+  for (let i = 0; i < px.length; i += 4) {
+    const k = px[i] * 3;
+    px[i] = lut[k]; px[i + 1] = lut[k + 1]; px[i + 2] = lut[k + 2];
+  }
+  ctx.putImageData(frame, 0, 0);
+}
+
+function startDepthStream() {
+  clearTimeout(depthStream.retry);
+  depthStream.retry = null;
+  if (!depthStream.on || !visible() || depthStreaming()) return;
+  $('depth-stream-img').src = STREAM_URL + '?t=' + Date.now();
+  setText('depth-stream-state', 'connecting…');
+  const fps = (ui.status && ui.status.depth_stream && ui.status.depth_stream.fps_target) || 5;
+  clearInterval(depthStream.timer);
+  depthStream.timer = setInterval(colorizeDepth, Math.max(60, Math.min(500, 500 / fps)));
+}
+
+function stopDepthStream(state) {
+  clearTimeout(depthStream.retry);
+  depthStream.retry = null;
+  clearInterval(depthStream.timer);
+  const img = $('depth-stream-img');
+  if (img.getAttribute('src')) {
+    img.src = BLANK_GIF;  // aborts the multipart request, so the camera stops streaming
+    img.removeAttribute('src');
+  }
+  colorizeDepth();
+  $('depth-stream-crosshair').hidden = true;
+  $('depth-stream-view').classList.add('empty');
+  setText('depth-stream-state', state || 'off');
+}
+
+function depthStreamError() {
+  if (!depthStream.on || !depthStreaming()) return;
+  stopDepthStream('not available, retrying…');
+  depthStream.retry = setTimeout(startDepthStream, 3000);
+}
+
+function toggleDepthStream() {
+  depthStream.on = $('depth-stream-on').checked;
+  if (depthStream.on) startDepthStream();
+  else stopDepthStream();
+  if (ui.status) renderDepthStream(ui.status);
+}
+
+function depthStreamProblem(s) {
+  const d = s.depth_stream || {};
+  if (s.algorithm !== 'pnp') return 'the depth stream needs the PnP algorithm (current: ' + s.algorithm + ')';
+  if (!d.enabled) return 'the depth stream is off in the settings (Live depth stream)';
+  if (!s.running) return 'VIO stopped';
+  if (d.stale) return 'waiting for the VIO process…';
+  return null;
+}
+
+function renderDepthStream(s) {
+  const d = s.depth_stream || {};
+  depthStream.scale = streamScale(d);
+  const legendKey = JSON.stringify(depthStream.scale);
+  if (renderDepthStream.legend !== legendKey) {
+    drawDepthLegend(depthStream.scale);
+    renderDepthStream.legend = legendKey;
+  }
+  const camera = s.camera || {};
+  const scaleText = isNum(camera.total_depth_scale) && camera.total_depth_scale !== 1
+    ? mm => ' (×' + camera.total_depth_scale.toFixed(3) + ' = ' + (mm * camera.total_depth_scale / 1000).toFixed(3) + ' m in PnP)'
+    : () => '';
+  const c = d.streaming ? d.center : null;
+  setText('ds-center', c && isNum(c.median_mm)
+    ? (c.median_mm / 1000).toFixed(3) + ' m' + scaleText(c.median_mm) + ' · ' + c.valid + '/' + c.pixels + ' valid'
+    : c ? 'no depth' : '–');
+  setText('ds-center-pixel', c ? (c.pixel_mm ? (c.pixel_mm / 1000).toFixed(3) + ' m' : 'no depth') + ' at (' + c.x + ', ' + c.y + ')' : '–');
+  setText('ds-range', (depthStream.scale.min / 1000).toFixed(2) + ' – ' + (depthStream.scale.max / 1000).toFixed(2) + ' m');
+  setText('ds-quant', isNum(d.quantization_mm) ? d.quantization_mm + ' mm steps, ' + (d.gray_near - d.gray_far + 1) + ' gray levels' : '–');
+  setText('ds-rate', d.streaming && isNum(d.fps) ? d.fps.toFixed(1) + ' fps (target ' + fmt(d.fps_target, 1) + ')'
+    : isNum(d.fps_target) ? 'target ' + d.fps_target.toFixed(1) + ' fps' : '–');
+  setText('ds-kbps', d.streaming && isNum(d.kbps) ? d.kbps.toFixed(0) + ' kbit/s' : '–');
+  const last = d.last_frame;
+  setText('ds-jpeg', (isNum(d.quality) ? 'quality ' + d.quality : '–') + (d.streaming && last ? ' · ' + (last.bytes / 1024).toFixed(1) + ' KiB/frame' : ''));
+
+  const problem = depthStreamProblem(s);
+  const img = $('depth-stream-img');
+  if (!depthStream.on) {
+    setText('depth-stream-caption', problem ? 'Live depth unavailable: ' + problem : 'Tick "stream" to watch the depth the VIO uses, live.');
+    return;
+  }
+  const showing = depthStreaming() && img.naturalWidth > 1;
+  $('depth-stream-view').classList.toggle('empty', !showing);
+  $('depth-stream-crosshair').hidden = !showing;
+  if (problem) setText('depth-stream-caption', problem);
+  else if (!d.streaming) setText('depth-stream-caption', 'asking the camera to stream…');
+  else setText('depth-stream-caption', 'depth ' + (d.image_size ? d.image_size.join('×') : '') + ' · '
+    + (d.frames_total || 0) + ' frames this run · ' + new Date().toLocaleTimeString());
+  if (showing) setText('depth-stream-state', 'streaming');
+  if (!problem && !depthStreaming() && !depthStream.retry) startDepthStream();
 }
 
 // --- process control ----------------------------------------------------------------------------
@@ -1039,7 +1201,13 @@ $('view-left').querySelector('img').addEventListener('click', aimAt);
 $('vel-scale').addEventListener('change', () => ui.history && renderVelocity(ui.history));
 $('hist-window').addEventListener('change', () => { ui.historyEtag = null; updateHistory(); });
 $('view-left-stream').addEventListener('change', () => refreshViews(true));
-document.addEventListener('visibilitychange', () => { if (visible()) tick(); });
+document.addEventListener('visibilitychange', () => {
+  if (visible()) { tick(); startDepthStream(); } else if (depthStream.on) stopDepthStream('paused (tab hidden)');
+});
+$('depth-stream-on').addEventListener('change', toggleDepthStream);
+$('depth-stream-color').addEventListener('change', colorizeDepth);
+$('depth-stream-img').addEventListener('error', depthStreamError);
+$('depth-stream-img').addEventListener('load', () => { if (depthStreaming()) colorizeDepth(); });
 for (const figure of document.querySelectorAll('.view')) figure.classList.add('empty');
 
 initSettings();

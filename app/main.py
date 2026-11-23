@@ -3,6 +3,7 @@
 BlueOS OAK-D VIO Extension - Web Configuration Interface
 """
 
+import asyncio
 import os
 import json
 import math
@@ -12,7 +13,7 @@ import time
 from html import escape
 from pathlib import Path
 from fastapi import Body, FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from typing import Literal, Optional
 import uvicorn
@@ -20,6 +21,7 @@ import uvicorn
 import autopilot_params
 import config_schema
 import depth_probe
+import depth_stream
 import dvl_source
 import snapshots
 import system_stats
@@ -49,6 +51,9 @@ MAX_TAIL_ROWS = 300
 TELEMETRY_STALE_S = 3.0
 # No processed frame for this long while running: the camera counts as disconnected
 CAMERA_FRAME_TIMEOUT_S = 3.0
+# /api/stream/depth: how often each client checks for a new frame and renews the stream lease
+DEPTH_STREAM_POLL_S = 0.05
+DEPTH_STREAM_LEASE_REFRESH_S = 1.0
 # ArduPilot panel: per-request timeout and attempts of each parameter read, and how long a write waits
 # for a new HEARTBEAT to prove the vehicle is live and disarmed
 AUTOPILOT_TIMEOUT = 1.0
@@ -103,6 +108,19 @@ def saved_lever_arm(config: dict) -> tuple:
         return DEFAULT_LEVER_ARM_M
 
 
+def saved_number(config: dict, key: str):
+    """A saved number forced into its schema range (the default if it isn't a number), like clamp_refractive_index."""
+    field = config_schema.FIELDS_BY_KEY[key]
+    kind = int if field.kind == "int" else float
+    try:
+        value = kind(config.get(key, field.default))
+    except (TypeError, ValueError, OverflowError):
+        return field.default
+    if not math.isfinite(value):
+        return field.default
+    return min(max(value, kind(field.minimum)), kind(field.maximum))
+
+
 def telemetry_dir() -> Path:
     return Path(TELEMETRY_DIR) if TELEMETRY_DIR is not None else vio_telemetry.DEFAULT_DIR
 
@@ -126,6 +144,9 @@ def build_vio_command(config: dict) -> list:
             "--recovery-frames", str(int(config["tracking_recovery_frames"])),
             "--max-reference-age", str(float(config["max_reference_age"])),
             "--snapshots" if config["snapshots"] else "--no-snapshots",
+            "--depth-stream" if config.get("depth_stream", True) else "--no-depth-stream",
+            "--depth-stream-fps", str(saved_number(config, "depth_stream_fps")),
+            "--depth-stream-quality", str(saved_number(config, "depth_stream_quality")),
             "--telemetry-dir", str(telemetry_dir()),
             "--intrinsics-from", config.get("intrinsics_from") or "rectified",
             "--depth-scale", str(float(config.get("depth_scale", 1.0))),
@@ -305,6 +326,16 @@ def camera_connected(telemetry: Optional[dict]):
     return age is not None and age <= CAMERA_FRAME_TIMEOUT_S
 
 
+def depth_stream_status(config: dict, process_status: dict, now: float) -> dict:
+    """The depth stream setting and what the VIO process last published about it (stale if from another run)."""
+    meta = depth_stream.read_meta(telemetry_dir()) or {}
+    stale = bool(not meta or not process_status.get("running")
+                 or (process_status.get("pid") is not None and meta.get("pid") != process_status.get("pid")))
+    return {**meta, "enabled": bool(config.get("depth_stream", True)) and config.get("algorithm") == "pnp",
+            "streaming": bool(meta.get("streaming")) and not stale, "stale": stale,
+            "age_s": now - float(meta["unix_time"]) if meta.get("unix_time") else None}
+
+
 @app.get("/api/status")
 def get_status():
     """
@@ -319,11 +350,13 @@ def get_status():
     with vehicle_state_lock:
         vehicle = dict(vehicle_state)
     started = telemetry.get("started_at") if telemetry else None
+    config = load_config()
     return {
         **process,
-        **log_only_status(),
+        **log_only_status(config),
         "camera": snapshots.read_camera_status(SNAPSHOT_DIR),
-        "algorithm": load_config().get("algorithm"),
+        "algorithm": config.get("algorithm"),
+        "depth_stream": depth_stream_status(config, process, now),
         "telemetry": telemetry,
         "camera_connected": camera_connected(telemetry),
         "chip_temperature_c": telemetry.get("chip_temperature_c") if telemetry and not telemetry["stale"] else None,
@@ -475,6 +508,42 @@ def require_pnp_running(what):
     if not supervisor.status().get("running"):
         raise HTTPException(status_code=503, detail=f"{what} needs the PnP VIO running; it is stopped")
     return config
+
+
+async def depth_stream_parts(directory: Path, limit: int):
+    """Multipart parts of each new depth_stream.jpg, renewing the lease that keeps the camera streaming."""
+    reader = depth_stream.FrameReader(directory)
+    sent, leased = 0, float("-inf")
+    while True:
+        now = time.monotonic()
+        if now - leased >= DEPTH_STREAM_LEASE_REFRESH_S:
+            depth_stream.touch_lease(directory)
+            leased = now
+        frame = reader.read_new()
+        if frame is not None:
+            yield depth_stream.multipart_part(frame)
+            sent += 1
+            if limit and sent >= limit:
+                return
+        await asyncio.sleep(DEPTH_STREAM_POLL_S)
+
+
+@app.get("/api/stream/depth")
+async def stream_depth(frames: int = Query(0, ge=0, le=100000)):
+    """
+    Live depth of the running PnP VIO as multipart/x-mixed-replace MJPEG (for an <img>): the JPEGs the
+    camera encodes, forwarded as they are. Gray, linear in depth over stereo_depth_min_mm..max_mm, near
+    bright, invalid black (see depth_stream.py; /api/status depth_stream has the scale and the centre
+    depth). The camera only streams while a client is connected. frames > 0 stops after that many.
+    """
+    config = require_pnp_running("the depth stream")
+    if not config.get("depth_stream", True):
+        raise HTTPException(status_code=503, detail="the depth stream is off in the settings (Live depth stream)")
+    directory = telemetry_dir()
+    depth_stream.touch_lease(directory)
+    return StreamingResponse(depth_stream_parts(directory, frames),
+                             media_type=f"multipart/x-mixed-replace; boundary={depth_stream.BOUNDARY}",
+                             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
 
 @app.get("/api/depth_probe")

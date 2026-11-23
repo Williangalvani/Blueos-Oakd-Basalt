@@ -24,6 +24,7 @@ import numpy as np
 from loguru import logger
 
 import depth_probe
+import depth_stream
 import snapshots
 import vio_telemetry
 from autopilot_params import AutopilotParams
@@ -45,6 +46,8 @@ GYRO_BUFFER_SECONDS = 2.0
 GYRO_BUFFER_MAX_SAMPLES = 10000
 SNAPSHOT_RGB_SIZE = (640, 400)
 SNAPSHOT_RGB_FPS = 5.0
+# StereoDepth's default frames per output pool (StereoDepthProperties::numFramesPool)
+STEREO_FRAMES_POOL = 3
 
 CORNER_DETECTORS = {
     "harris": dai.FeatureTrackerConfig.CornerDetector.Type.HARRIS,
@@ -64,6 +67,20 @@ def _argument_type(parse):
         except ValueError as e:
             raise argparse.ArgumentTypeError(str(e))
     return convert
+
+
+def parse_stream_fps(text):
+    value = float(text)
+    if not (math.isfinite(value) and 0 < value <= 60):
+        raise ValueError(f"depth stream fps must be above 0 and at most 60, got {text!r}")
+    return value
+
+
+def parse_stream_quality(text):
+    value = int(text)
+    if not 1 <= value <= 100:
+        raise ValueError(f"depth stream quality must be between 1 and 100, got {text!r}")
+    return value
 
 
 def parse_args(argv=None):
@@ -118,6 +135,13 @@ def parse_args(argv=None):
     parser.add_argument('--snapshot-dir', type=Path, default=snapshots.SNAPSHOT_DIR)
     parser.add_argument('--telemetry-dir', type=Path, default=None,
                         help='Live status and plot history for the web page (default: <snapshot-dir>/telemetry)')
+    parser.add_argument('--depth-stream', action=argparse.BooleanOptionalAction, default=True,
+                        help='Live depth for /api/stream/depth, converted to 8 bit and MJPEG-encoded on the camera; '
+                             'sent only while a client watches')
+    parser.add_argument('--depth-stream-fps', type=_argument_type(parse_stream_fps), default=5.0,
+                        help='Depth stream rate; the camera sends every round(fps / this)-th depth frame')
+    parser.add_argument('--depth-stream-quality', type=_argument_type(parse_stream_quality), default=70,
+                        help='Depth stream JPEG quality, 1-100')
 
     parser.add_argument('--vehicle-ip', default='127.0.0.1')
     parser.add_argument('--quality-rate', type=float, default=1.0)
@@ -370,6 +394,9 @@ class PipelineHandles:
     snapshot_queue: Optional[object] = None
     snapshot_streams: tuple = ()
     snapshot_unavailable: dict = field(default_factory=dict)
+    depth_stream_control_queue: Optional[object] = None
+    depth_stream_queue: Optional[object] = None
+    depth_stream_info: dict = field(default_factory=dict)
 
 
 def build_snapshot_gate(p, device, stereo):
@@ -393,12 +420,45 @@ def build_snapshot_gate(p, device, stereo):
     script.inputs["request"].setBlocking(False)
     script.inputs["request"].setMaxSize(4)
     script.setScript(snapshot_script(sources))
-    # One extra frame per stereo output pool for the frame each gate queue holds
-    stereo.setNumFramesPool(4)
 
     request_queue = script.inputs["request"].createInputQueue(maxSize=4, blocking=False)
     snapshot_queue = script.outputs["snapshot"].createOutputQueue(maxSize=2, blocking=False)
     return request_queue, snapshot_queue, tuple(sources), unavailable
+
+
+def build_depth_stream(p, stereo, args, stereo_settings):
+    """
+    Script node gate + 8-bit conversion of stereo.depth (depth_stream.device_script) feeding an MJPEG
+    VideoEncoder. The Script waits on its control input until the host enables it, then forwards every
+    n-th frame; the encoder and host queues are non-blocking, so a slow consumer only drops stream frames.
+    """
+    every = depth_stream.stream_divisor(args.fps, args.depth_stream_fps)
+    fps = args.fps / every
+    min_mm, max_mm = stereo_settings["stereo_depth_min_mm"], stereo_settings["stereo_depth_max_mm"]
+    script = p.create(dai.node.Script)
+    stereo.depth.link(script.inputs["depth"])
+    script.inputs["depth"].setBlocking(False)
+    script.inputs["depth"].setMaxSize(1)
+    script.inputs["control"].setBlocking(False)
+    script.inputs["control"].setMaxSize(4)
+    script.setScript(depth_stream.device_script(every, min_mm, max_mm))
+
+    encoder = p.create(dai.node.VideoEncoder)
+    encoder.setDefaultProfilePreset(fps, dai.VideoEncoderProperties.Profile.MJPEG)
+    encoder.setQuality(args.depth_stream_quality)
+    encoder.input.setBlocking(False)
+    encoder.input.setMaxSize(1)
+    script.outputs["gray"].link(encoder.input)
+
+    control_queue = script.inputs["control"].createInputQueue(maxSize=4, blocking=False)
+    frame_queue = encoder.out.createOutputQueue(maxSize=2, blocking=False)
+    shift = depth_stream.depth_shift(max_mm)
+    info = {"encoding": "gray8-depth-linear", "codec": "mjpeg", "fps_target": fps, "every": every,
+            "camera_fps": args.fps, "quality": args.depth_stream_quality, "image_size": [args.width, args.height],
+            "depth_range_mm": [min_mm, max_mm], "quantization_mm": 1 << shift,
+            "gray_far": depth_stream.GRAY_FAR, "gray_near": depth_stream.GRAY_NEAR,
+            "gray_invalid_below": depth_stream.GRAY_INVALID_BELOW}
+    return control_queue, frame_queue, info
 
 
 def build_pipeline(p, device, args, stereo_settings):
@@ -438,6 +498,14 @@ def build_pipeline(p, device, args, stereo_settings):
          handles.snapshot_unavailable) = build_snapshot_gate(p, device, stereo)
     else:
         handles.snapshot_unavailable = {s: "snapshots are disabled (--no-snapshots)" for s in snapshots.STREAMS}
+    if args.depth_stream:
+        (handles.depth_stream_control_queue, handles.depth_stream_queue,
+         handles.depth_stream_info) = build_depth_stream(p, stereo, args, stereo_settings)
+    # One extra frame per stereo output pool for the frame each gate queue holds, plus the one the
+    # depth stream Script is converting
+    extra = (1 if args.snapshots else 0) + (2 if args.depth_stream else 0)
+    if extra:
+        stereo.setNumFramesPool(STEREO_FRAMES_POOL + extra)
     return handles
 
 
@@ -576,7 +644,7 @@ def run_pipeline(args, log_only, data_log, stereo_settings, telemetry):
     telemetry.temperature = device.getChipTemperature
     telemetry.set_phase("configuring")
 
-    writer = None
+    writer = stream = None
     try:
         with dai.Pipeline(device) as p:
             handles = build_pipeline(p, device, args, stereo_settings)
@@ -631,6 +699,18 @@ def run_pipeline(args, log_only, data_log, stereo_settings, telemetry):
                 overlay=lambda: overlay.builder((args.width, args.height)))
             data_log.event("snapshots", streams=list(handles.snapshot_streams),
                            unavailable=handles.snapshot_unavailable)
+
+            def send_depth_stream_control(enabled):
+                control = dai.Buffer()
+                control.setSequenceNum(1 if enabled else 0)
+                handles.depth_stream_control_queue.send(control)
+
+            if handles.depth_stream_control_queue is not None:
+                stream = depth_stream.DepthStreamService(telemetry.directory, send_depth_stream_control,
+                                                         handles.depth_stream_info, log=logger.info)
+                logger.info(f"Depth stream: on demand, {handles.depth_stream_info['fps_target']:.1f} fps MJPEG "
+                            f"quality {args.depth_stream_quality}, encoded on the camera")
+            data_log.event("depth_stream", enabled=stream is not None, **handles.depth_stream_info)
 
             p.start()
             telemetry.set_phase("running")
@@ -740,6 +820,11 @@ def run_pipeline(args, log_only, data_log, stereo_settings, telemetry):
                                                   timestamp_seconds(snapshot_msg), snapshot_msg.getSequenceNum())
                 probe.tick()
                 probe.on_depth(depth, t, depth_msg.getSequenceNum())
+                if stream is not None:
+                    stream.tick(depth)
+                    encoded = handles.depth_stream_queue.tryGetAll()
+                    if encoded:
+                        stream.on_frame(encoded[-1].getData(), encoded[-1].getSequenceNum())
                 proc_ms = (time.perf_counter() - start) * 1000.0
 
                 lever = lever_arm_fields(position_delta, R_prior, pose.rotation, args) if args.lever_arm else {}
@@ -798,6 +883,8 @@ def run_pipeline(args, log_only, data_log, stereo_settings, telemetry):
                 stats.add(frame, proc_ms)
                 stats.maybe_report()
     finally:
+        if stream is not None:
+            stream.close()
         if writer is not None:
             writer.close()
         if mavlink:

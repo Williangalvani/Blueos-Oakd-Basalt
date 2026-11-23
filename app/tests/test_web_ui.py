@@ -11,6 +11,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import config_schema  # noqa: E402
+import depth_stream  # noqa: E402
 import snapshots  # noqa: E402
 import vio_log  # noqa: E402
 import vio_telemetry  # noqa: E402
@@ -72,7 +73,8 @@ def test_page_is_one_self_contained_offline_page(client):
     assert not re.search(r"<script[^>]+src=|<link[^>]+href=|@import|url\(", page)
     assert external_urls(page) == set()
     for panel in ("panel-status", "panel-views", "panel-trajectory", "panel-velocity", "panel-vxvy",
-                  "panel-inliers", "panel-settings", "panel-autopilot", "plot-dial", "plot-vbar", "ap-dialog"):
+                  "panel-inliers", "panel-settings", "panel-autopilot", "plot-dial", "plot-vbar", "ap-dialog",
+                  "panel-depth-stream", "depth-stream-img", "depth-stream-canvas", "depth-legend"):
         assert f'id="{panel}"' in page
     assert "integrated, drifts" in page
     # Every configuration field is in the form
@@ -265,6 +267,134 @@ def test_history_etag(client):
     path = vio_telemetry.DEFAULT_DIR / vio_telemetry.HISTORY_FILE
     os.utime(path, (time.time() + 1, time.time() + 1))
     assert http.get("/api/history?seconds=30", headers={"If-None-Match": etag}).status_code == 200
+
+
+# --- live depth stream ----------------------------------------------------------------------------
+
+def save_config(tmp_path, **values):
+    import main
+    (tmp_path / "config.json").write_text(json.dumps({**main.DEFAULT_CONFIG, **values}))
+
+
+def test_depth_stream_needs_the_pnp_vio_running(client, tmp_path):
+    main, http = client
+    response = http.get("/api/stream/depth")
+    assert response.status_code == 503 and "PnP" in response.json()["detail"]
+    save_config(tmp_path, algorithm="pnp")
+    assert "stopped" in http.get("/api/stream/depth").json()["detail"]
+    running(http)
+    save_config(tmp_path, algorithm="pnp", depth_stream=False)
+    response = http.get("/api/stream/depth")
+    assert response.status_code == 503 and "off in the settings" in response.json()["detail"]
+    assert not (vio_telemetry.DEFAULT_DIR / depth_stream.LEASE_FILE).exists()
+
+
+def jpeg(value):
+    import cv2
+    ok, data = cv2.imencode(".jpg", np.full((40, 64), value, np.uint8), [cv2.IMWRITE_JPEG_QUALITY, 70])
+    assert ok
+    return data.tobytes()
+
+
+@pytest.fixture
+def streaming_vio(tmp_path):
+    """A VIO stand-in: the real DepthStreamService, with a fake camera that encodes frames while enabled."""
+    directory = vio_telemetry.DEFAULT_DIR
+    controls = []
+    service = depth_stream.DepthStreamService(directory, controls.append, {"fps_target": 20.0, "quality": 70,
+                                                                           "depth_range_mm": [300, 4000]},
+                                              poll_interval=0.01, meta_interval=0.02, log=lambda m: None)
+    stop = threading.Event()
+    depth = np.full((400, 640), 1234, np.uint16)
+
+    def loop():
+        n = 0
+        while not stop.is_set():
+            service.tick(depth)
+            if service.enabled:
+                service.on_frame(jpeg(10 * (n % 20)), sequence=n)
+                n += 1
+            time.sleep(0.05)
+
+    thread = threading.Thread(target=loop, daemon=True)
+    thread.start()
+    yield service, controls
+    stop.set()
+    thread.join()
+
+
+def multipart_frames(body, boundary=depth_stream.BOUNDARY):
+    frames = []
+    for part in body.split(f"--{boundary}\r\n".encode())[1:]:
+        headers, _, rest = part.partition(b"\r\n\r\n")
+        length = int(re.search(rb"Content-Length: (\d+)", headers).group(1))
+        assert b"Content-Type: image/jpeg" in headers and rest[length:] == b"\r\n"
+        frames.append(rest[:length])
+    return frames
+
+
+def test_depth_stream_forwards_the_camera_jpegs(client, tmp_path, streaming_vio):
+    import cv2
+    main, http = client
+    service, controls = streaming_vio
+    save_config(tmp_path, algorithm="pnp")
+    running(http)
+    assert not service.enabled
+    response = http.get("/api/stream/depth?frames=3")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "multipart/x-mixed-replace; boundary=depthframe"
+    assert response.headers["cache-control"] == "no-store"
+    frames = multipart_frames(response.content)
+    assert len(frames) == 3 and len(set(frames)) == 3
+    # The bytes the camera encoded, unchanged
+    for frame in frames:
+        image = cv2.imdecode(np.frombuffer(frame, np.uint8), cv2.IMREAD_UNCHANGED)
+        assert image.shape[:2] == (40, 64)
+    assert True in controls
+
+    deadline = time.time() + 3
+    while http.get("/api/status").json()["depth_stream"].get("frames_total", 0) < 3 and time.time() < deadline:
+        time.sleep(0.02)
+    status = http.get("/api/status").json()["depth_stream"]
+    assert status["enabled"] is True and status["streaming"] is True and status["stale"] is False
+    assert status["fps_target"] == 20.0 and status["depth_range_mm"] == [300, 4000]
+    assert status["center"]["median_mm"] == 1234.0 and status["center"]["pixel_mm"] == 1234
+    assert status["frames_total"] >= 3 and status["kbps"] > 0
+
+    # Nobody watching: the lease runs out and the camera is told to stop
+    lease = vio_telemetry.DEFAULT_DIR / depth_stream.LEASE_FILE
+    old = time.time() - depth_stream.LEASE_S - 1
+    os.utime(lease, (old, old))
+    deadline = time.time() + 3
+    while service.enabled and time.time() < deadline:
+        time.sleep(0.02)
+    assert not service.enabled and controls[-1] is False
+
+
+def test_status_depth_stream_without_vio(client, tmp_path):
+    main, http = client
+    status = http.get("/api/status").json()["depth_stream"]
+    assert status == {"enabled": False, "streaming": False, "stale": True, "age_s": None}
+    save_config(tmp_path, algorithm="pnp")
+    assert http.get("/api/status").json()["depth_stream"]["enabled"] is True
+
+
+def test_depth_stream_settings_reach_the_vio_command(client):
+    main, http = client
+    pnp = {**main.DEFAULT_CONFIG, "algorithm": "pnp"}
+    command = main.build_vio_command(pnp)
+    assert "--depth-stream" in command
+    assert command[command.index("--depth-stream-fps") + 1] == "5.0"
+    assert command[command.index("--depth-stream-quality") + 1] == "70"
+    command = main.build_vio_command({**pnp, "depth_stream": False, "depth_stream_fps": 2.5,
+                                      "depth_stream_quality": 50})
+    assert "--no-depth-stream" in command and command[command.index("--depth-stream-fps") + 1] == "2.5"
+    # A hand-edited config.json can't make the VIO exit on its arguments
+    command = main.build_vio_command({**pnp, "depth_stream_fps": 1000, "depth_stream_quality": "bad"})
+    assert command[command.index("--depth-stream-fps") + 1] == "15.0"
+    assert command[command.index("--depth-stream-quality") + 1] == "70"
+    response = http.post("/api/config", json={**pnp, "depth_stream_fps": 0.1})
+    assert response.status_code == 422 and response.json()["detail"][0]["field"] == "depth_stream_fps"
 
 
 # --- snapshot feature overlay ---------------------------------------------------------------------

@@ -113,6 +113,9 @@ The page is one self-contained file (`app/static/ui.html`, `ui.css` and `ui.js`,
 | PnP Recovery After (frames) | 20 | PnP only: consecutive failed frames before [tracking recovery](#tracking-recovery-pnp); 0 disables it. |
 | PnP Max Reference Age (s) | 1.0 | PnP only: how long [failed frames](#failed-frames-pnp) keep the last good frame as the reference (`--max-reference-age`); 0 removes the limit. |
 | Snapshots | on | PnP only: allow [camera snapshots](#snapshots-pnp). Nothing is streamed until one is requested. |
+| Live depth stream | on | PnP only: allow the page's [live depth stream](#live-depth-stream), MJPEG encoded on the camera. Nothing is sent until a client watches (`--depth-stream`). |
+| Depth stream fps | 5 | PnP only: target rate of the depth stream (0.5–15; every n-th camera frame, `--depth-stream-fps`). |
+| Depth stream JPEG quality | 70 | PnP only: the camera's MJPEG quality (10–100, `--depth-stream-quality`). |
 | PnP Intrinsics Source | rectified | PnP only: where the rectified-left camera matrix comes from (`--intrinsics-from`). See [Camera matrix](#camera-matrix-pnp). |
 | PnP Intrinsics Override | empty | PnP only: `fx,fy,cx,cy` in pixels on the width × height grid (`--intrinsics-override`). Wins over the source. Empty = off. |
 | PnP Depth Scale | 1.0 | PnP only: extra trim on the camera depth before back-projection, on top of the refractive index (`--depth-scale`, 0.2–5). Translation scales with it. Use it for a residual measured with the [depth probe](#depth-probe-pnp). |
@@ -215,6 +218,7 @@ The page is backed by a small HTTP API:
 | GET | `/api/snapshot?stream=<stream>` | PnP only: PNG of one current camera frame; `stream` is `rect_left`, `rect_right`, `depth` or `rgb`. `&crosshair=1&x=&y=&w=&h=` draws the depth probe's ROI; `&overlay=1` (rect_left) draws the tracked features. See [Snapshots](#snapshots-pnp). |
 | GET | `/api/depth_probe?x=&y=&w=&h=&frames=` | PnP only: depth statistics in an ROI over the next frames. See [Depth probe](#depth-probe-pnp). |
 | GET | `/api/focal_check` | PnP only: checks fx against the focal length the device depth implies. See [Focal check](#focal-check-pnp). |
+| GET | `/api/stream/depth` | PnP only: live depth as `multipart/x-mixed-replace` MJPEG (grayscale, encoded on the camera); 503 when PnP is stopped or the stream is off. `?frames=N` ends after N frames. See [Live depth stream](#live-depth-stream). |
 
 ### Snapshots (PnP)
 
@@ -228,7 +232,7 @@ Responses carry `Cache-Control: no-store` and `X-Snapshot-Unix-Time`, `X-Snapsho
 
 How it works:
 
-- On the camera, a `Script` node holds only the latest frame of each stream, in size-1 non-blocking queues. It forwards one frame only when the host asks for it, so snapshots use no USB/Ethernet bandwidth until requested. Each stereo output's frame pool grows from 3 to 4 frames to cover the frame the gate holds.
+- On the camera, a `Script` node holds only the latest frame of each stream, in size-1 non-blocking queues. It forwards one frame only when the host asks for it, so snapshots use no USB/Ethernet bandwidth until requested. Each stereo output's frame pool grows from 3 to 4 frames to cover the frame the gate holds (to 6 with the [live depth stream](#live-depth-stream), whose Script holds one frame and converts another).
 - `main.py` and the VIO process share `/app/data/snapshots/` (`/usr/blueos/extensions/oakd-vio/snapshots/` on the vehicle). The endpoint atomically writes a request file, `requests/<stream>`, holding the request time.
 - The VIO loop checks the directory at most every 0.2 s and claims requests by renaming them. It sends at most one request to the camera per second, with only one in flight at a time; repeated requests for the same stream are merged. Each frame it does a non-blocking check for a reply.
 - PNG encoding runs on a separate writer thread with a bounded queue, so the VIO loop never waits on it. The writer saves `<stream>.png`, plus `depth_raw.png` for depth, then writes `<stream>.json` last, holding the request time it answers. The endpoint waits until that file shows a request time at least as recent as its own.
@@ -308,6 +312,18 @@ The VIO process publishes its live status through files, like snapshots ([`app/v
 - Memory bound: 10 minutes of frames at min(fps, 30), +10 %, 12 float64 columns: at most 19800 rows, 1.9 MB (0.63 MB at 10 fps). The failure window holds at most 5 minutes × 30 fps of (time, reason) pairs.
 - `/api/history` downsamples to at most 600 points (every k-th frame, the newest always kept) and caches the parsed file by mtime. Pi CPU % comes from `/proc/stat` deltas in `main.py` (no psutil).
 - The trajectory rotates each body-frame delta by the yaw integrated so far (from the gyro prior, else the PnP rotation) and starts at the origin facing +x. It drifts, and deltas dropped at reference resets are missing from it.
+
+### Live depth stream
+
+The *Live depth* panel shows the camera's stereo depth at about 5 fps while its *stream* box is ticked. The *colorize* box colours it in the browser (near is red, far is blue, invalid is black). The panel also shows a legend for *Stereo Depth Min/Max*, the depth at the image centre (the median of the centre 5×5 pixels and the centre pixel), the frame rate and the bandwidth. It is the `<img>` of `GET /api/stream/depth` (MJPEG), so it also opens in a browser tab or in VLC.
+
+The depth is made 8-bit and JPEG-encoded on the camera; the Pi only forwards the bytes ([`app/depth_stream.py`](app/depth_stream.py)):
+
+- On the camera, a `Script` node takes `StereoDepth.depth` (RAW16 mm, aligned to rectified left, 640×400) in a size-1 non-blocking queue. It forwards every n-th frame (n = fps / stream fps; 3 at 15 fps) as a GRAY8 frame, converted with two 256-byte lookup tables on the high and low bytes (`bytes.translate`, 50 rows at a time). A `VideoEncoder` in MJPEG mode (quality 70) encodes it; its input is non-blocking with size 1, so a busy encoder drops stream frames, never VIO frames.
+- The gray scale is linear in depth: 255 at *Stereo Depth Min*, 16 at *Stereo Depth Max*, 0 for invalid or out-of-range pixels, in 2^k mm steps (16 mm for a 4 m max). The browser treats gray < 8 as invalid, which absorbs JPEG ringing. `/api/status` → `depth_stream` gives the scale (`depth_range_mm`, `gray_near`, `gray_far`, `quantization_mm`), `fps`, `kbps` and `center`.
+- With nobody watching, the Script blocks on its control input, so it converts, encodes and sends nothing. Each `/api/stream/depth` client touches `depth_stream.lease` in the telemetry directory every second. The VIO loop checks the lease every 0.5 s and sends the Script on/off. The stream stops about 4 s after the last client leaves.
+- The VIO loop takes the newest encoded frame (`tryGetAll`, non-blocking) and writes it atomically to `/dev/shm/oakd-vio-telemetry/depth_stream.jpg`. `main.py` polls the file every 50 ms and sends each new one as a multipart part. The centre depth goes to `depth_stream.json` once a second while streaming.
+- Cost: on the Pi, one file write per streamed frame and a 5×5 median once a second. A sparse depth frame from the stage-1 snapshots (`snap4`, 13 % valid) is 26 KB as a quality-70 JPEG (OpenCV's encoder), so about 130 KB/s (1 Mbit/s) on the link at 5 fps. The Script logs its own conversion time on the camera every 150 frames ("depth stream: … ms"); it has not been measured on hardware yet. If it competes with the VIO, lower *Depth stream fps* or turn *Live depth stream* off, which removes the Script and encoder from the pipeline.
 
 ### DVL overlay
 

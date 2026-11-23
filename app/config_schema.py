@@ -98,6 +98,15 @@ CONFIG_FIELDS = (
                 placeholder="fx,fy,cx,cy"),
     ConfigField("snapshots", "bool", True, "Snapshots",
                 "PnP only: on-demand camera snapshots (live views); no bandwidth until requested"),
+    ConfigField("depth_stream", "bool", True, "Live depth stream",
+                "PnP only: depth converted to 8 bit and MJPEG-encoded on the camera for the Live depth panel; "
+                "sent only while the panel is open"),
+    ConfigField("depth_stream_fps", "float", 5.0, "Depth Stream FPS",
+                "PnP only: the camera sends every round(FPS / this)-th depth frame", minimum=0.5, maximum=15.0,
+                step=0.5),
+    ConfigField("depth_stream_quality", "int", 70, "Depth Stream JPEG Quality",
+                "PnP only: MJPEG quality on the camera (lower = less USB bandwidth)", minimum=10, maximum=100,
+                step=1),
 
     ConfigField("algorithm", "choice", "basalt", "Algorithm", "PnP ignores the Basalt tuning", "camera",
                 choices=("basalt", "pnp")),
@@ -235,7 +244,8 @@ def _cross_field_errors(config):
     if isinstance(low, int) and isinstance(high, int) and low >= high:
         errors.append({"loc": ["body", "stereo_depth_max_mm"], "field": "stereo_depth_max_mm", "type": "value_error",
                        "msg": f"Max depth (mm) (stereo_depth_max_mm): must be above Min depth (mm) ({low})"})
-    for key in ("refractive_index", "depth_scale", "max_reference_age", "camera_angle", "quality_rate"):
+    for key in ("refractive_index", "depth_scale", "max_reference_age", "camera_angle", "quality_rate",
+                "depth_stream_fps"):
         value = config.get(key)
         if isinstance(value, float) and not math.isfinite(value):
             errors.append({"loc": ["body", key], "field": key, "type": "finite_number",

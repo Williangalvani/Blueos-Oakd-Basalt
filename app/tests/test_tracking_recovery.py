@@ -4,7 +4,7 @@ import os
 import signal
 import sys
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +16,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import depth_probe  # noqa: E402
+import depth_stream  # noqa: E402
 import snapshots  # noqa: E402
 import vio_log  # noqa: E402
 from pnp_odometry import Intrinsics, PnPOdometry, PnPParams, back_project, camera_to_body_matrix  # noqa: E402
@@ -232,7 +233,7 @@ def pnp_vio(monkeypatch, tmp_path):
     sys.modules.pop("pnp_vio", None)
 
 
-def run_fake(module, monkeypatch, tmp_path, groups, argv, imu=(), log_only=True):
+def run_fake(module, monkeypatch, tmp_path, groups, argv, imu=(), log_only=True, **handle_fields):
     sync_queue = FakeQueue(groups)
     snapshot_queue = FakeQueue()
     request_queue = FakeQueue()
@@ -241,7 +242,8 @@ def run_fake(module, monkeypatch, tmp_path, groups, argv, imu=(), log_only=True)
     handles = module.PipelineHandles(
         sync_queue=sync_queue, imu_queue=FakeQueue(imu), feature_config_queue=FakeQueue(),
         stereo_effective={"decimation": 1}, snapshot_request_queue=request_queue, snapshot_queue=snapshot_queue,
-        snapshot_streams=("rect_left", "rect_right", "depth"), snapshot_unavailable={"rgb": "no CAM_A"})
+        snapshot_streams=("rect_left", "rect_right", "depth"), snapshot_unavailable={"rgb": "no CAM_A"},
+        **handle_fields)
     monkeypatch.setattr(module, "build_pipeline", lambda p, device, args, settings: handles)
     monkeypatch.setattr(module.dai, "Pipeline", lambda device: FakePipeline(sync_queue))
     monkeypatch.setattr(module.dai, "FeatureTrackerConfig", lambda: mock.MagicMock())
@@ -404,6 +406,141 @@ def test_snapshot_script_gates_on_requests(pnp_vio):
     compile(code, "snapshot_script", "exec")
     assert "available = ['depth', 'rect_left']" in code
     assert "node.inputs['request'].get()" in code
+
+
+# --- live depth stream in pnp_vio ---------------------------------------------------------------
+
+def test_parse_args_depth_stream(pnp_vio, capsys):
+    args = pnp_vio.parse_args([])
+    assert (args.depth_stream, args.depth_stream_fps, args.depth_stream_quality) == (True, 5.0, 70)
+    args = pnp_vio.parse_args(["--no-depth-stream", "--depth-stream-fps", "2.5", "--depth-stream-quality", "40"])
+    assert (args.depth_stream, args.depth_stream_fps, args.depth_stream_quality) == (False, 2.5, 40)
+    for bad in (["--depth-stream-fps", "0"], ["--depth-stream-fps", "61"], ["--depth-stream-fps", "nan"],
+                ["--depth-stream-quality", "0"], ["--depth-stream-quality", "101"],
+                ["--depth-stream-quality", "x"]):
+        with pytest.raises(SystemExit):
+            pnp_vio.parse_args(bad)
+    assert "depth stream fps" in capsys.readouterr().err
+
+
+def fake_dai_pipeline():
+    """A MagicMock pipeline whose p.create() returns a distinct node per call, with real input/output dicts."""
+    created = []
+
+    def create(kind):
+        node = mock.MagicMock(name=str(kind))
+        node.inputs, node.outputs = defaultdict(mock.MagicMock), defaultdict(mock.MagicMock)
+        created.append((kind, node))
+        return node
+
+    p = mock.MagicMock()
+    p.create.side_effect = create
+    return p, created
+
+
+def nodes_of(created, kind):
+    return [node for k, node in created if k is kind]
+
+
+def build_fake_pipeline(module, argv):
+    p, created = fake_dai_pipeline()
+    device = mock.MagicMock()
+    device.getConnectedCameras.return_value = []
+    args = module.parse_args(argv)
+    handles = module.build_pipeline(p, device, args, module.resolve_stereo_settings(args))
+    return handles, created
+
+
+def test_build_pipeline_encodes_the_depth_stream_on_the_camera(pnp_vio):
+    dai = pnp_vio.dai
+    handles, created = build_fake_pipeline(pnp_vio, ["--stereo-depth-max-mm", "4000"])
+    (stereo,) = nodes_of(created, dai.node.StereoDepth)
+    snapshot_script, stream_script = nodes_of(created, dai.node.Script)
+    (encoder,) = nodes_of(created, dai.node.VideoEncoder)
+
+    # stereo.depth -> Script (8-bit conversion) -> MJPEG encoder, all inputs non-blocking and small
+    depth_in = stream_script.inputs["depth"]
+    assert mock.call(depth_in) in stereo.depth.link.call_args_list
+    depth_in.setBlocking.assert_called_with(False)
+    depth_in.setMaxSize.assert_called_with(1)
+    stream_script.inputs["control"].setBlocking.assert_called_with(False)
+    stream_script.outputs["gray"].link.assert_called_once_with(encoder.input)
+    code = stream_script.setScript.call_args[0][0]
+    compile(code, "depth_stream_script", "exec")
+    assert "every = 3" in code
+    encoder.setDefaultProfilePreset.assert_called_once_with(5.0, dai.VideoEncoderProperties.Profile.MJPEG)
+    encoder.setQuality.assert_called_once_with(70)
+    encoder.input.setBlocking.assert_called_with(False)
+    encoder.input.setMaxSize.assert_called_with(1)
+
+    stream_script.inputs["control"].createInputQueue.assert_called_once_with(maxSize=4, blocking=False)
+    encoder.out.createOutputQueue.assert_called_once_with(maxSize=2, blocking=False)
+    assert handles.depth_stream_control_queue is stream_script.inputs["control"].createInputQueue.return_value
+    assert handles.depth_stream_queue is encoder.out.createOutputQueue.return_value
+    info = handles.depth_stream_info
+    assert info["fps_target"] == 5.0 and info["every"] == 3 and info["quality"] == 70
+    assert info["depth_range_mm"][1] == 4000 and info["quantization_mm"] == 16
+    assert info["image_size"] == [640, 400]
+    # One more stereo frame per gate queue (snapshots) and two for the stream Script
+    stereo.setNumFramesPool.assert_called_once_with(pnp_vio.STEREO_FRAMES_POOL + 3)
+    assert snapshot_script is not stream_script
+
+
+def test_build_pipeline_without_the_depth_stream(pnp_vio):
+    dai = pnp_vio.dai
+    handles, created = build_fake_pipeline(pnp_vio, ["--no-depth-stream", "--depth-stream-fps", "1"])
+    assert not nodes_of(created, dai.node.VideoEncoder) and len(nodes_of(created, dai.node.Script)) == 1
+    assert handles.depth_stream_control_queue is None and handles.depth_stream_info == {}
+    (stereo,) = nodes_of(created, dai.node.StereoDepth)
+    stereo.setNumFramesPool.assert_called_once_with(pnp_vio.STEREO_FRAMES_POOL + 1)
+
+    handles, created = build_fake_pipeline(pnp_vio, ["--no-depth-stream", "--no-snapshots"])
+    (stereo,) = nodes_of(created, dai.node.StereoDepth)
+    stereo.setNumFramesPool.assert_not_called()
+
+    handles, created = build_fake_pipeline(pnp_vio, ["--no-snapshots", "--depth-stream-fps", "1",
+                                                     "--depth-stream-quality", "55"])
+    (encoder,) = nodes_of(created, dai.node.VideoEncoder)
+    encoder.setDefaultProfilePreset.assert_called_once_with(1.0, dai.VideoEncoderProperties.Profile.MJPEG)
+    encoder.setQuality.assert_called_once_with(55)
+    assert handles.depth_stream_info["every"] == 15
+
+
+def test_run_streams_depth_only_while_a_client_watches(pnp_vio, monkeypatch, tmp_path):
+    telemetry_dir = tmp_path / "snapshots" / "telemetry"
+    depth_stream.touch_lease(telemetry_dir)
+    encoded = FakeQueue([SimpleNamespace(getData=lambda: np.frombuffer(b"\xff\xd8jpeg\xff\xd9", np.uint8),
+                                         getSequenceNum=lambda: 42)])
+    control = FakeQueue()
+    info = {"fps_target": 5.0, "quality": 70, "depth_range_mm": [300, 4000]}
+    lines, handles = run_fake(pnp_vio, monkeypatch, tmp_path, scenario(n_good=6, n_lost=0, n_back=0), [],
+                              depth_stream_control_queue=control, depth_stream_queue=encoded,
+                              depth_stream_info=info)
+    # The lease enabled the camera's stream (sequence 1); the run's end leaves it to the device shutdown
+    assert [m.setSequenceNum.call_args[0][0] for m in control.sent] == [1]
+    assert (telemetry_dir / depth_stream.FRAME_FILE).read_bytes() == b"\xff\xd8jpeg\xff\xd9"
+    meta = depth_stream.read_meta(telemetry_dir)
+    assert meta["frames_total"] == 1 and meta["last_frame"]["sequence"] == 42 and meta["streaming"] is False
+    events = {line["event"]: line for line in lines if line["type"] == "event"}
+    assert events["depth_stream"]["enabled"] is True and events["depth_stream"]["fps_target"] == 5.0
+    # VIO output unchanged
+    assert [line["status"] for line in lines if line["type"] == "step"][1:] == ["ok"] * 5
+
+
+def test_run_without_a_watcher_keeps_the_stream_off(pnp_vio, monkeypatch, tmp_path):
+    control = FakeQueue()
+    lines, _ = run_fake(pnp_vio, monkeypatch, tmp_path, scenario(n_good=4, n_lost=0, n_back=0), [],
+                        depth_stream_control_queue=control, depth_stream_queue=FakeQueue(),
+                        depth_stream_info={"fps_target": 5.0})
+    assert [m.setSequenceNum.call_args[0][0] for m in control.sent] == [0]
+    assert not (tmp_path / "snapshots" / "telemetry" / depth_stream.FRAME_FILE).exists()
+
+
+def test_run_with_the_depth_stream_disabled_logs_it(pnp_vio, monkeypatch, tmp_path):
+    lines, _ = run_fake(pnp_vio, monkeypatch, tmp_path, scenario(n_good=4, n_lost=0, n_back=0), [])
+    events = {line["event"]: line for line in lines if line["type"] == "event"}
+    assert events["depth_stream"]["enabled"] is False
+    assert not (tmp_path / "snapshots" / "telemetry" / depth_stream.META_FILE).exists()
 
 
 # --- camera matrix selection, depth scale and depth probe in pnp_vio ---------------------------
