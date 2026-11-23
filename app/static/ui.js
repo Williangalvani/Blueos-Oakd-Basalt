@@ -557,7 +557,7 @@ async function showProbeResult(url, busy, summarize) {
   const result = $('probe-result');
   summary.textContent = busy;
   let r;
-  try { r = await fetchJSON(url); } catch (e) { summary.textContent = 'web server not reachable'; return; }
+  try { r = await fetchJSON(url, { method: 'POST' }); } catch (e) { summary.textContent = 'web server not reachable'; return; }
   if (!r.ok) {
     summary.textContent = errorText(r.data, r.status);
     result.textContent = '';
@@ -720,6 +720,13 @@ function renderDepthStream(s) {
   setText('ds-kbps', d.streaming && isNum(d.kbps) ? d.kbps.toFixed(0) + ' kbit/s' : '–');
   const last = d.last_frame;
   setText('ds-jpeg', (isNum(d.quality) ? 'quality ' + d.quality : '–') + (d.streaming && last ? ' · ' + (last.bytes / 1024).toFixed(1) + ' KiB/frame' : ''));
+  const cost = d.stale ? null : d.device_stats;
+  setText('ds-cost', cost ? fmt(cost.convert_ms_mean, 1) + ' ms mean, ' + fmt(cost.convert_ms_max, 1) + ' ms max' : '–');
+  const error = d.stale ? null : d.last_error;
+  setText('ds-errors', d.stale ? '–' : !d.errors ? 'none' : d.errors + (error
+    ? ' · ' + (error.fatal ? 'stopped: ' : '') + error.text + (isNum(error.unix_time) && isNum(s.server_time)
+      ? ' (' + Math.max(0, s.server_time - error.unix_time).toFixed(0) + ' s ago)' : '')
+    : ''));
 
   const problem = depthStreamProblem(s);
   const img = $('depth-stream-img');
@@ -979,7 +986,7 @@ async function readAutopilot() {
   const body = $('ap-table').tBodies[0];
   body.innerHTML = '<tr><td colspan="6" class="muted">Reading parameters (PARAM_REQUEST_READ only)…</td></tr>';
   let r;
-  try { r = await fetchJSON('api/autopilot/params'); } catch (e) { r = { ok: false, status: 0, data: null }; }
+  try { r = await fetchJSON('api/autopilot/params/read', { method: 'POST' }); } catch (e) { r = { ok: false, status: 0, data: null }; }
   if (!r.ok) {
     body.innerHTML = '';
     const message = $('ap-message');

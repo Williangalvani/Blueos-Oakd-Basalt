@@ -397,6 +397,7 @@ class PipelineHandles:
     snapshot_unavailable: dict = field(default_factory=dict)
     depth_stream_control_queue: Optional[object] = None
     depth_stream_queue: Optional[object] = None
+    depth_stream_status_queue: Optional[object] = None
     depth_stream_info: dict = field(default_factory=dict)
 
 
@@ -432,6 +433,7 @@ def build_depth_stream(p, stereo, args, stereo_settings):
     Script node gate + 8-bit conversion of stereo.depth (depth_stream.device_script) feeding an MJPEG
     VideoEncoder. The Script waits on its control input until the host enables it, then forwards every
     n-th frame; the encoder and host queues are non-blocking, so a slow consumer only drops stream frames.
+    The Script's 'status' output carries its errors and timing (depth_stream.parse_device_status).
     """
     every = depth_stream.stream_divisor(args.fps, args.depth_stream_fps)
     fps = args.fps / every
@@ -453,13 +455,14 @@ def build_depth_stream(p, stereo, args, stereo_settings):
 
     control_queue = script.inputs["control"].createInputQueue(maxSize=4, blocking=False)
     frame_queue = encoder.out.createOutputQueue(maxSize=2, blocking=False)
+    status_queue = script.outputs["status"].createOutputQueue(maxSize=8, blocking=False)
     shift = depth_stream.depth_shift(max_mm)
     info = {"encoding": "gray8-depth-linear", "codec": "mjpeg", "fps_target": fps, "every": every,
             "camera_fps": args.fps, "quality": args.depth_stream_quality, "image_size": [args.width, args.height],
             "depth_range_mm": [min_mm, max_mm], "quantization_mm": 1 << shift,
             "gray_far": depth_stream.GRAY_FAR, "gray_near": depth_stream.GRAY_NEAR,
             "gray_invalid_below": depth_stream.GRAY_INVALID_BELOW}
-    return control_queue, frame_queue, info
+    return control_queue, frame_queue, status_queue, info
 
 
 def build_pipeline(p, device, args, stereo_settings):
@@ -500,7 +503,7 @@ def build_pipeline(p, device, args, stereo_settings):
     else:
         handles.snapshot_unavailable = {s: "snapshots are disabled (--no-snapshots)" for s in snapshots.STREAMS}
     if args.depth_stream:
-        (handles.depth_stream_control_queue, handles.depth_stream_queue,
+        (handles.depth_stream_control_queue, handles.depth_stream_queue, handles.depth_stream_status_queue,
          handles.depth_stream_info) = build_depth_stream(p, stereo, args, stereo_settings)
     # One extra frame per stereo output pool for the frame each gate queue holds, plus the one the
     # depth stream Script is converting
@@ -830,6 +833,9 @@ def run_pipeline(args, log_only, data_log, stereo_settings, telemetry):
                     encoded = handles.depth_stream_queue.tryGetAll()
                     if encoded:
                         stream.on_frame(encoded[-1].getData(), encoded[-1].getSequenceNum())
+                    if handles.depth_stream_status_queue is not None:
+                        for report in handles.depth_stream_status_queue.tryGetAll():
+                            stream.on_device_status(report.getData())
                 proc_ms = (time.perf_counter() - start) * 1000.0
 
                 lever = lever_arm_fields(position_delta, R_prior, pose.rotation, args) if args.lever_arm else {}

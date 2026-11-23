@@ -209,20 +209,22 @@ The page is backed by a small HTTP API:
 | POST | `/api/log_only` | `{"log_only": true\|false}`: save the setting and restart VIO; 400 for anything else |
 | GET | `/api/status` | Whether the VIO process is running, restarts, whether log-only mode is active (`log_only`, `log_only_forced_by_env`), and for PnP the `camera` matrix in use (`null` until the first frame): the in-air `intrinsics`, `effective_intrinsics`, `refractive_index`, `depth_scale` and `total_depth_scale`. Also `algorithm`, `telemetry` (PnP live status, below; `null` until published, `stale: true` when VIO stopped), `camera_connected`, `chip_temperature_c`, `cpu_percent`, `uptime_s` and the last known `vehicle` armed state |
 | GET | `/api/history?seconds=60&max_points=600&tail=0` | PnP plot history, oldest first, `t` in seconds before `server_time`: `vx`, `vy`, `vz` (m/s, body FRD, `null` for rejected frames), integrated `x`, `y`, `yaw`, `inliers`, `ok`. At most `max_points` (≤ 600) over `seconds` (≤ 600); `tail` (≤ 10 s) adds the newest frames at full rate. `dvl` holds the [DVL overlay](#dvl-overlay). Weak `ETag`; `If-None-Match` gives 304 |
-| GET | `/api/autopilot/params` | The suggested optical-hold parameters as the vehicle has them, and the HEARTBEAT armed state. Read only. See [ArduPilot panel](#ardupilot-panel) |
+| POST | `/api/autopilot/params/read` | The suggested optical-hold parameters as the vehicle has them, and the HEARTBEAT armed state. Read only (POST because it sends MAVLink requests). See [ArduPilot panel](#ardupilot-panel) |
 | POST | `/api/autopilot/params` | `{"confirm": true, "params": {"NAME": value}}`: guarded write with read-back. See [ArduPilot panel](#ardupilot-panel) |
 | GET | `/api/logs` | Data logs: name, size (bytes), mtime (unix time), newest first |
 | GET | `/api/logs/{name}` | Download one data log |
 | POST | `/api/start`, `/api/stop` | Start or stop VIO |
 | POST | `/api/reset` | Restore defaults and restart VIO |
 | GET | `/api/snapshot?stream=<stream>` | PnP only: PNG of one current camera frame; `stream` is `rect_left`, `rect_right`, `depth` or `rgb`. `&crosshair=1&x=&y=&w=&h=` draws the depth probe's ROI; `&overlay=1` (rect_left) draws the tracked features. See [Snapshots](#snapshots-pnp). |
-| GET | `/api/depth_probe?x=&y=&w=&h=&frames=` | PnP only: depth statistics in an ROI over the next frames. See [Depth probe](#depth-probe-pnp). |
-| GET | `/api/focal_check` | PnP only: checks fx against the focal length the device depth implies. See [Focal check](#focal-check-pnp). |
+| POST | `/api/depth_probe?x=&y=&w=&h=&frames=` | PnP only: depth statistics in an ROI over the next frames. See [Depth probe](#depth-probe-pnp). |
+| POST | `/api/focal_check?tolerance=` | PnP only: checks fx against the focal length the device depth implies. See [Focal check](#focal-check-pnp). |
 | GET | `/api/stream/depth` | PnP only: live depth as `multipart/x-mixed-replace` MJPEG (grayscale, encoded on the camera); 503 when PnP is stopped or the stream is off. `?frames=N` ends after N frames. See [Live depth stream](#live-depth-stream). |
 | GET | `/api/stream/features` | Server-sent events for the [Cockpit widget](#cockpit-widget): `features` (the PnP tracker's features, about 5 per second) and `status` (once a second; `problem` says why there is nothing to show). Always 200. `?events=N` ends after N events. |
 | GET | `/api/features` | PnP only: the latest `features` object once; 404 until the VIO process has published one (it starts on request) |
 | GET | `/widget/depth` | The [Cockpit widget](#cockpit-widget) page |
 | GET | `/register_service`, `/cockpit_extras.json` | BlueOS service metadata and the Cockpit extras that declare the widget |
+
+`/openapi.json` (and `/docs`) lists only the GET routes that answer at once with a bounded body and start nothing: `/`, `/widget/depth`, `/register_service`, `/cockpit_extras.json`, `/api/config`, `/api/config/schema`, `/api/status`, `/api/logs` and `/api/logs/{name}`. BlueOS's helper GETs every path listed there every few seconds and reads each body to its end, so the streams (`/api/stream/*`) and the routes that wait for the camera or start work (`/api/snapshot`, `/api/history`, `/api/features`) are left out of the schema, and everything that runs something on the camera or the autopilot is a POST. `app/tests/test_openapi_scan.py` runs that scan against the app and fails on any other GET in the schema.
 
 ### Snapshots (PnP)
 
@@ -250,11 +252,11 @@ To aim the [depth probe](#depth-probe-pnp), add `&crosshair=1` (and the probe's 
 
 ### Depth probe (PnP)
 
-`GET /api/depth_probe` measures the device depth in a small region while PnP keeps running. Use it to compare the camera's depth with a tape measure. In water, compare the tape with `scaled_m` (which includes the refractive index) and set *PnP Depth Scale* for any residual. The *Depth probe* part of the page's *Live views* has the inputs and a *Probe* button; click the left image to aim, and tick *probe ROI* to draw the crosshair on the views.
+`POST /api/depth_probe` measures the device depth in a small region while PnP keeps running. Use it to compare the camera's depth with a tape measure. In water, compare the tape with `scaled_m` (which includes the refractive index) and set *PnP Depth Scale* for any residual. The *Depth probe* part of the page's *Live views* has the inputs and a *Probe* button; click the left image to aim, and tick *probe ROI* to draw the crosshair on the views. The parameters go in the query string; a GET returns 405.
 
 ```
-http://<vehicle>:8095/api/depth_probe                                # image centre, 41×41 px, 10 frames
-http://<vehicle>:8095/api/depth_probe?x=320&y=200&w=41&h=41&frames=10
+curl -X POST 'http://<vehicle>:8095/api/depth_probe'                                # image centre, 41×41 px, 10 frames
+curl -X POST 'http://<vehicle>:8095/api/depth_probe?x=320&y=200&w=41&h=41&frames=10'
 ```
 
 - `x`, `y`: ROI centre in pixels on the rectified-left grid (width × height, 640×400 by default). The default is the image centre. Coordinates outside the image return 400.
@@ -279,11 +281,11 @@ Requests are served one at a time, oldest first. The probe works with *Snapshots
 
 ### Focal check (PnP)
 
-`GET /api/focal_check` (the *Focal check* button) checks the camera matrix's fx against the focal length the device used to turn disparity into depth. It finds feature matches between `rect_left` and `rect_right` on the same image row (SIFT on contrast-enhanced images, |dy| < 2 px, disparity > 0.5 px). At each match it reads the device depth (median of a 3×3 window) and computes f = Z·d/B.
+`POST /api/focal_check` (the *Focal check* button) checks the camera matrix's fx against the focal length the device used to turn disparity into depth. It finds feature matches between `rect_left` and `rect_right` on the same image row (SIFT on contrast-enhanced images, |dy| < 2 px, disparity > 0.5 px). At each match it reads the device depth (median of a 3×3 window) and computes f = Z·d/B.
 
 ```
-http://<vehicle>:8095/api/focal_check              # tolerance 15%
-http://<vehicle>:8095/api/focal_check?tolerance=0.1
+curl -X POST 'http://<vehicle>:8095/api/focal_check'               # tolerance 15%
+curl -X POST 'http://<vehicle>:8095/api/focal_check?tolerance=0.1'
 ```
 
 The response has `fx_K`, `f_from_depth` (median), `f_iqr`, `ratio`, `n_matches`, `ok` (|ratio − 1| ≤ tolerance, with at least 10 matches) and a `message`. It also gives the `baseline_m` used and the `device_timestamps` of the three snapshots. With the rectified K the expected ratio is about 1.0. With the raw K it is about 0.59, and the message says so.
@@ -327,7 +329,9 @@ The depth is made 8-bit and JPEG-encoded on the camera; the Pi only forwards the
 - The gray scale is linear in depth: 255 at *Stereo Depth Min*, 16 at *Stereo Depth Max*, 0 for invalid or out-of-range pixels, in 2^k mm steps (16 mm for a 4 m max). The browser treats gray < 8 as invalid, which absorbs JPEG ringing. `/api/status` → `depth_stream` gives the scale (`depth_range_mm`, `gray_near`, `gray_far`, `quantization_mm`), `fps`, `kbps` and `center`.
 - With nobody watching, the Script blocks on its control input, so it converts, encodes and sends nothing. Each `/api/stream/depth` client touches `depth_stream.lease` in the telemetry directory every second. The VIO loop checks the lease every 0.5 s and sends the Script on/off. The stream stops about 4 s after the last client leaves.
 - The VIO loop takes the newest encoded frame (`tryGetAll`, non-blocking) and writes it atomically to `/dev/shm/oakd-vio-telemetry/depth_stream.jpg`. `main.py` polls the file every 50 ms and sends each new one as a multipart part. The centre depth goes to `depth_stream.json` once a second while streaming.
-- Cost: on the Pi, one file write per streamed frame and a 5×5 median once a second. A sparse depth frame from the stage-1 snapshots (`snap4`, 13 % valid) is 26 KB as a quality-70 JPEG (OpenCV's encoder), so about 130 KB/s (1 Mbit/s) on the link at 5 fps. The Script logs its own conversion time on the camera every 150 frames ("depth stream: … ms"); it has not been measured on hardware yet. If it competes with the VIO, lower *Depth stream fps* or turn *Live depth stream* off, which removes the Script and encoder from the pipeline.
+- The Script uses only the camera's own Script API, which is smaller than the host's `dai.ImgFrame`: `ImgFrame(width * height)` (the size in bytes; `ImgFrame()` does not exist there), `setData`, `setType(GRAY8)`, `setWidth`, `setHeight`, `setTimestamp` and `setSequenceNum`. There is no `setStride` (GRAY8's stride is the width), `setMetadata` or `setTimestampDevice`. The list was checked against the RVC2 firmware that depthai 3.3.0 ships, and a test runs the Script against fakes that accept only that API.
+- Errors: the Script counts each frame that fails, and sends the count and the latest error on its `status` output: the first one at once, then at most one a second. It also logs the 1st and every 100th with `node.warn`. A metadata failure still sends the frame. `/api/status` → `depth_stream` has `errors`, `last_error` (`text`, `unix_time`, `fatal` if the Script stopped) and `device_stats` (the camera's convert + send time, every 150 frames). The panel shows them as *camera conversion* and *camera errors*, and the widget's status line shows the error count.
+- Cost: on the Pi, one file write per streamed frame and a 5×5 median once a second. A sparse depth frame from the stage-1 snapshots (`snap4`, 13 % valid) is 26 KB as a quality-70 JPEG (OpenCV's encoder), so about 130 KB/s (1 Mbit/s) on the link at 5 fps. The Script logs its own conversion time on the camera every 150 frames ("depth stream: … ms") and reports it in `device_stats`; it has not been measured on hardware yet. If it competes with the VIO, lower *Depth stream fps* or turn *Live depth stream* off, which removes the Script and encoder from the pipeline.
 
 ### Cockpit widget
 
@@ -361,7 +365,7 @@ With *DVL overlay source* `auto`, `main.py` ([`app/dvl_source.py`](app/dvl_sourc
 
 ### ArduPilot panel
 
-The panel reads the [suggested parameters](#suggested-parameters-for-optical-position-hold-written-only-from-the-page) with `PARAM_REQUEST_READ` and shows current, suggested (editable), status (`ok`, `differs`, `unreadable`), why and *reboot*, plus the armed state from the autopilot's HEARTBEAT (`base_mode & 128`). Reading never writes.
+The panel reads the [suggested parameters](#suggested-parameters-for-optical-position-hold-written-only-from-the-page) with `PARAM_REQUEST_READ` and shows current, suggested (editable), status (`ok`, `differs`, `unreadable`), why and *reboot*, plus the armed state from the autopilot's HEARTBEAT (`base_mode & 128`). Reading (`POST /api/autopilot/params/read`, on load and on *Re-read*) never writes. Both reading and writing are POST, so no GET (BlueOS's API scan, a browser prefetch) reaches the autopilot.
 
 Writing (`POST /api/autopilot/params`):
 

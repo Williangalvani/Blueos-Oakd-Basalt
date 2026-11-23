@@ -101,5 +101,5 @@ def widget_status(problem, telemetry, depth, log_only, now):
         "log_only": bool(log_only),
         "depth": {key: depth.get(key) for key in (
             "enabled", "streaming", "fps", "fps_target", "image_size", "depth_range_mm", "gray_far", "gray_near",
-            "gray_invalid_below")},
+            "gray_invalid_below", "errors", "last_error")},
     }

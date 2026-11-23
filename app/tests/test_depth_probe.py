@@ -349,7 +349,7 @@ def fake_vio(tmp_path):
 
 def test_api_depth_probe(client, fake_vio):
     main, http = client
-    response = http.get("/api/depth_probe?x=320&y=200&w=41&h=41&frames=5")
+    response = http.post("/api/depth_probe?x=320&y=200&w=41&h=41&frames=5")
     assert response.status_code == 200, response.text
     assert response.headers["cache-control"] == "no-store"
     data = response.json()
@@ -359,34 +359,34 @@ def test_api_depth_probe(client, fake_vio):
     assert data["valid_fraction"] == pytest.approx(1 - 500 / 41 ** 2) and data["intrinsics_source"] == "rectified"
     assert data["summary"].startswith("median 1.500 m (scaled 1.800 m)")
     # Defaults: centre, 41 x 41, 10 frames
-    default = http.get("/api/depth_probe").json()
+    default = http.post("/api/depth_probe").json()
     assert default["roi"] == {"x": 320.0, "y": 200.0, "w": 41, "h": 41} and default["frames"] == 10
-    clamped = http.get("/api/depth_probe?w=500&frames=60").json()
+    clamped = http.post("/api/depth_probe?w=500&frames=60").json()
     assert clamped["roi"]["w"] == 200 and clamped["frames"] == 50 and clamped["clamped"] == ["w 500 -> 200", "frames 60 -> 50"]
 
 
 def test_api_depth_probe_validation(client):
     main, http = client
-    assert http.get("/api/depth_probe?x=700").status_code == 400
-    assert "inside the 640x400" in http.get("/api/depth_probe?y=-1").json()["detail"]
-    assert http.get("/api/depth_probe?w=0").status_code == 400
-    assert http.get("/api/depth_probe?w=abc").status_code == 422
+    assert http.post("/api/depth_probe?x=700").status_code == 400
+    assert "inside the 640x400" in http.post("/api/depth_probe?y=-1").json()["detail"]
+    assert http.post("/api/depth_probe?w=0").status_code == 400
+    assert http.post("/api/depth_probe?w=abc").status_code == 422
 
 
 def test_api_depth_probe_needs_pnp_running(client, monkeypatch):
     main, http = client
     monkeypatch.setattr(main.supervisor, "status", lambda: {"running": False})
-    response = http.get("/api/depth_probe")
+    response = http.post("/api/depth_probe")
     assert response.status_code == 503 and "stopped" in response.json()["detail"]
     main.save_config({**main.DEFAULT_CONFIG, "algorithm": "basalt"})
-    response = http.get("/api/depth_probe")
+    response = http.post("/api/depth_probe")
     assert response.status_code == 503 and "PnP algorithm" in response.json()["detail"]
 
 
 def test_api_depth_probe_times_out_without_vio(client, monkeypatch, tmp_path):
     main, http = client
     monkeypatch.setattr(main, "PROBE_EXTRA_TIMEOUT", 0.1)
-    response = http.get("/api/depth_probe?frames=1")
+    response = http.post("/api/depth_probe?frames=1")
     assert response.status_code == 504 and "did not pick up" in response.json()["detail"]
     assert not list((tmp_path / "snapshots" / "depth_probe" / "requests").iterdir())
 
@@ -395,4 +395,12 @@ def test_index_page_has_the_depth_probe(client):
     main, http = client
     page = http.get("/").text
     assert "'api/depth_probe?" in page and "crosshair" in page and "'api/focal_check'" in page
+    assert "fetchJSON(url, { method: 'POST' })" in page  # showProbeResult: both run on the camera
     assert 'id="probe-frames"' in page
+
+
+def test_depth_probe_and_focal_check_are_post_only(client, tmp_path):
+    main, http = client
+    for path in ("/api/depth_probe", "/api/focal_check"):
+        assert http.get(path).status_code == 405
+    assert not (tmp_path / "snapshots" / "depth_probe").exists()

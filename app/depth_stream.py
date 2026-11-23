@@ -19,6 +19,9 @@ Gating: main.py touches DIRECTORY/depth_stream.lease while a client streams; the
 at most every poll_interval and tells the Script to start or stop. With nobody watching, the Script
 blocks on its control input, so nothing is converted, encoded or sent.
 
+Errors: the Script counts failed frames and sends the count with the last error (throttled) on its 'status'
+output; the VIO process publishes them in DIRECTORY/depth_stream.json, which /api/status serves.
+
 depthai-free so it can be unit tested.
 """
 
@@ -44,6 +47,15 @@ CHUNK_ROWS = 50
 CENTER_PATCH = 5
 BOUNDARY = "depthframe"
 RATE_WINDOW_S = 5.0
+REPORT_INTERVAL_S = 1.0
+REPORT_MAX_CHARS = 400
+# ImgFrame methods of the Script runtime in the RVC2 firmware (depthai 3.3.0, device side a406121b);
+# a subset of the host's dai.ImgFrame. Its constructor is ImgFrame(size in bytes).
+DEVICE_IMGFRAME_API = frozenset({
+    "getData", "setData", "getWidth", "setWidth", "getHeight", "setHeight", "setSize", "getType", "setType",
+    "getTimestamp", "getTimestampDevice", "setTimestamp", "getSequenceNum", "setSequenceNum",
+    "getInstanceNum", "setInstanceNum", "getCategory", "setCategory", "getTransformation", "setTransformation",
+})
 
 
 def depth_shift(max_mm):
@@ -96,18 +108,29 @@ def stream_divisor(camera_fps, stream_fps):
     return max(1, int(round(float(camera_fps) / max(float(stream_fps), 1e-3))))
 
 
-def device_script(every, min_mm, max_mm, chunk_rows=CHUNK_ROWS, stats_every=150):
+def device_script(every, min_mm, max_mm, chunk_rows=CHUNK_ROWS, stats_every=150, report_interval=REPORT_INTERVAL_S):
     """
     Script node source: inputs 'depth' (RAW16 mm) and 'control' (Buffer, sequence number 1 = stream,
-    0 = stop); output 'gray' (GRAY8 ImgFrame) for the VideoEncoder. Plain CPython builtins only.
-    While streaming it logs (node.warn, so it reaches the host log) its conversion time every
-    stats_every frames: the measured on-device cost.
+    0 = stop); outputs 'gray' (GRAY8 ImgFrame) for the VideoEncoder and 'status' (Buffer, see
+    parse_device_status) for the host. Plain CPython builtins only.
+
+    Only the on-device message API (the RVC2 firmware's Script bindings, not the host's): ImgFrame(size in
+    bytes) and Buffer(size in bytes), each filled with setData; ImgFrame.setType/setWidth/setHeight (no
+    setStride: GRAY8's stride is the width), setTimestamp/setSequenceNum (no setMetadata or
+    setTimestampDevice); see DEVICE_IMGFRAME_API.
+
+    Errors: each failed frame counts; the first one, then at most one per report_interval, is sent on
+    'status' with the running count, and the 1st and every 100th also go to node.warn (the host log). While
+    streaming it reports (status and node.warn) its conversion time every stats_every frames: the
+    measured on-device cost.
     """
     _, t_hi, t_lo, t_out = encoding_tables(min_mm, max_mm)
     return "\n".join([
         f"every = {int(every)}",
         f"chunk_rows = {int(chunk_rows)}",
         f"STATS_EVERY = {int(stats_every)}",
+        f"REPORT_INTERVAL = {float(report_interval)!r}",
+        f"REPORT_MAX = {int(REPORT_MAX_CHARS)}",
         f"t_hi = {t_hi!r}",
         f"t_lo = {t_lo!r}",
         f"t_out = {t_out!r}",
@@ -130,26 +153,17 @@ def device_script(every, min_mm, max_mm, chunk_rows=CHUNK_ROWS, stats_every=150)
         "        parts.append((hi | lo).to_bytes(rows * width, 'little').translate(t_out))",
         "    return width, height, b''.join(parts)",
         "",
-        "def gray_frame(src, width, height, gray):",
-        "    out = ImgFrame()",
-        "    try:",
-        "        out.setMetadata(src)",
-        "    except Exception:",
-        "        pass",
+        "def gray_frame(width, height, gray):",
+        "    out = ImgFrame(width * height)",
         "    out.setData(gray)",
+        "    out.setType(ImgFrame.Type.GRAY8)",
         "    out.setWidth(width)",
         "    out.setHeight(height)",
-        "    try:",
-        "        out.setStride(width)",
-        "    except Exception:",
-        "        pass",
-        "    out.setType(ImgFrame.Type.GRAY8)",
-        "    for name in ('setTimestamp', 'setTimestampDevice', 'setSequenceNum'):",
-        "        try:",
-        "            getattr(out, name)(getattr(src, 'g' + name[1:])())",
-        "        except Exception:",
-        "            pass",
         "    return out",
+        "",
+        "def copy_metadata(src, out):",
+        "    out.setTimestamp(src.getTimestamp())",
+        "    out.setSequenceNum(src.getSequenceNum())",
         "",
         "try:",
         "    import time",
@@ -163,43 +177,99 @@ def device_script(every, min_mm, max_mm, chunk_rows=CHUNK_ROWS, stats_every=150)
         "sent = 0",
         "busy = 0.0",
         "worst = 0.0",
-        "while True:",
-        "    if not enabled:",
-        "        enabled = node.inputs['control'].get().getSequenceNum() > 0",
-        "        count = every - 1",
-        "        continue",
-        "    control = node.inputs['control'].tryGet()",
-        "    while control is not None:",
-        "        enabled = control.getSequenceNum() > 0",
-        "        control = node.inputs['control'].tryGet()",
-        "    if not enabled:",
-        "        continue",
-        "    frame = node.inputs['depth'].get()",
-        "    count += 1",
-        "    if count < every:",
-        "        continue",
-        "    count = 0",
+        "reported = None",
+        "",
+        "def report(kind, text):",
         "    try:",
+        "        data = (kind + '\\t' + str(errors) + '\\t' + str(sent) + '\\t' + text)[:REPORT_MAX].encode()",
+        "        message = Buffer(len(data))",
+        "        message.setData(data)",
+        "        node.outputs['status'].send(message)",
+        "    except Exception as e:",
+        "        node.warn('depth stream: status not sent: ' + str(e))",
+        "",
+        "def failed(where, e, kind='error'):",
+        "    global errors, reported",
+        "    errors += 1",
+        "    text = where + ': ' + type(e).__name__ + ': ' + str(e)",
+        "    if errors == 1 or errors % 100 == 0 or kind != 'error':",
+        "        node.warn('depth stream: ' + text + ' (' + str(errors) + ' errors)')",
+        "    now = clock() if clock else None",
+        "    if (kind != 'error' or reported is None or (now is None and errors % 100 == 0)",
+        "            or (now is not None and now - reported >= REPORT_INTERVAL)):",
+        "        reported = now if now is not None else 0.0",
+        "        report(kind, text)",
+        "",
+        "try:",
+        "    while True:",
+        "        if not enabled:",
+        "            enabled = node.inputs['control'].get().getSequenceNum() > 0",
+        "            count = every - 1",
+        "            continue",
+        "        control = node.inputs['control'].tryGet()",
+        "        while control is not None:",
+        "            enabled = control.getSequenceNum() > 0",
+        "            control = node.inputs['control'].tryGet()",
+        "        if not enabled:",
+        "            continue",
+        "        frame = node.inputs['depth'].get()",
+        "        count += 1",
+        "        if count < every:",
+        "            continue",
+        "        count = 0",
         "        start = clock() if clock else 0.0",
-        "        width, height, gray = to_gray(frame)",
-        "        node.outputs['gray'].send(gray_frame(frame, width, height, gray))",
+        "        try:",
+        "            width, height, gray = to_gray(frame)",
+        "            out = gray_frame(width, height, gray)",
+        "        except Exception as e:",
+        "            failed('convert', e)",
+        "            frame = None",
+        "            continue",
+        "        try:",
+        "            copy_metadata(frame, out)",
+        "        except Exception as e:",
+        "            failed('metadata', e)",
+        "        frame = None",
+        "        try:",
+        "            node.outputs['gray'].send(out)",
+        "        except Exception as e:",
+        "            failed('send', e)",
+        "            continue",
+        "        out = None",
         "        sent += 1",
         "        if clock:",
         "            took = clock() - start",
         "            busy += took",
         "            worst = max(worst, took)",
         "            if sent % STATS_EVERY == 0:",
-        "                node.warn('depth stream: ' + str(sent) + ' frames, convert + send mean '",
-        "                          + str(round(1000.0 * busy / STATS_EVERY, 1)) + ' ms, max '",
-        "                          + str(round(1000.0 * worst, 1)) + ' ms (' + str(width) + 'x' + str(height) + ')')",
+        "                mean_ms = round(1000.0 * busy / STATS_EVERY, 1)",
+        "                max_ms = round(1000.0 * worst, 1)",
+        "                node.warn('depth stream: ' + str(sent) + ' frames, convert + send mean ' + str(mean_ms)",
+        "                          + ' ms, max ' + str(max_ms) + ' ms (' + str(width) + 'x' + str(height) + ')')",
+        "                report('stats', str(mean_ms) + ' ' + str(max_ms) + ' ' + str(width) + ' ' + str(height))",
         "                busy = 0.0",
         "                worst = 0.0",
-        "    except Exception as e:",
-        "        errors += 1",
-        "        if errors == 1 or errors % 100 == 0:",
-        "            node.warn('depth stream: ' + str(e) + ' (' + str(errors) + ' errors)')",
-        "    frame = None",
+        "except Exception as e:",
+        "    failed('stopped', e, 'fatal')",
+        "    raise",
     ])
+
+
+def parse_device_status(data):
+    """
+    One 'status' message of device_script: tab-separated kind, error count, frames sent, text. kind is
+    'error' (a frame failed; text says where and why), 'fatal' (the Script stopped) or 'stats' (text:
+    mean and max convert + send ms, width, height). None if malformed.
+    """
+    try:
+        kind, errors, sent, text = bytes(data).decode("utf-8", "replace").split("\t", 3)
+        status = {"kind": kind, "errors": int(errors), "sent": int(sent), "text": text}
+        if kind == "stats":
+            mean_ms, max_ms, width, height = text.split()
+            status.update(convert_ms_mean=float(mean_ms), convert_ms_max=float(max_ms), size=[int(width), int(height)])
+    except (TypeError, ValueError):
+        return None
+    return status
 
 
 def center_depth(depth, patch=CENTER_PATCH):
@@ -248,6 +318,9 @@ class DepthStreamService:
         self.bytes = 0
         self.last_frame = None  # (unix time, bytes, sequence)
         self.center = None
+        self.errors = 0
+        self.last_error = None
+        self.device_stats = None
         self.recent = deque()
         self._last_poll = self._last_send = self._last_meta = float("-inf")
         try:
@@ -302,6 +375,27 @@ class DepthStreamService:
             self.recent.popleft()
         return True
 
+    def on_device_status(self, data):
+        """A 'status' message from the device Script: errors (count, last text and time) or its own timing."""
+        now = self.clock()
+        status = parse_device_status(data)
+        if status is None:
+            self.log(f"Depth stream: unreadable status from the camera: {bytes(data)[:80]!r}")
+            return
+        self.errors = max(self.errors, status["errors"])
+        if status["kind"] == "stats":
+            self.device_stats = {"unix_time": now, "frames_sent": status["sent"], "size": status["size"],
+                                 "convert_ms_mean": status["convert_ms_mean"],
+                                 "convert_ms_max": status["convert_ms_max"]}
+        else:
+            fatal = status["kind"] == "fatal"
+            if fatal or self.last_error is None or self.last_error["text"] != status["text"]:
+                self.log(f"Depth stream {'stopped on the camera' if fatal else 'error on the camera'} "
+                         f"({status['errors']} errors, {status['sent']} frames sent): {status['text']}")
+            self.last_error = {"text": status["text"], "unix_time": now, "fatal": fatal, "errors": status["errors"],
+                               "frames_sent": status["sent"]}
+        self.write_meta(now)
+
     def rates(self, now):
         recent = [(t, size) for t, size in self.recent if now - t <= RATE_WINDOW_S]
         if len(recent) < 2:
@@ -316,7 +410,8 @@ class DepthStreamService:
         return {**self.info, "pid": os.getpid(), "unix_time": now, "streaming": self.enabled,
                 "frames_total": self.frames, "bytes_total": self.bytes, "fps": fps, "kbps": kbps,
                 "last_frame": None if last is None else {"unix_time": last[0], "bytes": last[1], "sequence": last[2]},
-                "center": self.center}
+                "center": self.center, "errors": self.errors, "last_error": self.last_error,
+                "device_stats": self.device_stats}
 
     def write_meta(self, now=None):
         now = self.clock() if now is None else now

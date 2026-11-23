@@ -181,10 +181,12 @@ python /app/pnp_vio.py --fps 15 --width 640 --height 400 --num-features 300 --ve
     - That the feature overlay's inliers line up with the image (the overlay is from the last processed frame, one or two frames older than the snapshot).
     - A guarded parameter write on a disarmed vehicle on the bench, and the 409 while armed.
 17. **Live depth stream (task 11):**
-    - The pipeline starts with the stream Script and the MJPEG `VideoEncoder` fed by a GRAY8 `ImgFrame` built in the Script (the setters, `getData()` as bytes/memoryview, and `bytes.translate` on the device Python are untested on hardware).
-    - The Script's "depth stream: N frames, convert + send mean X ms" log: the conversion must stay well under the stream interval (200 ms at 5 fps), and the 10 s VIO fps summary and `proc_ms` should not change with the page's stream on.
+    - test9 (OAK-D-W): `/api/stream/depth` sent 0 bytes; every frame failed on `ImgFrame()` ("incompatible constructor arguments ... lpb.ImgFrame(arg0: int)"). The conversion itself (`getData()`, `bytes.translate`, `int.from_bytes`) ran, since it comes before that call. Task 13 builds the frame with `ImgFrame(width * height)` and only the setters the firmware has (`setData`, `setType`, `setWidth`, `setHeight`, `setTimestamp`, `setSequenceNum`). Check that the stream now shows frames and that `/api/status` → `depth_stream.errors` stays 0; if not, `last_error` has the camera's message.
+    - The Script's "depth stream: N frames, convert + send mean X ms" log (also `depth_stream.device_stats`): the conversion must stay well under the stream interval (200 ms at 5 fps), and the 10 s VIO fps summary and `proc_ms` should not change with the page's stream on.
+    - GRAY8 into the RVC2 MJPEG encoder (the firmware lists GRAY8 among its input types; not seen working yet).
     - `NumFramesPool(6)` on the stereo outputs: no pool stalls.
-    - JPEG size and the browser's colours against `/api/depth_probe` at a few distances.
+    - JPEG size and the browser's colours against `POST /api/depth_probe` at a few distances.
+    - BlueOS: `/helper/v1.0/web_services` answers again with the extension running (task 13 took the streams out of `/openapi.json`).
 
 ## Rectified intrinsics
 

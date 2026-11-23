@@ -74,7 +74,8 @@ def test_page_is_one_self_contained_offline_page(client):
     assert external_urls(page) == set()
     for panel in ("panel-status", "panel-views", "panel-trajectory", "panel-velocity", "panel-vxvy",
                   "panel-inliers", "panel-settings", "panel-autopilot", "plot-dial", "plot-vbar", "ap-dialog",
-                  "panel-depth-stream", "depth-stream-img", "depth-stream-canvas", "depth-legend"):
+                  "panel-depth-stream", "depth-stream-img", "depth-stream-canvas", "depth-legend", "ds-cost",
+                  "ds-errors"):
         assert f'id="{panel}"' in page
     assert "integrated, drifts" in page
     # Every configuration field is in the form
@@ -374,9 +375,27 @@ def test_depth_stream_forwards_the_camera_jpegs(client, tmp_path, streaming_vio)
 def test_status_depth_stream_without_vio(client, tmp_path):
     main, http = client
     status = http.get("/api/status").json()["depth_stream"]
-    assert status == {"enabled": False, "streaming": False, "stale": True, "age_s": None}
+    assert status == {"enabled": False, "streaming": False, "stale": True, "age_s": None, "errors": 0,
+                      "last_error": None}
     save_config(tmp_path, algorithm="pnp")
     assert http.get("/api/status").json()["depth_stream"]["enabled"] is True
+
+
+def test_status_shows_the_camera_scripts_errors(client, tmp_path, streaming_vio):
+    main, http = client
+    service, _ = streaming_vio
+    save_config(tmp_path, algorithm="pnp")
+    running(http)
+    status = http.get("/api/status").json()["depth_stream"]
+    assert status["errors"] == 0 and status["last_error"] is None
+    text = "convert: TypeError: __init__(): incompatible constructor arguments"
+    service.on_device_status(f"error\t12\t0\t{text}".encode())
+    status = http.get("/api/status").json()["depth_stream"]
+    assert status["errors"] == 12 and status["last_error"]["text"] == text
+    assert status["last_error"]["fatal"] is False and abs(status["last_error"]["unix_time"] - time.time()) < 5
+    service.on_device_status(b"stats\t12\t150\t41.5 60.2 640 400")
+    status = http.get("/api/status").json()["depth_stream"]
+    assert status["device_stats"]["convert_ms_mean"] == 41.5 and status["last_error"]["text"] == text
 
 
 def test_depth_stream_settings_reach_the_vio_command(client):

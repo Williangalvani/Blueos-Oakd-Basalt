@@ -41,11 +41,11 @@ def by_name(result):
     return {param["name"]: param for param in result["params"]}
 
 
-# --- GET: read only -------------------------------------------------------------------------------
+# --- POST /api/autopilot/params/read: read only ---------------------------------------------------
 
 def test_get_reads_and_diffs_without_writing(client, vehicle):
     main, http = client
-    response = http.get("/api/autopilot/params")
+    response = http.post("/api/autopilot/params/read")
     assert response.status_code == 200
     result = response.json()
     assert result["armed"] is False and result["heartbeat"]["armed"] is False
@@ -73,7 +73,7 @@ def test_get_reads_and_diffs_without_writing(client, vehicle):
 def test_get_reports_unreadable_params(client, vehicle):
     main, http = client
     del vehicle.params["VISO_ORIENT"]
-    params = by_name(http.get("/api/autopilot/params").json())
+    params = by_name(http.post("/api/autopilot/params/read").json())
     assert params["VISO_ORIENT"]["status"] == "unreadable" and params["VISO_ORIENT"]["current"] is None
     assert params["VISO_ORIENT"]["error"] == "no PARAM_VALUE reply"
     assert params["VISO_TYPE"]["status"] == "differs"
@@ -83,7 +83,7 @@ def test_get_reports_unreadable_params(client, vehicle):
 def test_get_without_mavlink2rest(client, vehicle):
     main, http = client
     vehicle.reachable = False
-    result = http.get("/api/autopilot/params").json()
+    result = http.post("/api/autopilot/params/read").json()
     assert result["heartbeat"]["reachable"] is False and result["armed"] is None
     assert all(p["status"] == "unreadable" and "not reachable" in p["error"] for p in result["params"])
     assert vehicle.posted == []
@@ -92,7 +92,7 @@ def test_get_without_mavlink2rest(client, vehicle):
 def test_get_without_an_autopilot_heartbeat(client, vehicle):
     main, http = client
     vehicle.heartbeat = False
-    result = http.get("/api/autopilot/params").json()
+    result = http.post("/api/autopilot/params/read").json()
     assert result["heartbeat"]["reachable"] is True and result["armed"] is None
     assert all(p["status"] == "unreadable" for p in result["params"])
     assert vehicle.posted == []
@@ -101,7 +101,7 @@ def test_get_without_an_autopilot_heartbeat(client, vehicle):
 def test_get_shows_armed(client, vehicle):
     main, http = client
     vehicle.armed = True
-    result = http.get("/api/autopilot/params").json()
+    result = http.post("/api/autopilot/params/read").json()
     assert result["armed"] is True and vehicle.param_sets() == []
 
 
@@ -181,7 +181,7 @@ def test_post_writes_when_disarmed_and_confirmed(client, vehicle):
     assert sets[1]["param_type"] == {"type": "MAV_PARAM_TYPE_REAL32"}
     assert vehicle.params["VISO_TYPE"] == 1.0
     # A fresh read now agrees
-    params = by_name(http.get("/api/autopilot/params").json())
+    params = by_name(http.post("/api/autopilot/params/read").json())
     assert params["VISO_TYPE"]["status"] == "ok" and params["VISO_POS_X"]["status"] == "ok"
 
 
@@ -216,8 +216,17 @@ def test_nothing_is_written_at_startup_or_by_reading(client, vehicle):
     http.get("/")
     http.get("/api/status")
     http.get("/api/history")
-    http.get("/api/autopilot/params")
+    http.post("/api/autopilot/params/read")
     assert vehicle.param_sets() == []
+
+
+def test_a_get_never_reaches_the_autopilot(client, vehicle):
+    """BlueOS's helper GETs every path in /openapi.json: reading and writing are POST only."""
+    main, http = client
+    response = http.get("/api/autopilot/params")
+    assert response.status_code == 405 and response.headers["allow"] == "POST"
+    assert http.get("/api/autopilot/params/read").status_code == 405
+    assert vehicle.requests == [] and vehicle.param_sets() == []
 
 
 def test_live_armed_state_needs_a_heartbeat_counter(vehicle):

@@ -368,22 +368,22 @@ def test_api_focal_check(client, fake_vio, monkeypatch, tmp_path):
     monkeypatch.setitem(FRAMES, "rect_left", left)
     monkeypatch.setitem(FRAMES, "rect_right", right)
     monkeypatch.setitem(FRAMES, "depth", depth)
-    assert http.get("/api/focal_check").status_code == 503  # no camera status published yet
+    assert http.post("/api/focal_check").status_code == 503  # no camera status published yet
 
     camera = {"source": "rectified", "intrinsics": [163.1, 237.1, 329.4, 199.0],
               "raw": [285.11, 285.05, 323.2, 199.1], "baseline_m": 0.07496, "depth_range_mm": [300, 4000]}
     snapshots.write_camera_status(camera, tmp_path / "snapshots")
-    data = http.get("/api/focal_check").json()
+    data = http.post("/api/focal_check").json()
     assert data["ok"] and data["fx_K"] == 163.1 and 155 < data["f_from_depth"] < 180
     assert data["n_matches"] >= 20 and data["intrinsics_source"] == "rectified"
     assert set(data["device_timestamps"]) == {"rect_left", "rect_right", "depth"}
     assert "not one stereo pair" in data["note"]
 
     snapshots.write_camera_status({**camera, "source": "cam_b", "intrinsics": camera["raw"]}, tmp_path / "snapshots")
-    data = http.get("/api/focal_check").json()
+    data = http.post("/api/focal_check").json()
     assert not data["ok"] and data["ratio"] == pytest.approx(0.59, abs=0.05)
     assert "--intrinsics-from rectified" in data["message"]
-    assert http.get("/api/focal_check?tolerance=2").status_code == 422
+    assert http.post("/api/focal_check?tolerance=2").status_code == 422
 
 
 def test_api_focal_check_times_out_without_vio(client, monkeypatch, tmp_path):
@@ -391,5 +391,5 @@ def test_api_focal_check_times_out_without_vio(client, monkeypatch, tmp_path):
     snapshots.write_camera_status({"intrinsics": [163.1, 237.1, 329.4, 199.0], "baseline_m": 0.075},
                                   tmp_path / "snapshots")
     monkeypatch.setattr(main, "FOCAL_CHECK_TIMEOUT", 0.2)
-    response = http.get("/api/focal_check")
+    response = http.post("/api/focal_check")
     assert response.status_code == 504 and "PnP" in response.json()["detail"]

@@ -254,6 +254,11 @@ function renderStatus(s) {
     const age = isNum(failure.age_s) ? ' ' + (failure.age_s < 60 ? failure.age_s.toFixed(0) + ' s' : (failure.age_s / 60).toFixed(0) + ' min') + ' ago' : '';
     parts.push(span('last fail: ' + String(failure.reason).split(':')[0] + age, failure.age_s < 2 ? 'bad' : 'muted'));
   }
+  if (!s.problem && d.errors) {
+    const error = span('depth: ' + d.errors + ' camera errors', 'bad');
+    if (d.last_error) error.title = d.last_error.text;
+    parts.push(error);
+  }
   line.replaceChildren(...parts);
 
   let message = s.problem || '';

@@ -476,8 +476,10 @@ def test_build_pipeline_encodes_the_depth_stream_on_the_camera(pnp_vio):
 
     stream_script.inputs["control"].createInputQueue.assert_called_once_with(maxSize=4, blocking=False)
     encoder.out.createOutputQueue.assert_called_once_with(maxSize=2, blocking=False)
+    stream_script.outputs["status"].createOutputQueue.assert_called_once_with(maxSize=8, blocking=False)
     assert handles.depth_stream_control_queue is stream_script.inputs["control"].createInputQueue.return_value
     assert handles.depth_stream_queue is encoder.out.createOutputQueue.return_value
+    assert handles.depth_stream_status_queue is stream_script.outputs["status"].createOutputQueue.return_value
     info = handles.depth_stream_info
     assert info["fps_target"] == 5.0 and info["every"] == 3 and info["quality"] == 70
     assert info["depth_range_mm"][1] == 4000 and info["quantization_mm"] == 16
@@ -513,15 +515,19 @@ def test_run_streams_depth_only_while_a_client_watches(pnp_vio, monkeypatch, tmp
     encoded = FakeQueue([SimpleNamespace(getData=lambda: np.frombuffer(b"\xff\xd8jpeg\xff\xd9", np.uint8),
                                          getSequenceNum=lambda: 42)])
     control = FakeQueue()
+    report = b"error\t3\t0\tconvert: TypeError: incompatible constructor arguments"
+    status = FakeQueue([SimpleNamespace(getData=lambda: np.frombuffer(report, np.uint8))])
     info = {"fps_target": 5.0, "quality": 70, "depth_range_mm": [300, 4000]}
     lines, handles = run_fake(pnp_vio, monkeypatch, tmp_path, scenario(n_good=6, n_lost=0, n_back=0), [],
                               depth_stream_control_queue=control, depth_stream_queue=encoded,
-                              depth_stream_info=info)
+                              depth_stream_status_queue=status, depth_stream_info=info)
     # The lease enabled the camera's stream (sequence 1); the run's end leaves it to the device shutdown
     assert [m.setSequenceNum.call_args[0][0] for m in control.sent] == [1]
     assert (telemetry_dir / depth_stream.FRAME_FILE).read_bytes() == b"\xff\xd8jpeg\xff\xd9"
     meta = depth_stream.read_meta(telemetry_dir)
     assert meta["frames_total"] == 1 and meta["last_frame"]["sequence"] == 42 and meta["streaming"] is False
+    # The Script's error report reaches the metadata /api/status serves
+    assert meta["errors"] == 3 and "incompatible constructor" in meta["last_error"]["text"]
     events = {line["event"]: line for line in lines if line["type"] == "event"}
     assert events["depth_stream"]["enabled"] is True and events["depth_stream"]["fps_target"] == 5.0
     # VIO output unchanged

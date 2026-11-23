@@ -266,6 +266,11 @@ def render_page(config: dict) -> str:
     return html
 
 
+# BlueOS's helper GETs every path listed in /openapi.json, every few seconds, reading each body to the end
+# (core/services/helper/main.py, detect_service). A GET route in the schema must therefore answer quickly
+# with a bounded body and start nothing; streams, waits for the camera and anything that starts work are
+# include_in_schema=False, and whatever runs something on the camera or the autopilot is a POST.
+# tests/test_openapi_scan.py enforces this.
 @app.get("/", response_class=HTMLResponse)
 def index():
     """Serve the web UI"""
@@ -360,11 +365,15 @@ def camera_connected(telemetry: Optional[dict]):
 
 
 def depth_stream_status(config: dict, process_status: dict, now: float) -> dict:
-    """The depth stream setting and what the VIO process last published about it (stale if from another run)."""
+    """
+    The depth stream setting and what the VIO process last published about it (stale if from another run).
+    errors counts the camera Script's failed frames; last_error is the latest one (text, unix_time, fatal).
+    """
     meta = depth_stream.read_meta(telemetry_dir()) or {}
     stale = bool(not meta or not process_status.get("running")
                  or (process_status.get("pid") is not None and meta.get("pid") != process_status.get("pid")))
-    return {**meta, "enabled": bool(config.get("depth_stream", True)) and config.get("algorithm") == "pnp",
+    return {"errors": 0, "last_error": None, **meta,
+            "enabled": bool(config.get("depth_stream", True)) and config.get("algorithm") == "pnp",
             "streaming": bool(meta.get("streaming")) and not stale, "stale": stale,
             "age_s": now - float(meta["unix_time"]) if meta.get("unix_time") else None}
 
@@ -414,7 +423,7 @@ def history_columns(rows, now):
     }
 
 
-@app.get("/api/history")
+@app.get("/api/history", include_in_schema=False)
 def get_history(request: Request, seconds: float = Query(60.0, gt=0, le=MAX_HISTORY_SECONDS),
                 max_points: int = Query(MAX_HISTORY_POINTS, ge=10, le=MAX_HISTORY_POINTS),
                 tail: float = Query(0.0, ge=0, le=10.0)):
@@ -481,7 +490,7 @@ def vio_image_size():
     return int(config["resolution_width"]), int(config["resolution_height"])
 
 
-@app.get("/api/snapshot")
+@app.get("/api/snapshot", include_in_schema=False)
 def get_snapshot(stream: Literal[snapshots.STREAMS], raw: bool = False, crosshair: bool = False,
                  x: Optional[float] = None, y: Optional[float] = None, w: Optional[int] = None,
                  h: Optional[int] = None, overlay: bool = False):
@@ -561,7 +570,7 @@ async def depth_stream_parts(directory: Path, limit: int):
         await asyncio.sleep(DEPTH_STREAM_POLL_S)
 
 
-@app.get("/api/stream/depth")
+@app.get("/api/stream/depth", include_in_schema=False)
 async def stream_depth(frames: int = Query(0, ge=0, le=100000)):
     """
     Live depth of the running PnP VIO as multipart/x-mixed-replace MJPEG (for an <img>): the JPEGs the
@@ -615,7 +624,7 @@ async def feature_events(directory: Path, limit: int):
         await asyncio.sleep(DEPTH_STREAM_POLL_S)
 
 
-@app.get("/api/stream/features")
+@app.get("/api/stream/features", include_in_schema=False)
 async def stream_features(events: int = Query(0, ge=0, le=100000)):
     """
     text/event-stream for the Cockpit widget. "features": the PnP tracker's features of a recent frame,
@@ -631,7 +640,7 @@ async def stream_features(events: int = Query(0, ge=0, le=100000)):
                              headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
 
-@app.get("/api/features")
+@app.get("/api/features", include_in_schema=False)
 def get_features():
     """The latest tracked features (as in /api/stream/features); 404 until the VIO process has published them."""
     require_pnp_running("the tracked features")
@@ -644,12 +653,13 @@ def get_features():
     return Response(content=data, media_type="application/json", headers={"Cache-Control": "no-store"})
 
 
-@app.get("/api/depth_probe")
-def get_depth_probe(x: Optional[float] = None, y: Optional[float] = None, w: Optional[int] = None,
-                    h: Optional[int] = None, frames: Optional[int] = None):
+@app.post("/api/depth_probe")
+def post_depth_probe(x: Optional[float] = None, y: Optional[float] = None, w: Optional[int] = None,
+                     h: Optional[int] = None, frames: Optional[int] = None):
     """
     Depth statistics in a w x h ROI centred on pixel (x, y) of the rectified-left grid, over the next
-    `frames` depth frames of the running PnP VIO (defaults: image centre, 41 x 41, 10 frames).
+    `frames` depth frames of the running PnP VIO (defaults: image centre, 41 x 41, 10 frames). POST with
+    the parameters in the query: it runs on the VIO's frames.
     """
     config = require_pnp_running("the depth probe")
     try:
@@ -669,12 +679,13 @@ def get_depth_probe(x: Optional[float] = None, y: Optional[float] = None, w: Opt
     return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
 
-@app.get("/api/focal_check")
-def get_focal_check(tolerance: float = Query(0.15, gt=0.0, lt=1.0)):
+@app.post("/api/focal_check")
+def post_focal_check(tolerance: float = Query(0.15, gt=0.0, lt=1.0)):
     """
     Compare fx of the camera matrix in use with the focal length implied by the device depth
     (f = Z * d / B at row-consistent rect_left/rect_right feature matches). Takes three snapshots
-    about 1 s apart, so the camera and scene must be still.
+    about 1 s apart, so the camera and scene must be still. POST (tolerance in the query): it requests
+    snapshots from the camera.
     """
     camera = snapshots.read_camera_status(SNAPSHOT_DIR)
     if not camera or not camera.get("intrinsics"):
@@ -728,12 +739,13 @@ def remember_vehicle_state(heartbeat: dict):
         vehicle_state.update(armed=heartbeat.get("armed"), detail=heartbeat.get("detail"), checked_at=time.time())
 
 
-@app.get("/api/autopilot/params")
-def get_autopilot_params():
+@app.post("/api/autopilot/params/read")
+def read_autopilot_params():
     """
     The suggested optical-hold parameters (autopilot_params.SUGGESTED_OPTICAL_HOLD_PARAMS) as the autopilot
     has them, via mavlink2rest: current, suggested, status ok/differs/unreadable, rationale, needs_reboot,
-    allowed range; plus the HEARTBEAT armed state. Only reads (PARAM_REQUEST_READ); never writes.
+    allowed range; plus the HEARTBEAT armed state. Only reads (PARAM_REQUEST_READ); never writes. POST
+    because it sends MAVLink requests to the autopilot.
     """
     autopilot = make_autopilot()
     result = autopilot_params.read_suggested_params(autopilot, attempts=AUTOPILOT_ATTEMPTS)
