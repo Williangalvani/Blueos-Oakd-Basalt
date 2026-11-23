@@ -143,6 +143,7 @@ function renderStatus(s) {
   const t = s.telemetry;
   const live = !!(t && !t.stale);
   const cam = s.camera || {};
+  $('pill-mock').hidden = !s.mock;
   if (s.running) pill('pill-vio', 'VIO running', 'g');
   else if (s.restart_in !== null && s.restart_in !== undefined) pill('pill-vio', 'VIO restarting', 'y');
   else pill('pill-vio', 'VIO stopped', 'r');
@@ -150,6 +151,7 @@ function renderStatus(s) {
   else if (s.camera_connected === false) pill('pill-camera', 'camera not connected', 'r');
   else pill('pill-camera', 'camera ?', 'dim');
   if (s.log_only) pill('pill-output', 'LOG-ONLY (no MAVLink output)', 'y');
+  else if (s.mock) pill('pill-output', 'mock output (nothing sent)', 'dim');
   else pill('pill-output', 'sending MAVLink', 'g');
   pill('pill-algorithm', 'algorithm: ' + s.algorithm, 'dim');
 

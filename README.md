@@ -207,10 +207,10 @@ The page is backed by a small HTTP API:
 | GET | `/api/config/schema` | Every setting: `name`, `type`, `min`, `max`, `default`, `help`, `label`, `group`, `choices`, `nullable` |
 | POST | `/api/config` | Validate and save settings (JSON body, same keys; missing keys get defaults) and restart VIO. 422 lists every invalid field: `detail: [{field, msg, loc, type}]`, e.g. `FPS (fps): must be between 1 and 60 (got 0)`; nothing is saved |
 | POST | `/api/log_only` | `{"log_only": true\|false}`: save the setting and restart VIO; 400 for anything else |
-| GET | `/api/status` | Whether the VIO process is running, restarts, whether log-only mode is active (`log_only`, `log_only_forced_by_env`), and for PnP the `camera` matrix in use (`null` until the first frame): the in-air `intrinsics`, `effective_intrinsics`, `refractive_index`, `depth_scale` and `total_depth_scale`. Also `algorithm`, `telemetry` (PnP live status, below; `null` until published, `stale: true` when VIO stopped), `camera_connected`, `chip_temperature_c`, `cpu_percent`, `uptime_s` and the last known `vehicle` armed state |
+| GET | `/api/status` | Whether the VIO process is running, restarts, whether log-only mode is active (`log_only`, `log_only_forced_by_env`), and for PnP the `camera` matrix in use (`null` until the first frame): the in-air `intrinsics`, `effective_intrinsics`, `refractive_index`, `depth_scale` and `total_depth_scale`. Also `algorithm`, `telemetry` (PnP live status, below; `null` until published, `stale: true` when VIO stopped), `camera_connected`, `chip_temperature_c`, `cpu_percent`, `uptime_s`, the last known `vehicle` armed state and `mock` (true in [mock mode](#mock-mode-no-oak-d-no-autopilot)) |
 | GET | `/api/history?seconds=60&max_points=600&tail=0` | PnP plot history, oldest first, `t` in seconds before `server_time`: `vx`, `vy`, `vz` (m/s, body FRD, `null` for rejected frames), integrated `x`, `y`, `yaw`, `inliers`, `ok`. At most `max_points` (≤ 600) over `seconds` (≤ 600); `tail` (≤ 10 s) adds the newest frames at full rate. `dvl` holds the [DVL overlay](#dvl-overlay). Weak `ETag`; `If-None-Match` gives 304 |
 | POST | `/api/autopilot/params/read` | The suggested optical-hold parameters as the vehicle has them, and the HEARTBEAT armed state. Read only (POST because it sends MAVLink requests). See [ArduPilot panel](#ardupilot-panel) |
-| POST | `/api/autopilot/params` | `{"confirm": true, "params": {"NAME": value}}`: guarded write with read-back. See [ArduPilot panel](#ardupilot-panel) |
+| POST | `/api/autopilot/params` | `{"confirm": true, "params": {"NAME": value}}`: guarded write with read-back (403 in mock mode). See [ArduPilot panel](#ardupilot-panel) |
 | GET | `/api/logs` | Data logs: name, size (bytes), mtime (unix time), newest first |
 | GET | `/api/logs/{name}` | Download one data log |
 | POST | `/api/start`, `/api/stop` | Start or stop VIO |
@@ -383,6 +383,33 @@ python app/tools/ui_demo_server.py --log vio-20261118-190503-10.jsonl --port 809
 python app/tools/ui_screenshots.py --url http://127.0.0.1:8099/ --out /tmp/ui
 ```
 
+### Mock mode (no OAK-D, no autopilot)
+
+`OAKD_MOCK=1` runs the extension's own server on a PC (x86 is fine), with the configuration page and the Cockpit widget (`/widget/depth`, `/cockpit_extras.json`, `/register_service`) fully working. Unlike the demo server, it is the normal startup: `main.py` launches [`app/mock_vio.py`](app/mock_vio.py) through the same supervisor, instead of `pnp_vio.py`. The fake VIO publishes through the real telemetry, depth-stream, feature-stream, snapshot and depth-probe services, so every server path runs as with a camera. depthai is never imported.
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt          # tests also need: .venv/bin/pip install pytest httpx
+cd app
+OAKD_MOCK=1 ../.venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8095
+# or: ../.venv/bin/python main.py --mock --host 127.0.0.1 --port 8095
+# open http://127.0.0.1:8095/ and http://127.0.0.1:8095/widget/depth
+```
+
+- **Data:** config, snapshots, telemetry and logs live in `OAKD_MOCK_DIR` (default `/tmp/oakd-vio-mock-<uid>`). On first start the configuration is PnP, 640 x 400 at 10 fps; settings, Start/Stop/Reset and log-only work as usual.
+- **Camera:** a synthetic camera, in `mock_vio.py`:
+  - a panning seabed texture;
+  - depth on a tilted plane whose distance drifts, with three nearer blobs moving across it and no depth in dark spots, the left edge band and outside the stereo range;
+  - a right image warped by the matching disparity.
+- **Features:** tracked features in every state. Most of those on a moving blob are rejected.
+- **Failures:** a turbid spell of 2.5 s every 50 s (counted from the start), where depth drops out and frames fail.
+- **Live data:** telemetry at the configured fps, chip temperature, and the depth MJPEG at `depth_stream_fps`, only while a client holds the lease. The host CPU is the real one.
+- **Snapshots:** each snapshot shows the scene at its request time. The depth probe and the focal check therefore give real results on the synthetic frames. RGB is "not available".
+- **Autopilot:** simulated and read-only (`mock_mode.MockAutopilot`). The HEARTBEAT is always disarmed, and `POST /api/autopilot/params/read` returns fixed values (some differ from the suggestions). `POST /api/autopilot/params` always answers 403 and writes nothing.
+- **DVL:** the overlay is fed by an in-process fake mavlink2rest.
+- **Network:** urllib refuses every URL, so nothing leaves the machine. The fake VIO opens no MAVLink connection; "messages sent" counts what would have been sent.
+- **Visible:** a purple MOCK badge on the page and in the widget's status line, and `"mock": true` in `/api/status` (and in the widget's status events).
+
 ## Log-only mode and data logs
 
 On a vehicle whose EKF already uses ExternalNav (`VISO_TYPE` 1, `EK3_SRC1_VELXY` 6), every `VISION_POSITION_DELTA` the extension sends is fused. To record VIO without affecting the vehicle, turn on log-only mode in any of these ways:
@@ -504,6 +531,7 @@ The image is built in two stages so that the slow part only runs once:
 | `app/dvl_source.py` | Optional DVL velocity overlay read from mavlink2rest |
 | `app/system_stats.py` | Pi CPU load from `/proc/stat` |
 | `app/tools/ui_demo_server.py`, `fake_mavlink2rest.py`, `ui_screenshots.py` | Web UI development: replay server, fake mavlink2rest, screenshots |
+| `app/mock_mode.py`, `app/mock_vio.py` | Mock mode (`OAKD_MOCK=1`): read-only mock autopilot, fake DVL, network block; the fake PnP VIO with a synthetic camera |
 | `app/vio_supervisor.py` | Restarts the VIO process with backoff when it exits unexpectedly |
 | `app/device_open.py` | Waits for the OAK-D and opens it, retrying with backoff |
 | `app/vio_log.py` | Log-only mode selection and the JSONL data logs |

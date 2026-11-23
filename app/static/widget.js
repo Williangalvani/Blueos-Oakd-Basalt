@@ -234,6 +234,7 @@ function renderStatus(s) {
   const line = $('status-line');
   line.hidden = !SHOW_STATUS;
   const parts = [];
+  if (s.mock) parts.push(span('MOCK', 'mock'));
   if (s.problem) {
     parts.push(span(s.problem, 'warn'));
   } else {

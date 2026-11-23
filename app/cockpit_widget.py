@@ -74,8 +74,8 @@ def widget_problem(config, process, telemetry):
     return None
 
 
-def widget_status(problem, telemetry, depth, log_only, now):
-    """The status line of the widget: one small JSON object, sent once a second."""
+def widget_status(problem, telemetry, depth, log_only, now, mock=False):
+    """The status line of the widget: one small JSON object, sent once a second. mock: mock mode (no camera)."""
     telemetry = telemetry if telemetry and not telemetry.get("stale") else {}
     recent = telemetry.get("recent") or {}
     last = telemetry.get("last_frame") or {}
@@ -99,6 +99,7 @@ def widget_status(problem, telemetry, depth, log_only, now):
         "send_rate_hz": output.get("rate_hz"),
         "output_mode": output.get("mode"),
         "log_only": bool(log_only),
+        "mock": bool(mock),
         "depth": {key: depth.get(key) for key in (
             "enabled", "streaming", "fps", "fps_target", "image_size", "depth_range_mm", "gray_far", "gray_near",
             "gray_invalid_below", "errors", "last_error")},

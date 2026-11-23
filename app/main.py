@@ -3,6 +3,7 @@
 BlueOS OAK-D VIO Extension - Web Configuration Interface
 """
 
+import argparse
 import asyncio
 import os
 import json
@@ -25,6 +26,7 @@ import depth_probe
 import depth_stream
 import dvl_source
 import feature_stream
+import mock_mode
 import snapshots
 import system_stats
 import vio_log
@@ -63,6 +65,8 @@ WIDGET_STATUS_INTERVAL_S = 1.0
 AUTOPILOT_TIMEOUT = 1.0
 AUTOPILOT_ATTEMPTS = 2
 HEARTBEAT_WAIT = 2.5
+# Mock mode (mock_mode.py): no camera, no autopilot; set by OAKD_MOCK=1 or --mock (enable_mock_mode)
+MOCK = False
 
 app = FastAPI(title="OAK-D VIO Configuration")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -180,21 +184,26 @@ def build_vio_command(config: dict) -> list:
 
 
 def launch_vio() -> subprocess.Popen:
-    """Launch the VIO process for the saved configuration"""
+    """Launch the VIO process for the saved configuration (mock_vio.py in mock mode)"""
     config = load_config()
     cmd = build_vio_command(config)
 
     env = os.environ.copy()
-    env["PYTHONPATH"] = "/app/depthai-python"
     env["PYTHONUNBUFFERED"] = "1"
-    
+    if MOCK:
+        cmd = mock_mode.vio_command(cmd, SNAPSHOT_DIR, vio_log.LOG_DIR)
+        cwd = str(mock_mode.APP_DIR)
+    else:
+        env["PYTHONPATH"] = "/app/depthai-python"
+        cwd = "/app"
+
     # stdout/stderr are inherited so VIO logs reach the container output
     process = subprocess.Popen(
         cmd,
         env=env,
-        cwd="/app"
+        cwd=cwd
     )
-    mode = " (LOG-ONLY)" if "--log-only" in cmd else ""
+    mode = (" (LOG-ONLY)" if "--log-only" in cmd else "") + (" (MOCK)" if MOCK else "")
     print(f"Started {config['algorithm']} VIO process with PID {process.pid}{mode}", flush=True)
     return process
 
@@ -213,6 +222,28 @@ dvl_poller = dvl_source.DvlPoller()
 # Armed state from the ArduPilot panel's last read or write (no polling of its own)
 vehicle_state = {"armed": None, "detail": "not read yet", "checked_at": None}
 vehicle_state_lock = threading.Lock()
+
+
+def enable_mock_mode(directory=None):
+    """
+    Mock mode (see mock_mode.py): data under `directory` (default mock_mode.data_dir()), mock_vio.py instead of
+    the camera, the mock autopilot and DVL, and urllib refusing every request. Call before serving.
+    """
+    global MOCK, CONFIG_FILE, SNAPSHOT_DIR, TELEMETRY_DIR, dvl_poller
+    root = Path(directory) if directory is not None else mock_mode.data_dir()
+    for name in ("snapshots", "telemetry", "logs"):
+        (root / name).mkdir(parents=True, exist_ok=True)
+    MOCK = True
+    CONFIG_FILE = root / "config.json"
+    SNAPSHOT_DIR = root / "snapshots"
+    TELEMETRY_DIR = root / "telemetry"
+    vio_log.LOG_DIR = root / "logs"
+    if not CONFIG_FILE.exists():
+        save_config({**DEFAULT_CONFIG, **mock_mode.INITIAL_CONFIG})
+    dvl_poller = dvl_source.DvlPoller(fetch=mock_mode.dvl_fetch)
+    mock_mode.block_network()
+    remember_vehicle_state(mock_mode.MockAutopilot().heartbeat_status())
+    print(f"MOCK MODE: no camera, no autopilot; data in {root}", flush=True)
 
 
 def start_vio():
@@ -385,6 +416,8 @@ def get_status():
     telemetry (rates, failures by reason, output, chip temperature), host CPU load and the last known
     armed state. telemetry is null until the PnP VIO publishes; stale when it stopped.
     """
+    if MOCK:
+        remember_vehicle_state(mock_mode.MockAutopilot().heartbeat_status())
     now = time.time()
     process = supervisor.status()
     vio_telemetry.touch_lease(vio_telemetry.STATUS_LEASE, telemetry_dir())
@@ -394,6 +427,7 @@ def get_status():
     started = telemetry.get("started_at") if telemetry else None
     config = load_config()
     return {
+        "mock": MOCK,
         **process,
         **log_only_status(config),
         "camera": snapshots.read_camera_status(SNAPSHOT_DIR),
@@ -595,7 +629,7 @@ def widget_status_now() -> dict:
     telemetry = live_telemetry(process, now)
     return cockpit_widget.widget_status(cockpit_widget.widget_problem(config, process, telemetry), telemetry,
                                         depth_stream_status(config, process, now),
-                                        log_only_status(config)["log_only"], now)
+                                        log_only_status(config)["log_only"], now, mock=MOCK)
 
 
 async def feature_events(directory: Path, limit: int):
@@ -731,6 +765,8 @@ def post_focal_check(tolerance: float = Query(0.15, gt=0.0, lt=1.0)):
 
 
 def make_autopilot() -> AutopilotParams:
+    if MOCK:
+        return mock_mode.MockAutopilot()
     return AutopilotParams(load_config().get("vehicle_ip", "127.0.0.1"), timeout=AUTOPILOT_TIMEOUT)
 
 
@@ -760,8 +796,10 @@ def post_autopilot_params(body=Body(...)):
     Write suggested parameters: {"confirm": true, "params": {"NAME": value, ...}}. 400 without confirm, for
     names outside the suggested table or values outside their range; 409 (nothing written) unless a new
     HEARTBEAT arrives and says disarmed. Each written parameter is read back. Returns changed
-    [{name, old, new, readback}], failed, unchanged and reboot_required.
+    [{name, old, new, readback}], failed, unchanged and reboot_required. Mock mode: always 403, nothing written.
     """
+    if MOCK:
+        return JSONResponse({"detail": mock_mode.WRITE_REFUSED, "mock": True}, status_code=403)
     if not isinstance(body, dict) or body.get("confirm") is not True:
         raise HTTPException(status_code=400, detail='writing needs {"confirm": true, "params": {...}}')
     problems = autopilot_params.validate_param_values(body.get("params"))
@@ -812,5 +850,21 @@ async def shutdown_event():
     supervisor.shutdown()
 
 
+if mock_mode.enabled():
+    enable_mock_mode()
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="OAK-D VIO web server")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=WEB_PORT)
+    parser.add_argument("--mock", action="store_true",
+                        help="mock mode: no camera, no autopilot (same as OAKD_MOCK=1; data in OAKD_MOCK_DIR)")
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=WEB_PORT)
+    args = parse_args()
+    if args.mock and not MOCK:
+        enable_mock_mode()
+    uvicorn.run(app, host=args.host, port=args.port)

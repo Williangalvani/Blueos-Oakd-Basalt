@@ -4,6 +4,8 @@ import sys
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+# main.py enters mock mode on import if this is set; test_mock_mode.py starts its own mock servers
+os.environ.pop("OAKD_MOCK", None)
 
 import vio_telemetry  # noqa: E402
 

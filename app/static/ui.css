@@ -5,6 +5,8 @@ header { background: #1b2230; padding: 10px 20px; display: flex; gap: 12px; alig
 h1 { font-size: 18px; margin: 0; }
 .header-right { margin-left: auto; }
 .pill { padding: 2px 10px; border-radius: 12px; font-size: 12px; background: #34425a; white-space: nowrap; }
+.pill.mock { background: #7a3db8; font-weight: 700; letter-spacing: 0.05em; }
+.pill[hidden] { display: none; }
 .pill.g { background: #1e7a46; } .pill.y { background: #8a6d0b; } .pill.r { background: #9b2c1f; } .pill.dim { background: #2c3647; }
 .log-only { background: #3a2e0b; color: #ffd54f; border-bottom: 1px solid #8a6d0b; padding: 6px 20px; font-weight: 600; font-size: 13px; }
 main { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 14px; padding: 16px 20px; max-width: 1800px; margin: 0 auto; }
