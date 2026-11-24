@@ -87,6 +87,10 @@ CONFIG_FIELDS = (
                 "the gap; 0 = no limit", minimum=0.0, maximum=10.0, step=0.1),
     ConfigField("num_features", "int", 300, "PnP Features", "PnP only: features tracked on the camera",
                 minimum=50, maximum=1000, step=1),
+    ConfigField("max_features", "int", 0, "PnP Max Features",
+                "PnP only: hard cap on the features the camera detects per frame (FeatureTracker numMaxFeatures); "
+                "0 = depthai's automatic maximum. Each feature costs about 64 B on the link at every frame (the "
+                "message has no smaller form) and one ROI in points mode", minimum=0, maximum=1000, step=1),
     ConfigField("tracking_recovery_frames", "int", 20, "PnP Recovery After (frames)",
                 "PnP only: consecutive failed frames before the tracker is re-initialised; 0 disables",
                 minimum=0, maximum=1000, step=1),
@@ -106,15 +110,16 @@ CONFIG_FIELDS = (
                 "PnP only: wins over the source; pixels on the width x height grid. Empty = off", nullable=True,
                 placeholder="fx,fy,cx,cy"),
     ConfigField("depth_transport", "choice", "points", "PnP Depth Transport",
-                "PnP only: points = the camera computes the depth at the tracked features (a 5x5 median per "
+                "PnP only: points = the camera computes the depth at the tracked features (a 5x5 average per "
                 "feature) and sends only those (~2 Mbps instead of ~40 at 640x400 10 fps); full depth frames cross "
                 "the link only while the depth probe runs or someone watches a host_jpeg stream. full_frame = every "
                 "depth frame goes to the Pi (the previous behaviour, for comparison)", choices=DEPTH_TRANSPORTS),
     ConfigField("depth_points_rois", "choice", "host", "PnP Depth Points ROIs",
                 "PnP, points only: who lists the per-feature windows for the camera. host = the Pi (from the "
-                "features it receives anyway; a few kB per frame up the link, almost no camera CPU); camera = a "
-                "Script on the camera (no upstream traffic, but ~84 ms of the camera's Leon CPU per 300 features "
-                "estimated: may not keep up above ~10 fps)", choices=DEPTH_POINTS_ROIS),
+                "features it receives anyway; a few kB per frame up the link, almost no camera CPU); camera = SLOW: "
+                "a Script on the camera builds them (no upstream traffic, but ~110 ms of the camera's Leon CPU per "
+                "frame of ~255 features measured: under 10 fps, and the camera's CPU is then saturated)",
+                choices=DEPTH_POINTS_ROIS),
     ConfigField("snapshots", "bool", True, "Snapshots",
                 "PnP only: on-demand camera snapshots (live views); no bandwidth until requested"),
     ConfigField("snapshot_encoding", "choice", "camera_jpeg", "Snapshot Encoding",

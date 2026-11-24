@@ -604,6 +604,19 @@ def test_depth_transport_settings_reach_the_vio_command(client):
     # A hand-edited config.json falls back to the default
     command = main.build_vio_command({**pnp, "depth_transport": "pigeons"})
     assert command[command.index("--depth-transport") + 1] == "points"
+
+
+def test_max_features_reaches_the_vio_command(client):
+    main, http = client
+    pnp = {**main.DEFAULT_CONFIG, "algorithm": "pnp"}
+    assert pnp["max_features"] == 0
+    command = main.build_vio_command(pnp)
+    assert command[command.index("--max-features") + 1] == "0"
+    command = main.build_vio_command({**pnp, "max_features": 220})
+    assert command[command.index("--max-features") + 1] == "220"
+    # A config.json saved before the setting existed
+    del pnp["max_features"]
+    assert main.build_vio_command(pnp)[main.build_vio_command(pnp).index("--max-features") + 1] == "0"
     assert http.post("/api/config", json={**pnp, "depth_transport": "pigeons"}).status_code == 422
     assert http.post("/api/config", json={**pnp, "depth_transport": "full_frame"}).status_code == 200
     transport = http.get("/api/status").json()["depth_transport"]

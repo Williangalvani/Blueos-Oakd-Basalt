@@ -101,6 +101,9 @@ def parse_args(argv=None):
 
     parser.add_argument('--num-features', type=int, default=300,
                         help='Target number of features tracked on the camera')
+    parser.add_argument('--max-features', type=int, default=0,
+                        help='Hard cap on the features detected per frame (FeatureTracker numMaxFeatures); 0 = '
+                             "depthai's automatic maximum")
     parser.add_argument('--corner-detector', choices=sorted(CORNER_DETECTORS), default='harris')
     parser.add_argument('--intrinsics-from', choices=INTRINSICS_SOURCES, default='rectified',
                         help='Rectified-left camera matrix: "rectified" computes it from the CAM_B calibration and the '
@@ -173,8 +176,8 @@ def parse_args(argv=None):
     parser.add_argument('--depth-points-rois', choices=depth_points.ROI_SOURCES,
                         default=depth_points.DEFAULT_ROI_SOURCE,
                         help='points only: who builds the per-feature ROI list: host (the Pi, from the features it '
-                             'receives anyway; a few kB/frame up the link) or camera (a Script on the camera\'s '
-                             'Leon CPU, ~84 ms per 300 features estimated)')
+                             'receives anyway; ~12 kB/frame up the link) or camera (slow: a Script on the camera\'s '
+                             'Leon CPU, 111 ms per frame of ~255 features on test16b)')
 
     parser.add_argument('--pose-attitude-source', choices=pose_stream.ATTITUDE_MODES, default='autopilot',
                         help='Attitude of the 3D pose viewer: autopilot (ArduPilot ATTITUDE read from '
@@ -437,6 +440,14 @@ def lever_arm_fields(position_delta, R_gyro, R_pnp, args):
 def configure_feature_tracker(config, args, maintainer=True):
     config.setCornerDetector(CORNER_DETECTORS[args.corner_detector])
     config.setNumTargetFeatures(args.num_features)
+    if args.max_features > 0:
+        # numMaxFeatures is only reachable through a whole CornerDetector (no setter); its other fields are the
+        # defaults the two calls above leave
+        detector = dai.FeatureTrackerConfig.CornerDetector()
+        detector.type = CORNER_DETECTORS[args.corner_detector]
+        detector.numTargetFeatures = args.num_features
+        detector.numMaxFeatures = args.max_features
+        config.setCornerDetector(detector)
     config.setMotionEstimator(True)
     config.setOpticalFlow()  # Lucas-Kanade; keeps feature ids across frames
     config.setFeatureMaintainer(maintainer)  # default minimum distance between features (50)
@@ -656,8 +667,9 @@ def build_depth_points(p, stereo, feature_tracker, args):
     points: the Script (depth_points.device_script) pairing each request with its depth frame, and the
     SpatialLocationCalculator it feeds in lockstep (blocking size-1 inputs both ways, inputConfig waiting for a
     message, so exactly one config and one depth frame are in flight). The Script's depth input is
-    non-blocking (DEPTH_QUEUE frames: the request may come a little after its frame). rois "host": the configs
-    come from the host's 'rois' queue; "camera": the Script builds them from the FeatureTracker output.
+    non-blocking and holds the newest DEPTH_BUFFER frames (a request comes up to WAIT_PERIODS after its frame).
+    rois "host": the tags and configs come from the host's 'rois' queue (ROIS_QUEUE: REQUESTS_AHEAD of each);
+    "camera": the Script builds the configs from the FeatureTracker output.
 
     Returns (points queue, status queue, rois queue or None).
     """
@@ -666,7 +678,7 @@ def build_depth_points(p, stereo, feature_tracker, args):
     slc = p.create(dai.node.SpatialLocationCalculator)
     stereo.depth.link(script.inputs["depth"])
     script.inputs["depth"].setBlocking(False)
-    script.inputs["depth"].setMaxSize(depth_points.DEPTH_QUEUE)
+    script.inputs["depth"].setMaxSize(depth_points.DEPTH_BUFFER)
     rois_queue = None
     if args.depth_points_rois == depth_points.ROIS_CAMERA:
         feature_tracker.outputFeatures.link(script.inputs["features"])
@@ -674,8 +686,8 @@ def build_depth_points(p, stereo, feature_tracker, args):
         script.inputs["features"].setMaxSize(2)
     else:
         script.inputs["rois"].setBlocking(False)
-        script.inputs["rois"].setMaxSize(4)
-        rois_queue = script.inputs["rois"].createInputQueue(maxSize=4, blocking=False)
+        script.inputs["rois"].setMaxSize(depth_points.ROIS_QUEUE)
+        rois_queue = script.inputs["rois"].createInputQueue(maxSize=depth_points.ROIS_QUEUE, blocking=False)
     for name, slc_input in (("config", slc.inputConfig), (depth_points.SLC_DEPTH_OUT, slc.inputDepth)):
         script.outputs[name].link(slc_input)
         slc_input.setBlocking(True)
@@ -873,7 +885,7 @@ class FullFrameSource:
         ids, uv = tracked_arrays(features_msg)
         depth = depth_msg.getFrame()
         self.link_streams.add("depth", link_stats.frame_bytes(link_stats.data_bytes(depth_msg)))
-        self.link_streams.add("features", link_stats.features_bytes(len(ids)))
+        self.link_streams.add("features", link_stats.features_bytes(ids))
         self.link_streams.add("sync_group", link_stats.MESSAGE_GROUP_OVERHEAD)
         self.gaps.add(sequence)
         self.depth_frames += 1
@@ -887,10 +899,23 @@ class FullFrameSource:
                 "feature_gap_frames": self.gaps.frames}
 
 
+@dataclass
+class FetchedFeatures:
+    """A features message PointsSource took from the queue, with its depth already requested."""
+    msg: object
+    ids: np.ndarray
+    uv: np.ndarray
+    requested: bool
+
+
 class PointsSource:
     """
     points: the features straight from the FeatureTracker, then the camera's depth at them
-    (depth_points.DepthPointsReceiver: rois "host" sends this frame's ROI config first). t is the features'
+    (depth_points.DepthPointsReceiver: rois "host" sends each frame's tag and ROI config). Each features message
+    is requested as soon as it is fetched: get() takes the messages already queued and requests them, then
+    hands out the oldest, so when the Pi falls behind the camera already works on the next frames while the Pi
+    solves this one. At most REQUESTS_AHEAD are requested and not yet handed out (what the camera's 'rois' queue
+    holds); queued messages beyond that are dropped unrequested (host_behind_dropped). t is the features'
     device timestamp: the end of the exposure (a TrackedFeatures message has no exposure time), the same
     for every frame, so the deltas' dt are unchanged.
     """
@@ -901,27 +926,52 @@ class PointsSource:
         self.link_streams = link_streams
         self.image_size = (args.width, args.height)
         self.fallback_size = (args.width // max(decimation, 1), args.height // max(decimation, 1))
+        self.ahead = deque()
+        self.ahead_max = self.behind_dropped = 0
         thresholds = depth_points.thresholds_mm(args.min_depth, args.max_depth)
         rois_queue = handles.rois_queue
 
-        def send_config(config):
-            rois_queue.send(config)
+        def send(message):
+            rois_queue.send(message)
 
         def counted(rows):
             link_streams.add("depth_points", link_stats.spatial_data_bytes(0 if rows is None else len(rows)))
 
         self.receiver = depth_points.DepthPointsReceiver(
-            handles.points_queue, self.image_size, args.depth_points_rois, wait_s=points_wait_s(args.fps),
-            send_config=send_config if rois_queue is not None else None,
+            handles.points_queue, self.image_size, args.depth_points_rois,
+            wait_s=depth_points.wait_s(args.fps, args.depth_points_rois),
+            send=send if rois_queue is not None else None,
             build_config=lambda windows, limits, sequence: depth_points.make_config(dai, windows, limits, sequence),
+            build_tag=lambda sequence: depth_points.make_tag(dai, sequence),
             thresholds=thresholds, frame_period_s=1.0 / max(args.fps, 1), log=log, on_message=counted)
 
+    def _fetched(self, msg):
+        self.on_status()
+        ids, uv = tracked_arrays(msg)
+        self.link_streams.add("features", link_stats.features_bytes(ids))
+        receiver = self.receiver
+        requested = receiver.request(msg.getSequenceNum(), uv)
+        if requested and receiver.roi_source == depth_points.ROIS_HOST:
+            self.link_streams.add("depth_points_rois", link_stats.points_request_bytes(len(ids) + depth_points.EXTRA_ROIS))
+        return FetchedFeatures(msg, ids, uv, requested)
+
     def get(self):
-        return self.queue.get()
+        if not self.ahead:
+            self.ahead.append(self._fetched(self.queue.get()))
+        more = self.queue.tryGetAll()
+        room = depth_points.REQUESTS_AHEAD - len(self.ahead)
+        if len(more) > room:
+            # Never more requests in flight than the camera's 'rois' queue holds: the newest that fit are taken
+            self.behind_dropped += len(more) - room
+            more = more[len(more) - room:] if room > 0 else []
+        for msg in more:
+            self.ahead.append(self._fetched(msg))
+        self.ahead_max = max(self.ahead_max, len(self.ahead))
+        return self.ahead.popleft()
 
     @staticmethod
-    def stamp(features_msg):
-        return features_msg.getSequenceNum(), features_msg.getTimestampDevice().total_seconds()
+    def stamp(item):
+        return item.msg.getSequenceNum(), item.msg.getTimestampDevice().total_seconds()
 
     def on_status(self):
         if self.handles.points_status_queue is None:
@@ -931,29 +981,20 @@ class PointsSource:
             self.link_streams.add("depth_points_status", link_stats.buffer_bytes(len(data)))
             self.receiver.on_status(data)
 
-    def frame(self, features_msg, sequence, t):
+    def frame(self, item, sequence, t):
         self.on_status()
-        ids, uv = tracked_arrays(features_msg)
-        self.link_streams.add("features", link_stats.features_bytes(len(ids)))
         receiver = self.receiver
-        requested = receiver.request(sequence, uv)
-        if requested and receiver.roi_source == depth_points.ROIS_HOST:
-            self.link_streams.add("depth_points_rois", link_stats.spatial_config_bytes(len(ids) + depth_points.EXTRA_ROIS))
         try:
-            features_ts = features_msg.getTimestamp().total_seconds()
+            features_ts = item.msg.getTimestamp().total_seconds()
         except Exception:
             features_ts = None
-        points, problem = receiver.take(sequence, uv, features_ts, requested=requested)
+        points, problem = receiver.take(sequence, item.uv, features_ts, requested=item.requested)
         size = points.depth_size if points is not None else (receiver.depth_size or self.fallback_size)
-        return FrameInput(sequence, t, ids, uv, (size[1], size[0]), points=points, depth_problem=problem)
+        return FrameInput(sequence, t, item.ids, item.uv, (size[1], size[0]), points=points, depth_problem=problem)
 
     def status(self):
-        return self.receiver.status()
-
-
-def points_wait_s(fps):
-    """How long the host waits for a frame's depth points: three frame periods, at least 0.25 s."""
-    return max(0.25, 3.0 / max(float(fps), 1.0))
+        return {**self.receiver.status(), "requested_ahead_max": self.ahead_max,
+                "host_behind_dropped": self.behind_dropped}
 
 
 def frame_depths(frame_in, params):
@@ -1237,7 +1278,8 @@ def run_session(device, args, log_only, data_log, stereo_settings, telemetry, ma
                 logger.info("Depth transport: full_frame (every depth frame to the Pi)")
             data_log.event("depth_transport", transport=handles.depth_transport,
                            rois=args.depth_points_rois if points_mode else None,
-                           wait_s=points_wait_s(args.fps) if points_mode else None)
+                           wait_s=depth_points.wait_s(args.fps, args.depth_points_rois) if points_mode else None,
+                           depth_buffer_frames=depth_points.DEPTH_BUFFER if points_mode else None)
             telemetry.depth_points_status = lambda: {**source.status(),
                                                      "full_depth": gate.status() if gate is not None else None}
             stats.depth_summary = lambda: depth_summary(source.status(), telemetry.camera_load_value)

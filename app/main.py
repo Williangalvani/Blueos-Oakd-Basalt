@@ -205,6 +205,7 @@ def build_vio_command(config: dict) -> list:
             "python", "-u", "/app/pnp_vio.py",
             *common_args,
             "--num-features", str(config["num_features"]),
+            "--max-features", str(int(config.get("max_features", DEFAULT_CONFIG["max_features"]))),
             "--min-inliers", str(int(config.get("min_inliers", DEFAULT_CONFIG["min_inliers"]))),
             "--recovery-frames", str(int(config["tracking_recovery_frames"])),
             "--max-reference-age", str(float(config["max_reference_age"])),

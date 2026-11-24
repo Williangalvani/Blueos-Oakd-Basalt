@@ -3,6 +3,7 @@ import os
 import sys
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -266,6 +267,21 @@ def test_size_estimates():
                                                         "depth_stream", "depth_stream_status", "device_log"))
 
 
+def test_feature_sizes_follow_the_libnop_integer_widths():
+    # libnop: < 128 in the prefix byte, then 1 + 1 / 2 / 4 / 8 bytes
+    assert link_stats.uint_bytes([0, 127, 128, 255, 256, 65535, 65536, 2 ** 32 - 1, 2 ** 32]).tolist() == \
+        [1, 1, 2, 2, 3, 3, 5, 5, 9]
+    ids = np.array([5, 200, 1000, 70000])
+    fixed = link_stats.TRACKED_FEATURE_FIXED_BYTES + link_stats.FEATURE_AGE_BYTES
+    assert link_stats.features_bytes(ids) == link_stats.TRACKED_FEATURES_OVERHEAD + 4 * fixed + 1 + 2 + 3 + 5
+    # A count: ids of 3 bytes (what a tracker running for a while has), the 64 B per feature of test15
+    assert link_stats.features_bytes(255) == link_stats.TRACKED_FEATURES_OVERHEAD + 255 * 64
+    assert link_stats.features_bytes(np.zeros(0, np.int64)) == link_stats.TRACKED_FEATURES_OVERHEAD
+    # Every message pays the 24 B trailer: datatype, metadata size, the 16 B end-of-packet marker
+    assert link_stats.TRAILER_BYTES == 24 and link_stats.buffer_bytes(0) == link_stats.BUFFER_OVERHEAD
+    assert link_stats.points_request_bytes(303) == link_stats.BUFFER_OVERHEAD + link_stats.spatial_config_bytes(303)
+
+
 def test_summary_for_the_periodic_log_line():
     clock, profiling = FakeClock(), FakeProfiling()
     monitor = LinkMonitor(clock=clock)
@@ -312,5 +328,5 @@ def test_upstream_streams_are_marked_and_summed_apart():
                                                           + by_name["control"]["mbps"])
     assert link_stats.UP_STREAMS == {"depth_points_rois", "control"}
     # 303 ROIs (300 features + 3): ~27 kB down and ~14 kB up per frame
-    assert link_stats.spatial_data_bytes(303) == 48 + 303 * 90
-    assert link_stats.spatial_config_bytes(303) == 40 + 303 * 45
+    assert link_stats.spatial_data_bytes(303) == 64 + 303 * 90
+    assert link_stats.spatial_config_bytes(303) == 56 + 303 * 45

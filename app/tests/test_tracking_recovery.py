@@ -857,7 +857,8 @@ def test_run_counts_each_host_queue_for_the_link_breakdown(pnp_vio, monkeypatch,
     totals = telemetry.link.streams.totals()
     frames = len(groups)
     assert totals["depth"] == (frames, frames * link_stats.frame_bytes(DEPTH.nbytes))
-    assert totals["features"] == (frames, frames * link_stats.features_bytes(len(GOOD_UV)))
+    # Counted from the ids (1 byte each below 128)
+    assert totals["features"] == (frames, frames * link_stats.features_bytes(np.arange(len(GOOD_UV))))
     assert totals["sync_group"] == (frames, frames * link_stats.MESSAGE_GROUP_OVERHEAD)
     assert totals["imu"] == (2, sum(link_stats.imu_bytes(len(m.packets)) for m in imu))
     assert totals["depth_stream"] == (2, 2 * link_stats.encoded_bytes(len(jpeg)))
@@ -1493,7 +1494,8 @@ def test_build_pipeline_points_sends_no_depth_frames(pnp_vio):
         port.setBlocking.assert_called_with(True)
         port.setMaxSize.assert_called_with(1)
     points_script.inputs["depth"].setBlocking.assert_called_with(False)
-    points_script.inputs["depth"].setMaxSize.assert_called_with(depth_points.DEPTH_QUEUE)
+    points_script.inputs["depth"].setMaxSize.assert_called_with(depth_points.DEPTH_BUFFER)
+    points_script.inputs["rois"].setMaxSize.assert_called_with(depth_points.ROIS_QUEUE)
     # rois "host": the Pi's configs go up into the Script; the tracker's features only go to the Pi
     assert handles.rois_queue is not None and handles.features_queue is not None
     assert mock.call(points_script.inputs["features"]) not in tracker.outputFeatures.link.call_args_list
@@ -1529,30 +1531,44 @@ class PointsQueue(FakeQueue):
         return None
 
 
+class KeptUpQueue(FakeQueue):
+    """The features queue of a Pi that keeps up: nothing more is queued when it asks (FakePipeline runs on it)."""
+
+    def tryGetAll(self):
+        return []
+
+
 def run_fake_points(module, monkeypatch, tmp_path, frames, argv=(), drop=(), corrupt=(), full_depth=(), **fields):
     """
     pnp_vio in points mode on fakes: the tracker's features (frames: (sequence, t, features)), and a camera that
-    answers each ROI config the Pi sends with the strict fake SLC on DEPTH, re-tagged as the Script does,
-    except for the sequences in drop (no answer) and corrupt (ROIs moved by 10 px).
+    gets what the Pi sends through slc_fakes.over_link (a config's own sequence number reads 0), pairs each
+    config with the tag before it as the Script does, and answers with the strict fake SLC on DEPTH, re-tagged
+    with the frame, except for the sequences in drop (no answer) and corrupt (ROIs moved by 10 px).
     """
     import slc_fakes
     for name in ("SpatialLocationCalculatorConfig", "SpatialLocationCalculatorConfigData",
-                 "SpatialLocationCalculatorAlgorithm", "Rect"):
+                 "SpatialLocationCalculatorAlgorithm", "Rect", "Buffer"):
         monkeypatch.setattr(module.dai, name, getattr(slc_fakes.FAKE_DAI, name))
     times = {sequence: t for sequence, t, _ in frames}
-    features_queue = FakeQueue([FeaturesMsg(s, t, features=f) for s, t, f in frames])
+    features_queue = KeptUpQueue([FeaturesMsg(s, t, features=f) for s, t, f in frames])
     points_queue = PointsQueue()
     rois_queue = FakeQueue()
+    rois_queue.tags = []
 
-    def camera(config):
-        rois_queue.sent.append(config)
-        sequence = config.getSequenceNum()
+    def camera(message):
+        rois_queue.sent.append(message)
+        received = slc_fakes.over_link(message)
+        if not isinstance(received, slc_fakes.Config):
+            rois_queue.tags.append(received.getSequenceNum())
+            return
+        assert received.getSequenceNum() == 0 and rois_queue.tags, "a config without its tag"
+        sequence = rois_queue.tags.pop()
         if sequence in drop:
             return
         if sequence in corrupt:
-            for roi in config.rois:
+            for roi in received.rois:
                 roi.roi.x = min(roi.roi.x + 10, WIDTH - roi.roi.width)
-        points_queue.items.append(slc_fakes.answer(config, DEPTH, times[sequence]))
+        points_queue.items.append(slc_fakes.answer(received, DEPTH, times[sequence], sequence))
 
     rois_queue.send = camera
     # The gate forwards full depth frames once told to (control sequence number > 0)
@@ -1561,7 +1577,7 @@ def run_fake_points(module, monkeypatch, tmp_path, frames, argv=(), drop=(), cor
 
     def control(msg):
         gate_control.sent.append(msg)
-        if msg.setSequenceNum.call_args[0][0] > 0:
+        if msg.getSequenceNum() > 0:
             gate_out.items.extend(waiting)
             waiting.clear()
 
@@ -1576,7 +1592,6 @@ def run_fake_points(module, monkeypatch, tmp_path, frames, argv=(), drop=(), cor
     monkeypatch.setattr(module, "build_pipeline", lambda p, device, args, settings: handles)
     monkeypatch.setattr(module.dai, "Pipeline", lambda device: FakePipeline(features_queue))
     monkeypatch.setattr(module.dai, "FeatureTrackerConfig", lambda: mock.MagicMock())
-    monkeypatch.setattr(module.dai, "Buffer", lambda: mock.MagicMock())
     module.main(["--log-only", "--gyro-gate", "0", "--snapshot-dir", str(tmp_path / "snapshots"),
                  "--depth-transport", "points", *argv])
     (log_file,) = (tmp_path / "logs").iterdir()
@@ -1588,6 +1603,7 @@ def static_frames(n):
 
 
 def test_run_points_pairs_each_frame_and_a_missing_one_has_no_depth(pnp_vio, monkeypatch, tmp_path):
+    import depth_points
     import link_stats
     created = recorded_telemetry(pnp_vio, monkeypatch)
     lines, handles = run_fake_points(pnp_vio, monkeypatch, tmp_path, static_frames(8), drop={3}, corrupt={5},
@@ -1616,10 +1632,75 @@ def test_run_points_pairs_each_frame_and_a_missing_one_has_no_depth(pnp_vio, mon
     n = len(GOOD_UV) + 3
     assert "depth" not in totals and "sync_group" not in totals
     assert totals["depth_points"] == (7, 7 * link_stats.spatial_data_bytes(n))
-    assert totals["depth_points_rois"] == (8, 8 * link_stats.spatial_config_bytes(n))
-    assert totals["features"] == (8, 8 * link_stats.features_bytes(len(GOOD_UV)))
+    assert totals["depth_points_rois"] == (8, 8 * link_stats.points_request_bytes(n))
+    ids = np.arange(len(GOOD_UV))
+    assert totals["features"] == (8, 8 * link_stats.features_bytes(ids))
+    # Tag then config per frame: the configs' own numbers read 0 on the camera, the tags carried the frames
+    sent = handles.rois_queue.sent
+    assert [m.getSequenceNum() for m in sent[0::2]] == list(range(8)) and not handles.rois_queue.tags
+    assert all(isinstance(m, pnp_vio.dai.SpatialLocationCalculatorConfig) for m in sent[1::2])
+    assert status["requested_ahead_max"] == 1 and status["host_behind_dropped"] == 0
+    assert status["wait_limit_ms"] == round(depth_points.wait_s(15) * 1000.0, 1)
     # The gate: told "off" once, nothing forwarded
-    assert [m.setSequenceNum.call_args[0][0] for m in handles.full_depth_control_queue.sent] == [0]
+    assert [m.getSequenceNum() for m in handles.full_depth_control_queue.sent] == [0]
+
+
+def test_max_features_caps_the_tracker_only_when_set(pnp_vio, monkeypatch):
+    detectors = []
+
+    class CornerDetector:
+        def __init__(self):
+            detectors.append(self)
+
+    monkeypatch.setattr(pnp_vio.dai.FeatureTrackerConfig, "CornerDetector", CornerDetector)
+    harris = pnp_vio.CORNER_DETECTORS["harris"]
+    config = mock.MagicMock()
+    pnp_vio.configure_feature_tracker(config, pnp_vio.parse_args([]))
+    # 0 (the default): depthai's automatic maximum, the two setters as before
+    assert detectors == [] and config.setCornerDetector.call_args_list == [mock.call(harris)]
+    config = mock.MagicMock()
+    pnp_vio.configure_feature_tracker(config, pnp_vio.parse_args(["--num-features", "250", "--max-features", "200"]))
+    (detector,) = detectors
+    assert (detector.type, detector.numTargetFeatures, detector.numMaxFeatures) == (harris, 250, 200)
+    assert config.setCornerDetector.call_args_list[-1] == mock.call(detector)
+    config.setNumTargetFeatures.assert_called_once_with(250)
+
+
+def test_points_source_requests_what_is_queued_but_never_more_than_the_camera_holds(pnp_vio, monkeypatch):
+    import depth_points
+    import link_stats
+    import slc_fakes
+    for name in ("SpatialLocationCalculatorConfig", "SpatialLocationCalculatorConfigData",
+                 "SpatialLocationCalculatorAlgorithm", "Rect", "Buffer"):
+        monkeypatch.setattr(pnp_vio.dai, name, getattr(slc_fakes.FAKE_DAI, name))
+    size = np.frombuffer(f"size\t0\t0\t0\t{WIDTH} {HEIGHT}".encode(), np.uint8)
+    queue = FakeQueue()
+    sent = []
+    rois_queue = FakeQueue()
+    rois_queue.send = sent.append
+    handles = SimpleNamespace(features_queue=queue, rois_queue=rois_queue, points_queue=PointsQueue(),
+                              points_status_queue=FakeQueue([SimpleNamespace(getData=lambda: size)]))
+    source = pnp_vio.PointsSource(handles, link_stats.StreamCounter(), pnp_vio.parse_args(["--fps", "30"]))
+
+    def arrive(sequences):
+        queue.items += [FeaturesMsg(s, 1.0 + s / 30, features=features(range(len(GOOD_UV)), GOOD_UV))
+                        for s in sequences]
+
+    def tags():
+        return [m.getSequenceNum() for m in sent if isinstance(m, slc_fakes.HostBuffer)]
+
+    # The Pi stalled for 7 frames: the oldest is taken, the newest that fit are requested behind it, the rest
+    # are dropped unrequested
+    arrive(range(7))
+    assert source.get().msg.getSequenceNum() == 0
+    assert tags() == [0, 4, 5, 6] and depth_points.REQUESTS_AHEAD == 4
+    assert [type(m) for m in sent] == [slc_fakes.HostBuffer, slc_fakes.Config] * 4
+    assert source.get().msg.getSequenceNum() == 4
+    arrive(range(7, 10))
+    assert source.get().msg.getSequenceNum() == 5 and tags()[4:] == [8, 9]
+    status = source.status()
+    assert status["requested_ahead_max"] == depth_points.REQUESTS_AHEAD and status["host_behind_dropped"] == 4
+    assert status["configs_sent"] == 6 and status["wait_limit_ms"] == round(1000.0 * 2.5 / 30, 1)
 
 
 def test_run_points_depth_probe_turns_full_depth_on_and_off(pnp_vio, monkeypatch, tmp_path):
@@ -1628,7 +1709,7 @@ def test_run_points_depth_probe_turns_full_depth_on_and_off(pnp_vio, monkeypatch
     request_id = depth_probe.request_probe(request, probe_dir)
     full = [FakeMsg(100 + k, 1.0 + 0.1 * k, frame=DEPTH) for k in range(2)]
     lines, handles = run_fake_points(pnp_vio, monkeypatch, tmp_path, static_frames(8), full_depth=full)
-    controls = [m.setSequenceNum.call_args[0][0] for m in handles.full_depth_control_queue.sent]
+    controls = [m.getSequenceNum() for m in handles.full_depth_control_queue.sent]
     # On for the probe (picked up on the first frame; every frame), off once it is done
     assert controls == [1, 0]
     result = json.loads((probe_dir / "results" / f"{request_id}.json").read_text())

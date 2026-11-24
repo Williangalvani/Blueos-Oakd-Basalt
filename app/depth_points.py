@@ -5,8 +5,8 @@ stays on the camera.
 Pipeline (pnp_vio.build_depth_points):
 
     FeatureTracker.outputFeatures --------------------------------------------> host 'features' queue
-          |  (depth_points_rois "camera" only)                          host 'rois' queue (rois "host")
-          v                                                                       |
+          |  (depth_points_rois "camera" only)                          host 'rois' queue (rois "host":
+          v                                                             tag + config per frame)
     Script 'features' / 'rois' --+                                                v
     StereoDepth.depth -> Script 'depth' --> SLC.inputConfig + SLC.inputDepth (blocking, lockstep)
                          Script 'spatial' <- SLC.out, Script 'passthrough' <- SLC.passthroughDepth
@@ -14,21 +14,37 @@ Pipeline (pnp_vio.build_depth_points):
                          Script 'status' ---------------------------------------> host 'points_status'
 
 One SpatialLocationCalculator (SLC) ROI per feature: the (2 * WINDOW_RADIUS + 1)^2 window around the feature
-on the depth grid (clamped to the frame), MEDIAN, depth thresholds = the PnP depth range (exclusive bounds, so
+on the depth grid (clamped to the frame), ALGORITHM, depth thresholds = the PnP depth range (exclusive bounds, so
 min_depth_m..max_depth_m are taken), then EXTRA_ROIS: the centre patch and the centre pixel (the centre depth
 readout of /api/status) and a 1x1 marker at the bottom-right pixel (the depth frame size, so the host can check
-every message on its own). MEDIAN runs with the SLC's AUTO step 2 (stepSize is not settable from Python), so a
-5x5 window samples 3x3 = SAMPLES_PER_WINDOW pixels.
+every message on its own). ALGORITHM is AVERAGE: the firmware computes MEDIAN / MODE only on a depth frame
+straight from StereoDepth ("Depth frame must be originating from StereoDepth node! Defaulting to 'AVERAGE/MEAN'"),
+and ours reaches the SLC through the pairing Script (test16b: every ROI came back as an average). AVERAGE uses
+every pixel (step 1): SAMPLES_PER_WINDOW = 25 for a 5x5 window.
 
 depth_points_rois (ROI_SOURCES): "host" (default) - the Pi builds the ROI config from the features it receives
-anyway and sends it up with the features' sequence number (make_config); "camera" - the Script builds it from
-the TrackedFeatures (~84 ms of Leon CPU per 300 features, estimated from task 15's measured Leon speed).
+anyway (make_config) and sends it up right after a tag (make_tag: a plain Buffer carrying the features' sequence
+number); "camera" - the Script builds it from the TrackedFeatures (slow: 111 ms of Leon CPU per frame of ~255
+features on test16b, more than a frame at 10 fps).
 
-Sync: the Script pairs each request (the host's config, or the features) with the depth frame of the same
-sequence number, sends both to the SLC and waits for its output and passthrough depth before the next request,
-then tags the output with the passthrough frame's sequence number and timestamp. The host pairs points and
-features by sequence number (PointsMatcher) and checks the echoed ROIs against the windows of that features
-message (resolve): anything else is missing depth for that frame (counted, reason recorded), never stale depth.
+The tag exists because the camera reads 0 as the sequence number of every SpatialLocationCalculatorConfig the
+host sends (test16b), while a plain Buffer's sequence number survives the link (the gates' controls since
+test15). Both go on the same queue, tag first, so they arrive in order; the Script pairs a config with the tag
+right before it and reports a tag without a config or a config without a tag.
+
+Sync: the Script pairs each request (the tagged config, or the features) with the depth frame of the same
+sequence number from the last DEPTH_BUFFER frames it holds, sends both to the SLC and waits for its output and
+passthrough depth before the next request, then tags the output with the passthrough frame's sequence number and
+timestamp. The host pairs points and features by sequence number (PointsMatcher) and checks the echoed ROIs
+against the windows of that features message (resolve): anything else is missing depth for that frame (counted,
+reason recorded), never stale depth. That check, not the tag, is what makes the depth right: the output's
+sequence number is the depth frame the SLC computed on, its ROIs are the windows it computed at, and the host
+takes it only when both are this frame's. A mispaired request can cost a frame, never give it wrong depth.
+
+Rate: the host's wait (wait_s) and the Script's depth buffer are frame periods (WAIT_PERIODS), so nothing here
+is tied to 10 fps. The host may request several frames before it takes the first one (PointsSource in
+pnp_vio requests every features message as it fetches it); the SLC still has one config and one frame at a
+time.
 
 Everything here is depthai-free (the host config builder takes the dai module), so it runs in the tests.
 """
@@ -57,9 +73,11 @@ GATE_OUT = "full_depth"  # gate_script: the forwarded depth frame
 
 # pnp_odometry.PnPParams.depth_window: the same 5x5 window as the host lookup
 WINDOW_RADIUS = 2
-# SpatialLocationCalculatorConfigData stepSize AUTO for MEDIAN (SpatialLocationCalculatorConfig.hpp)
-MEDIAN_STEP = 2
-AVERAGE_STEP = 1
+# SpatialLocationCalculatorConfigData stepSize AUTO (SpatialLocationCalculatorConfig.hpp): 1 for AVERAGE, 2 for
+# MEDIAN; stepSize is not settable from Python
+AVERAGE, MEDIAN = "AVERAGE", "MEDIAN"
+STEPS = {AVERAGE: 1, MEDIAN: 2}
+ALGORITHM = AVERAGE
 CENTER_PATCH = 5
 # centre patch, centre pixel, size marker
 EXTRA_ROIS = 3
@@ -70,9 +88,20 @@ ROI_TOLERANCE_PX = 0.5
 REPORT_INTERVAL_S = 1.0
 REPORT_MAX_CHARS = 400
 STATS_EVERY = 100
-# Script input queues (StereoDepth pool frames each can hold) and the frames the Script and the SLC hold
-DEPTH_QUEUE = 2
-POOL_FRAMES = DEPTH_QUEUE + 4
+# The host waits this many frame periods for a frame's points (at least WAIT_MIN_S; rois "camera" adds
+# CAMERA_BUILD_S, its Script's build time)
+WAIT_PERIODS = 2.5
+WAIT_MIN_S = 0.05
+CAMERA_BUILD_S = 0.15
+# The Script holds the newest DEPTH_BUFFER depth frames (its non-blocking input queue): a request that comes up
+# to WAIT_PERIODS after its frame still finds it; one coming later is past the host's wait anyway
+DEPTH_BUFFER = int(math.ceil(WAIT_PERIODS)) + 1
+# StereoDepth pool frames: the buffer, the frame the Script keeps for the next request, the SLC's input and
+# passthrough, and the one being handed over
+POOL_FRAMES = DEPTH_BUFFER + 4
+# Requests the host may have in flight (PointsSource fetching ahead) and the 'rois' queues for them (tag + config)
+REQUESTS_AHEAD = 4
+ROIS_QUEUE = 2 * REQUESTS_AHEAD
 # Points paired by sequence number are kept this many frames for a late features message
 KEEP_POINTS = 16
 # After this many timeouts in a row the host stops waiting (only takes what is there) until points come back
@@ -81,11 +110,17 @@ DEAD_AFTER = 5
 GAP_TOLERANCE = 1
 
 
-def samples_per_window(radius=WINDOW_RADIUS, step=MEDIAN_STEP):
+def samples_per_window(radius=WINDOW_RADIUS, step=STEPS[ALGORITHM]):
     return int(math.ceil((2 * radius + 1) / step)) ** 2
 
 
 SAMPLES_PER_WINDOW = samples_per_window()
+
+
+def wait_s(fps, roi_source=ROIS_HOST):
+    """How long the host waits for a frame's points: WAIT_PERIODS frame periods (at least WAIT_MIN_S)."""
+    wait = max(WAIT_MIN_S, WAIT_PERIODS / max(float(fps), 1.0))
+    return wait + (CAMERA_BUILD_S if roi_source == ROIS_CAMERA else 0.0)
 
 
 def thresholds_mm(min_depth_m, max_depth_m):
@@ -126,21 +161,29 @@ def all_windows(uv, image_size, depth_size, radius=WINDOW_RADIUS):
 
 # --- host: the ROI config (depth_points_rois "host") ------------------------------------------------------
 
+def make_tag(dai, sequence):
+    """The plain Buffer sent right before a frame's config: its sequence number is the features' (it survives)."""
+    tag = dai.Buffer()
+    tag.setSequenceNum(int(sequence))
+    return tag
+
+
 def make_config(dai, windows, thresholds, sequence, center_thresholds=CENTER_THRESHOLDS):
     """
-    A dai.SpatialLocationCalculatorConfig with one MEDIAN ROI per window (the last EXTRA_ROIS with
-    center_thresholds), tagged with the features' sequence number. Rect(x, y, w, h, False): explicitly not
-    normalized (a 1x1 rect at the origin would otherwise mean the whole frame, Rect.hpp isNormalized).
+    A dai.SpatialLocationCalculatorConfig with one ALGORITHM ROI per window (the last EXTRA_ROIS with
+    center_thresholds). Rect(x, y, w, h, False): explicitly not normalized (a 1x1 rect at the origin would
+    otherwise mean the whole frame, Rect.hpp isNormalized). It also carries the features' sequence number, which
+    the camera does not get (it reads 0, test16b; make_tag carries it): the Script reports what it read.
     """
     config = dai.SpatialLocationCalculatorConfig()
     config.setSequenceNum(int(sequence))
-    median = dai.SpatialLocationCalculatorAlgorithm.MEDIAN
+    algorithm = getattr(dai.SpatialLocationCalculatorAlgorithm, ALGORITHM)
     rois = []
     for lower, upper in (thresholds, center_thresholds):
         roi = dai.SpatialLocationCalculatorConfigData()
         roi.depthThresholds.lowerThreshold = int(lower)
         roi.depthThresholds.upperThreshold = int(upper)
-        roi.calculationAlgorithm = median
+        roi.calculationAlgorithm = algorithm
         rois.append(roi)
     feature_roi, center_roi = rois
     rect, add = dai.Rect, config.addROI
@@ -160,11 +203,18 @@ def make_config(dai, windows, thresholds, sequence, center_thresholds=CENTER_THR
 def device_script(roi_source, image_size, thresholds, radius=WINDOW_RADIUS, stats_every=STATS_EVERY,
                   report_interval=REPORT_INTERVAL_S, center_thresholds=CENTER_THRESHOLDS, patch=CENTER_PATCH):
     """
-    Script node source. Inputs: 'depth' (stereo.depth, non-blocking), 'rois' (the host's configs, rois "host")
-    or 'features' (FeatureTracker.outputFeatures, rois "camera"), 'spatial' (SLC.out) and 'passthrough'
-    (SLC.passthroughDepth); outputs 'config', SLC_DEPTH_OUT (to the SLC), 'points' (the SLC's output, re-tagged) and
-    'status' (parse_status). Only the camera's Script bindings: Buffer(size), the SLC config types by their
-    firmware names, Rect probed (Rect(x, y, w, h, False), Rect(x, y, w, h), Rect(Point2f, Size2f)).
+    Script node source. Inputs: 'depth' (stereo.depth, non-blocking, DEPTH_BUFFER frames), 'rois' (the host's
+    tag + config per frame, rois "host") or 'features' (FeatureTracker.outputFeatures, rois "camera"), 'spatial'
+    (SLC.out) and 'passthrough' (SLC.passthroughDepth); outputs 'config', SLC_DEPTH_OUT (to the SLC), 'points' (the
+    SLC's output, re-tagged) and 'status' (parse_status). Only the camera's Script bindings: Buffer(size), the SLC
+    config types by their firmware names, Rect probed (Rect(x, y, w, h, False), Rect(x, y, w, h), Rect(Point2f,
+    Size2f)).
+
+    rois "host": a message without getConfigData is a tag (its sequence number is the frame's); a config takes
+    the tag right before it. A second tag before a config, or a config with no tag, is reported ('error',
+    "pairing") and skipped. The own sequence number of the first paired config with a non-zero tag is reported
+    once ('tagging': the tag's and the config's), so the host can tell whether the config's number crossed the
+    link.
 
     Per request: depth frames older than its sequence number are dropped; a newer one means its frame is gone
     (a miss: reported at most once per report_interval, the frame kept for the next request). It reports
@@ -266,6 +316,36 @@ def device_script(roi_source, image_size, thresholds, radius=WINDOW_RADIUS, stat
         "        report('miss', 'request ' + str(sequence) + ', next depth frame ' + str(pending.getSequenceNum()))",
         "",
     ]
+    if not camera:
+        lines += [
+            "tag = None",
+            "lost_tags = 0",
+            "lost_configs = 0",
+            "checked_header = False",
+            "",
+            "def next_request():",
+            "    global tag, lost_tags, lost_configs, checked_header",
+            "    while True:",
+            "        message = node.inputs['rois'].get()",
+            "        if not hasattr(message, 'getConfigData'):",
+            "            if tag is not None:",
+            "                lost_configs += 1",
+            "                failed('pairing', ValueError('no config came after the tag of frame ' + str(tag) + ' ('",
+            "                                             + str(lost_configs) + ' times)'))",
+            "            tag = message.getSequenceNum()",
+            "            continue",
+            "        if tag is None:",
+            "            lost_tags += 1",
+            "            failed('pairing', ValueError('a config came without a tag (' + str(lost_tags) + ' times)'))",
+            "            continue",
+            "        sequence = tag",
+            "        tag = None",
+            "        if not checked_header and sequence != 0:",
+            "            checked_header = True",
+            "            report('tagging', str(sequence) + ' ' + str(message.getSequenceNum()))",
+            "        return message, sequence",
+            "",
+        ]
     if camera:
         lines += [
             "make_rect = None",
@@ -288,7 +368,7 @@ def device_script(roi_source, image_size, thresholds, radius=WINDOW_RADIUS, stat
             "    thresholds.upperThreshold = upper",
             "    data = SpatialLocationCalculatorConfigData()",
             "    data.depthThresholds = thresholds",
-            "    data.calculationAlgorithm = SpatialLocationCalculatorAlgorithm.MEDIAN",
+            f"    data.calculationAlgorithm = SpatialLocationCalculatorAlgorithm.{ALGORITHM}",
             "    return data",
             "",
             "def build(features):",
@@ -336,8 +416,12 @@ def device_script(roi_source, image_size, thresholds, radius=WINDOW_RADIUS, stat
             "    note_size(pending)",
         ]),
         "    while True:",
-        f"        request = node.inputs[{'features' if camera else 'rois'!r}].get()",
-        "        sequence = request.getSequenceNum()",
+        *([
+            "        request = node.inputs['features'].get()",
+            "        sequence = request.getSequenceNum()",
+        ] if camera else [
+            "        request, sequence = next_request()",
+        ]),
         "        frame = depth_for(sequence)",
         "        if frame is None:",
         "            request = None",
@@ -440,7 +524,8 @@ def parse_status(data):
     """
     One 'status' message of device_script: kind, error count, points sent, misses, text (tab-separated).
     kind: 'size' (text: width height), 'sent', 'miss' (text: which request), 'stats' (text: build ms mean,
-    max, SLC ms mean, max, width, height), 'error', 'fatal'. None if malformed.
+    max, SLC ms mean, max, width, height), 'tagging' (text: the tag's sequence number, the config's own), 'error',
+    'fatal'. None if malformed.
     """
     try:
         kind, errors, sent, misses, text = bytes(data).decode("utf-8", "replace").split("\t", 4)
@@ -448,6 +533,9 @@ def parse_status(data):
         if kind == "size":
             width, height = text.split()
             status["size"] = [int(width), int(height)]
+        elif kind == "tagging":
+            tag, header = text.split()
+            status.update(tag=int(tag), header=int(header))
         elif kind == "stats":
             build_mean, build_max, slc_mean, slc_max, width, height = text.split()
             status.update(build_ms_mean=float(build_mean), build_ms_max=float(build_max),
@@ -462,7 +550,7 @@ def parse_status(data):
 def decode(msg):
     """
     (N, 7) float64 rows of a SpatialLocationCalculatorData: echoed roi x, y, width, height, depthMedian,
-    depthAverage, depthAveragePixelCount.
+    depthAverage, depthAveragePixelCount. The firmware fills only the computed algorithm's depth (the other is 0).
     """
     rows = []
     for location in msg.getSpatialLocations():
@@ -476,14 +564,19 @@ def decode(msg):
 class DepthPoints:
     """The camera's depth at one frame's features, checked against them."""
     sequence: int
-    depth_mm: np.ndarray  # (N,) per feature: the SLC median (0 = no valid sample)
+    depth_mm: np.ndarray  # (N,) per feature: the SLC's ALGORITHM depth (0 = no valid sample)
     pixels: np.ndarray  # (N,) the SLC's depthAveragePixelCount
-    samples: np.ndarray  # (N,) pixels the SLC samples in a full window (MEDIAN 9, AVERAGE 25)
+    samples: np.ndarray  # (N,) pixels the SLC samples in a full window (AVERAGE 25, MEDIAN 9)
     depth_size: tuple  # (width, height) of the depth grid
     center: Optional[dict] = None
     pixel_count_reported: bool = True
-    average_used: int = 0  # ROIs where the median was 0 and the average was used (MEDIAN not supported)
+    other_algorithm: int = 0  # ROIs where only the other algorithm's depth came (a firmware that chose it)
     timestamp_s: Optional[float] = None
+
+
+# decode's columns of each algorithm's depth
+DEPTH_COLUMNS = {MEDIAN: 4, AVERAGE: 5}
+OTHER_ALGORITHM = {AVERAGE: MEDIAN, MEDIAN: AVERAGE}
 
 
 def _sampled(windows, step):
@@ -522,22 +615,24 @@ def resolve(rows, uv, image_size, depth_size=None, sequence=None):
                              f"{np.round(echoed[k], 2).tolist()} != {expected[k].tolist()} (depth {depth_size[0]}x"
                              f"{depth_size[1]})")
     n = len(uv)
-    median, average, pixels = rows[:, 4], rows[:, 5], rows[:, 6]
-    use_average = (median <= 0) & (average > 0)
-    depth = np.where(use_average, average, median)
+    other = OTHER_ALGORITHM[ALGORITHM]
+    primary, secondary, pixels = rows[:, DEPTH_COLUMNS[ALGORITHM]], rows[:, DEPTH_COLUMNS[other]], rows[:, 6]
+    use_other = (primary <= 0) & (secondary > 0)
+    depth = np.where(use_other, secondary, primary)
     # Pixels the SLC samples in a full (unclipped) window: what PnP's min_valid_depth_fraction refers to
-    samples = np.where(use_average, samples_per_window(WINDOW_RADIUS, AVERAGE_STEP), SAMPLES_PER_WINDOW)
+    samples = np.where(use_other, samples_per_window(WINDOW_RADIUS, STEPS[other]), SAMPLES_PER_WINDOW)
     reported = bool(np.any(pixels[depth > 0] > 0)) if np.any(depth > 0) else True
     c_patch, c_pixel = rows[n], rows[n + 1]
     cx, cy = depth_size[0] // 2, depth_size[1] // 2
-    patch_depth = c_patch[5] if c_patch[4] <= 0 and c_patch[5] > 0 else c_patch[4]
+    patch_depth = depth[n]
     center = {"x": cx, "y": cy, "pixel_mm": int(round(max(c_pixel[4], c_pixel[5]))), "patch": CENTER_PATCH,
               "median_mm": float(patch_depth) if patch_depth > 0 else None, "valid": int(c_patch[6]),
-              "pixels": int(_sampled(expected[n:n + 1], MEDIAN_STEP)[0]), "source": "depth_points",
-              "note": f"camera SpatialLocationCalculator, MEDIAN of every {MEDIAN_STEP}nd pixel"}
+              "pixels": int(_sampled(expected[n:n + 1], STEPS[ALGORITHM])[0]), "source": "depth_points",
+              "algorithm": ALGORITHM.lower() if not use_other[n] else other.lower(),
+              "note": f"camera SpatialLocationCalculator, {ALGORITHM} of the valid pixels in the patch"}
     return DepthPoints(sequence=sequence, depth_mm=depth[:n], pixels=pixels[:n].astype(np.int64),
                        samples=samples[:n].astype(np.int64), depth_size=tuple(depth_size), center=center,
-                       pixel_count_reported=reported, average_used=int(use_average[:n].sum())), None
+                       pixel_count_reported=reported, other_algorithm=int(use_other[:n].sum())), None
 
 
 def depth_sample(points):
@@ -633,11 +728,12 @@ class PointsMatcher:
             if any(s > sequence for s in self.pending):
                 self._take(sequence)
                 return None, "dropped"
-            remaining = deadline - self.clock()
-            if remaining <= 0:
+            remaining = timedelta(seconds=deadline - self.clock())
+            # timedelta has microseconds: a remainder below that is the deadline
+            if remaining <= timedelta(0):
                 self.timeouts_in_row += 1
                 return None, "timeout"
-            msg = self.queue.get(timedelta(seconds=remaining))
+            msg = self.queue.get(remaining)
             if msg is not None:
                 self._add(msg)
 
@@ -657,7 +753,7 @@ class PointsReport:
     last_problem: Optional[dict] = None
     feature_gaps: int = 0
     feature_gap_frames: int = 0
-    average_used: int = 0
+    other_algorithm: int = 0
     pixel_count_missing: int = 0
     valid: int = 0
     features: int = 0
@@ -668,19 +764,22 @@ class PointsReport:
 
 class DepthPointsReceiver:
     """
-    VIO-loop side of points mode. request(sequence, uv) once per features message (rois "host": builds and
-    sends the ROI config, needs the camera's depth size from its 'size' report), then take(sequence, uv,
-    features_ts) returns (DepthPoints or None, reason or None) for it. on_status(data) with each Script report.
-    status() is what /api/status shows under telemetry.depth_points.
+    VIO-loop side of points mode. request(sequence, uv) once per features message (rois "host": sends the tag
+    (build_tag) and then the ROI config (build_config) through send, needs the camera's depth size from its
+    'size' report), then take(sequence, uv, features_ts) returns (DepthPoints or None, reason or None) for it;
+    several requests may come before their takes. on_status(data) with each Script report. status() is what
+    /api/status shows under telemetry.depth_points.
     """
 
-    def __init__(self, queue, image_size, roi_source, wait_s, send_config=None, build_config=None, thresholds=None,
-                 frame_period_s=0.1, clock=time.monotonic, wall_clock=time.time, log=print, on_message=None):
+    def __init__(self, queue, image_size, roi_source, wait_s, send=None, build_config=None, build_tag=None,
+                 thresholds=None, frame_period_s=0.1, clock=time.monotonic, wall_clock=time.time, log=print,
+                 on_message=None):
         self.matcher = PointsMatcher(queue, wait_s, clock=clock, on_message=on_message)
         self.image_size = tuple(image_size)
         self.roi_source = roi_source
-        self.send_config = send_config
+        self.send = send
         self.build_config = build_config
+        self.build_tag = build_tag
         self.thresholds = thresholds
         self.frame_period_s = frame_period_s
         self.wall_clock = wall_clock
@@ -688,7 +787,7 @@ class DepthPointsReceiver:
         self.depth_size = None
         self.report = PointsReport()
         self.device = {"errors": 0, "sent": 0, "misses": 0, "last_error": None, "fatal": False, "stats": None,
-                       "size": None}
+                       "size": None, "config_sequence": None}
         self._last_feature_sequence = None
         self._requested = set()
         self._logged = Counter()
@@ -714,6 +813,12 @@ class DepthPointsReceiver:
             device["stats"]["unix_time"] = now
         elif kind == "miss":
             device["last_miss"] = {"text": status["text"], "unix_time": now}
+        elif kind == "tagging":
+            survives = status["header"] == status["tag"]
+            device["config_sequence"] = {"tag": status["tag"], "config": status["header"], "survives": survives}
+            self.log(f"Depth points: the camera paired its first config by its tag (frame {status['tag']}); the "
+                     f"config's own sequence number read {status['header']} on the camera"
+                     f"{'' if survives else ' (lost on the link, as on test16b)'}")
         elif kind in ("error", "fatal"):
             fatal = kind == "fatal"
             if fatal or device["last_error"] is None or device["last_error"]["text"] != status["text"]:
@@ -730,7 +835,9 @@ class DepthPointsReceiver:
             return False
         try:
             windows = all_windows(uv, self.image_size, self.depth_size)
-            self.send_config(self.build_config(windows, self.thresholds, sequence))
+            config = self.build_config(windows, self.thresholds, sequence)
+            self.send(self.build_tag(sequence))
+            self.send(config)
         except Exception as e:
             self.report.config_errors += 1
             if self.report.config_errors == 1 or self.report.config_errors % 100 == 0:
@@ -789,7 +896,7 @@ class DepthPointsReceiver:
                                                             f"features' frame")
             points.timestamp_s = points_ts
         report.paired += 1
-        report.average_used += points.average_used
+        report.other_algorithm += points.other_algorithm
         report.pixel_count_missing += not points.pixel_count_reported
         report.features += len(points.depth_mm)
         report.valid += int(np.count_nonzero(points.depth_mm > 0))
@@ -809,11 +916,13 @@ class DepthPointsReceiver:
             "waiting": not matcher.dead, "wait_ms_mean": wait_mean, "wait_ms_max": wait_max,
             "wait_limit_ms": round(matcher.wait_s * 1000.0, 1),
             "valid_percent": round(100.0 * report.valid / report.features, 1) if report.features else None,
-            "average_used": report.average_used, "pixel_count_missing_frames": report.pixel_count_missing,
+            "algorithm": ALGORITHM.lower(), "other_algorithm_rois": report.other_algorithm,
+            "pixel_count_missing_frames": report.pixel_count_missing,
             "timestamp_diff_ms_max": report.timestamp_diff_ms_max,
             "configs_sent": report.configs_sent, "config_errors": report.config_errors,
             "depth_size": None if self.depth_size is None else list(self.depth_size),
             "window_px": 2 * WINDOW_RADIUS + 1, "samples_per_window": SAMPLES_PER_WINDOW,
+            "depth_buffer_frames": DEPTH_BUFFER,
             "device": dict(self.device),
         }
 

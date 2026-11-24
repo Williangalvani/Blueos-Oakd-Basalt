@@ -6,7 +6,8 @@ Measured: device.getProfilingData() (depthai v3.3.0) returns the link's cumulati
 host) and numBytesWritten (host -> camera). It is a host-local read of XLink's per-link counters (no RPC),
 which XLink updates on every packet read or written, with or without DEPTHAI_PROFILING. They count the
 packet payloads of every XLink stream (output and input queues, RPC, logs, timesync, watchdog): per message
-its data, serialized metadata and an 8-byte trailer. XLink's own event headers and the USB/TCP framing are
+its data, serialized metadata and a TRAILER_BYTES trailer (StreamMessageParser::serializeMetadata: datatype 4 B,
+metadata size 4 B, a 16-byte end marker). XLink's own event headers and the USB/TCP framing are
 not counted, so the wire carries a little more. A new connection (camera reconnect) starts at 0.
 
 LinkMonitor.sample() runs on the telemetry publisher thread about once a second (never on the VIO loop):
@@ -16,12 +17,17 @@ keeps at most PEAK_WINDOW_S / SAMPLE_INTERVAL_S + 1 samples.
 Estimated: StreamCounter.add() on the VIO loop (a lock and two additions per message) counts the messages
 and bytes the host takes from each output queue: an ImgFrame's len(getData()), an EncodedFrame's JPEG, a
 Buffer's data, each plus a header estimate; TrackedFeatures and IMU packets from a per-item estimate. The
-estimates follow the libnop encoding of the depthai v3.3.0 structs (a struct 2 B, a float 5 B, small integers
-1-5 B, std::array<uint8_t, 32> 34 B, Timestamp about 11 B):
-- TrackedFeature (position, id, age, harrisScore, trackingError, 32-byte descriptor): about 64 B;
+estimates follow the libnop encoding of the depthai v3.3.0 structs (a struct 2 B, a float 5 B, a bool 1 B,
+unsigned integers 1 B below 128, 2 below 256, 3 below 65536, else 5, std::array<uint8_t, 32> 34 B, Timestamp
+about 12 B):
+- TrackedFeature (position x, y and its two normalized flags, id, age, harrisScore, trackingError, the 32-byte
+  descriptor): 60 B + the id's width + the age's (features_bytes takes the real ids; the age is taken as 1 B,
+  under 128 frames). The descriptor is always serialized whole (34 B of the ~64) and RVC2's FeatureTracker
+  leaves it zero; depthai has no setting to leave it or any other field out, so the only way to a smaller
+  message is fewer features (num_features, max_features);
 - IMUPacket (accelerometer, gyroscope, magnetic field, rotation vector; the last two empty here): about 156 B;
 - ImgFrame metadata (timestamps, Specs x2, CameraSettings, ImgTransformation with four 3x3 matrices and 14
-  distortion coefficients): about 500 B; EncodedFrame metadata about 450 B.
+  distortion coefficients): about 500 B; EncodedFrame metadata about 450 B (each + the trailer).
 UP_STREAMS are what the host sends the camera (input queues), summed separately (streams_up_sum_mbps).
 Messages a non-blocking host queue drops before the VIO reads them crossed the link but are not counted;
 with the protocol traffic (RPC, logs, timesync) they make up the measured total minus the sum.
@@ -31,6 +37,8 @@ import threading
 import time
 from collections import deque, namedtuple
 
+import numpy as np
+
 SOURCE = "xlink profiling"
 SAMPLE_INTERVAL_S = 1.0
 WINDOW_S = 10.0
@@ -39,23 +47,30 @@ REFERENCE_MBPS = 100.0
 STUCK_AT_ZERO_SAMPLES = 3
 _EPS = 1e-6
 
-# Bytes per message on top of its data: serialized metadata + the 8-byte trailer (see the module docstring)
-IMG_FRAME_OVERHEAD = 500
-ENCODED_FRAME_OVERHEAD = 450
-BUFFER_OVERHEAD = 40
-TRACKED_FEATURE_BYTES = 64
-TRACKED_FEATURES_OVERHEAD = 48
+# Bytes per message on top of its data: serialized metadata + the trailer (see the module docstring)
+TRAILER_BYTES = 24
+IMG_FRAME_OVERHEAD = 516
+ENCODED_FRAME_OVERHEAD = 466
+BUFFER_OVERHEAD = 56
+TRACKED_FEATURE_FIXED_BYTES = 60
+FEATURE_AGE_BYTES = 1
+# A feature with an id of 128..65535 (3 B)
+TRACKED_FEATURE_BYTES = TRACKED_FEATURE_FIXED_BYTES + 3 + FEATURE_AGE_BYTES
+TRACKED_FEATURES_OVERHEAD = 64
 IMU_PACKET_BYTES = 156
-IMU_DATA_OVERHEAD = 40
-MESSAGE_GROUP_OVERHEAD = 64
+IMU_DATA_OVERHEAD = 56
+MESSAGE_GROUP_OVERHEAD = 80
 LOG_MESSAGE_OVERHEAD = 64
 # SpatialLocations: the echoed config (Rect, thresholds, algorithm, step) about 45 B, three float depths, two
 # uint16, the pixel count and a Point3f
 SPATIAL_LOCATION_BYTES = 90
-SPATIAL_DATA_OVERHEAD = 48
+SPATIAL_DATA_OVERHEAD = 64
 # SpatialLocationCalculatorConfigData sent up (rois "host")
 SPATIAL_CONFIG_ROI_BYTES = 45
-SPATIAL_CONFIG_OVERHEAD = 40
+SPATIAL_CONFIG_OVERHEAD = 56
+# libnop's unsigned integer widths: below each limit, the width at the same index (above the last: 9 B)
+_UINT_LIMITS = np.array([128, 256, 65536, 2 ** 32], dtype=np.uint64)
+_UINT_WIDTHS = np.array([1, 2, 3, 5, 9], dtype=np.int64)
 
 # Host output queues in display order, with what they carry
 STREAMS = {
@@ -72,7 +87,8 @@ STREAMS = {
     "depth_stream_status": "depth stream Script status reports",
     "depth_points_status": "depth points Script status reports",
     "device_log": "camera log messages",
-    "depth_points_rois": "UP: ROI config per frame, built on the Pi (depth_points_rois host; estimate per ROI)",
+    "depth_points_rois": "UP: tag + ROI config per frame, built on the Pi (depth_points_rois host; estimate per "
+                         "ROI)",
     "control": "UP: gate, snapshot request and tracker control messages (estimate)",
 }
 # Streams the host sends to the camera
@@ -105,8 +121,19 @@ def buffer_bytes(data_length):
     return int(data_length) + BUFFER_OVERHEAD
 
 
-def features_bytes(count):
-    return TRACKED_FEATURES_OVERHEAD + int(count) * TRACKED_FEATURE_BYTES
+def uint_bytes(values):
+    """libnop's encoded size of each unsigned integer."""
+    values = np.asarray(values, dtype=np.uint64).reshape(-1)
+    return _UINT_WIDTHS[np.searchsorted(_UINT_LIMITS, values, side="right")]
+
+
+def features_bytes(ids):
+    """A TrackedFeatures message: from its feature ids (their encoded widths), or a count (3-byte ids)."""
+    if np.ndim(ids) == 0:
+        return TRACKED_FEATURES_OVERHEAD + int(ids) * TRACKED_FEATURE_BYTES
+    widths = uint_bytes(ids)
+    return TRACKED_FEATURES_OVERHEAD + len(widths) * (TRACKED_FEATURE_FIXED_BYTES + FEATURE_AGE_BYTES) + \
+        int(widths.sum())
 
 
 def imu_bytes(packets):
@@ -119,6 +146,11 @@ def spatial_data_bytes(rois):
 
 def spatial_config_bytes(rois):
     return SPATIAL_CONFIG_OVERHEAD + int(rois) * SPATIAL_CONFIG_ROI_BYTES
+
+
+def points_request_bytes(rois):
+    """rois "host": one frame's tag (a Buffer) and ROI config."""
+    return BUFFER_OVERHEAD + spatial_config_bytes(rois)
 
 
 def log_bytes(payload):

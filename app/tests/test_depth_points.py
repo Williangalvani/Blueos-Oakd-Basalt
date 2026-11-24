@@ -6,7 +6,9 @@ and checks, the on-demand full depth gate, and the host's use of the points (pnp
 The SLC types and computation are slc_fakes.py's. FakeSLC adds the node's behaviour: one config per depth frame
 (inputConfig.setWaitForMessage(True)) and, by default, the worst case: it neither copies the config's sequence
 number to its output nor keeps the depth frame's timestamp, so only the Script's re-tagging makes them right.
+The host's configs reach the Script through slc_fakes.over_link: with sequence number 0, as on the hardware.
 """
+import math
 import os
 import sys
 from datetime import timedelta
@@ -19,8 +21,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import depth_points  # noqa: E402
 from pnp_odometry import PnPParams, depth_from_points, lookup_depth  # noqa: E402
-from slc_fakes import (FAKE_DAI, Algorithm, Config, ConfigData, Point2f, Rect, Size2f, Thresholds,  # noqa: E402
-                       answer, slc_compute)
+from slc_fakes import (FAKE_DAI, Algorithm, Config, ConfigData, HostBuffer, Point2f, Rect, Size2f,  # noqa: E402
+                       Thresholds, answer, over_link, slc_compute)
 
 IMAGE = (640, 400)
 
@@ -95,6 +97,43 @@ class FakeInput:
         return self.items.pop(0) if self.items else None
 
 
+class Timeline:
+    """
+    Messages arriving in order, (input name, message). A blocking get() on an empty input lets time run: the next
+    arrivals go into their inputs until that one has a message (Done when none are left). An input with a
+    max_size drops its oldest message when a new one comes to a full queue, like a non-blocking device input.
+    """
+
+    def __init__(self, events):
+        self.events, self.inputs = list(events), {}
+
+    def input(self, name, max_size=None):
+        self.inputs[name] = TimedInput(self, max_size)
+        return self.inputs[name]
+
+    def advance(self):
+        if not self.events:
+            raise Done()
+        name, message = self.events.pop(0)
+        self.inputs[name].push(message)
+
+
+class TimedInput(FakeInput):
+    def __init__(self, timeline, max_size):
+        super().__init__()
+        self.timeline, self.max_size, self.dropped = timeline, max_size, []
+
+    def push(self, message):
+        self.items.append(message)
+        if self.max_size is not None and len(self.items) > self.max_size:
+            self.dropped.append(self.items.pop(0))
+
+    def get(self):
+        while not self.items:
+            self.timeline.advance()
+        return self.items.pop(0)
+
+
 class FakeOutput:
     def __init__(self, on_send=None):
         self.sent, self.on_send = [], on_send
@@ -136,12 +175,23 @@ def script_node(node, inputs, outputs):
     return node
 
 
-def run_device_script(roi_source, depth_frames, requests, thresholds=(199, 15001), clock=None, **slc_options):
+def run_device_script(roi_source, depth_frames=(), requests=(), thresholds=(199, 15001), clock=None, events=None,
+                      **slc_options):
+    """
+    depth_frames, requests: all there from the start (an unbounded depth queue). events: (input, message) in
+    arrival order instead (Timeline), into pnp_vio's queue sizes: the depth input keeps the newest DEPTH_BUFFER.
+    """
     node = SimpleNamespace(warnings=[])
     node.warn = node.warnings.append
     slc = FakeSLC(node, **slc_options)
-    script_node(node, {"depth": FakeInput(depth_frames), "spatial": FakeInput(), "passthrough": FakeInput(),
-                       ("features" if roi_source == depth_points.ROIS_CAMERA else "rois"): FakeInput(requests)},
+    request_input = "features" if roi_source == depth_points.ROIS_CAMERA else "rois"
+    if events is None:
+        depth, requested = FakeInput(depth_frames), FakeInput(requests)
+    else:
+        timeline = Timeline(events)
+        depth = timeline.input("depth", depth_points.DEPTH_BUFFER)
+        requested = timeline.input(request_input, depth_points.ROIS_QUEUE if request_input == "rois" else None)
+    script_node(node, {"depth": depth, "spatial": FakeInput(), "passthrough": FakeInput(), request_input: requested},
                 {"config": FakeOutput(slc.on_config), depth_points.SLC_DEPTH_OUT: FakeOutput(slc.on_depth),
                  "points": FakeOutput(), "status": FakeOutput()})
     node.slc = slc
@@ -211,46 +261,59 @@ def test_thresholds_take_the_inclusive_pnp_range_with_the_slc_exclusive_bounds()
     assert rows[0, 6] == 2 and rows[0, 5] == (200 + 15000) / 2
 
 
-def test_host_config_is_pixel_rects_median_and_tagged():
+def test_host_config_is_pixel_rects_average_and_its_tag_carries_the_frame():
     windows = depth_points.all_windows(np.array([[0.0, 0.0], [320, 200]]), IMAGE, (320, 200))
     config = depth_points.make_config(FAKE_DAI, windows, (199, 15001), 42)
     assert config.getSequenceNum() == 42 and len(config.rois) == 2 + depth_points.EXTRA_ROIS
     # A 1x1 rect at (0, 0) would be "the whole frame" if normalized: every rect says it is not
     assert not any(roi.roi.normalized for roi in config.rois)
     assert [[r.roi.x, r.roi.y, r.roi.width, r.roi.height] for r in config.rois] == windows.tolist()
-    assert all(r.calculationAlgorithm == Algorithm.MEDIAN for r in config.rois)
+    # AVERAGE: what the firmware computes anyway on a frame that comes through the Script
+    assert depth_points.ALGORITHM == depth_points.AVERAGE
+    assert all(r.calculationAlgorithm == Algorithm.AVERAGE for r in config.rois)
     assert [(r.depthThresholds.lowerThreshold, r.depthThresholds.upperThreshold) for r in config.rois] == \
         [(199, 15001)] * 2 + [depth_points.CENTER_THRESHOLDS] * 3
+    tag = depth_points.make_tag(FAKE_DAI, 42)
+    assert isinstance(tag, HostBuffer) and not hasattr(tag, "getConfigData")
+    # On the camera the config's number is gone (test16b), the tag's is not
+    assert over_link(config).getSequenceNum() == 0 and over_link(tag).getSequenceNum() == 42
 
 
 # --- the camera Script, rois "host" -------------------------------------------------------------------------
 
-def host_configs(depth_size, frames):
-    """(sequence, uv) -> the configs the Pi sends."""
-    return [depth_points.make_config(FAKE_DAI, depth_points.all_windows(uv, IMAGE, depth_size), (199, 15001), s)
-            for s, uv in frames]
+def host_requests(depth_size, frames):
+    """(sequence, uv) -> what the camera Script receives for the Pi's tag + config of each frame, in order."""
+    messages = []
+    for s, uv in frames:
+        config = depth_points.make_config(FAKE_DAI, depth_points.all_windows(uv, IMAGE, depth_size), (199, 15001), s)
+        messages += [over_link(depth_points.make_tag(FAKE_DAI, s)), over_link(config)]
+    return messages
 
 
 def test_host_rois_each_request_gets_the_depth_of_its_own_frame_retagged():
     depths = {s: scene_depth(seed=s) for s in range(1, 6)}
     uvs = {s: feature_uv(seed=s) for s in range(1, 6)}
     node = run_device_script("host", [DepthFrame(depths[s], s) for s in range(1, 6)],
-                             host_configs((320, 200), [(s, uvs[s]) for s in range(1, 6)]))
+                             host_requests((320, 200), [(s, uvs[s]) for s in range(1, 6)]))
     points = node.outputs["points"].sent
     # The fake SLC tags nothing: the sequence numbers and timestamps are the Script's, from the passthrough
     assert [p.getSequenceNum() for p in points] == [1, 2, 3, 4, 5]
     assert [p.getTimestamp() for p in points] == [DepthFrame(depths[s], s).timestamp for s in range(1, 6)]
     for s, p in zip(range(1, 6), points):
         np.testing.assert_array_equal(depth_points.decode(p), expected_rows(depths[s], uvs[s]))
+    # Every config read 0 on the camera, as on test16b: the pairing went by the tags alone
+    assert [c.getSequenceNum() for c in node.slc.configs] == [0] * 5
     report = statuses(node)
     assert report[0]["kind"] == "size" and report[0]["size"] == [320, 200]
+    (tagging,) = [r for r in report if r["kind"] == "tagging"]
+    assert (tagging["tag"], tagging["header"]) == (1, 0)
     assert not [r for r in report if r["kind"] in ("error", "fatal", "miss")] and not node.warnings
 
 
 def test_host_rois_older_depth_frames_are_dropped_and_a_lost_frame_is_a_miss():
     depth = scene_depth()
     frames = [DepthFrame(depth, s) for s in (1, 2, 3, 5, 6, 7)]  # 4 lost on the camera
-    requests = host_configs((320, 200), [(s, feature_uv(seed=s)) for s in (3, 4, 5, 7)])
+    requests = host_requests((320, 200), [(s, feature_uv(seed=s)) for s in (3, 4, 5, 7)])
     node = run_device_script("host", frames, requests)
     assert [p.getSequenceNum() for p in node.outputs["points"].sent] == [3, 5, 7]
     misses = [r for r in statuses(node) if r["kind"] == "miss"]
@@ -261,7 +324,7 @@ def test_host_rois_older_depth_frames_are_dropped_and_a_lost_frame_is_a_miss():
 
 def test_host_rois_a_slc_answer_for_another_frame_is_reported():
     depth = scene_depth()
-    node = run_device_script("host", [DepthFrame(depth, 1)], host_configs((320, 200), [(1, feature_uv())]),
+    node = run_device_script("host", [DepthFrame(depth, 1)], host_requests((320, 200), [(1, feature_uv())]),
                              out_of_order=True)
     errors = [r for r in statuses(node) if r["kind"] == "error"]
     assert errors and "order" in errors[0]["text"]
@@ -279,10 +342,64 @@ def test_host_rois_progress_and_stats_reports():
     depth = scene_depth(seed=3)
     n = depth_points.STATS_EVERY
     node = run_device_script("host", [DepthFrame(depth, s) for s in range(1, n + 1)],
-                             host_configs((320, 200), [(s, feature_uv(5)) for s in range(1, n + 1)]), clock=clock)
+                             host_requests((320, 200), [(s, feature_uv(5)) for s in range(1, n + 1)]), clock=clock)
     stats = [r for r in statuses(node) if r["kind"] == "stats"]
     assert len(stats) == 1 and stats[0]["sent"] == n and stats[0]["size"] == [320, 200]
     assert stats[0]["slc_ms_mean"] > 0 and stats[0]["build_ms_mean"] >= 0
+
+
+def stepping_clock(step=2.0):
+    """A clock that moves past REPORT_INTERVAL at each read: every report goes out."""
+    t = [0.0]
+
+    def clock():
+        t[0] += step
+        return t[0]
+    return clock
+
+
+def test_host_rois_a_lost_tag_or_config_is_reported_and_costs_only_its_frame():
+    depth = scene_depth()
+    uv = {s: feature_uv(seed=s) for s in range(1, 6)}
+    tag1, config1, tag2, config2, tag3, config3, tag4, config4, tag5, config5 = host_requests(
+        (320, 200), [(s, uv[s]) for s in range(1, 6)])
+    # 2: its tag lost; 3: its config lost; 4 and 5 arrive whole
+    requests = [tag1, config1, config2, tag3, tag4, config4, tag5, config5]
+    node = run_device_script("host", [DepthFrame(depth, s) for s in range(1, 6)], requests, clock=stepping_clock())
+    points = node.outputs["points"].sent
+    assert [p.getSequenceNum() for p in points] == [1, 4, 5]
+    for s, p in zip((1, 4, 5), points):
+        assert depth_points.resolve(depth_points.decode(p), uv[s], IMAGE, (320, 200), s)[1] is None
+    errors = [r["text"] for r in statuses(node) if r["kind"] == "error"]
+    assert len(errors) == 2 and errors[0].startswith("pairing:") and "without a tag" in errors[0]
+    assert "no config came after the tag of frame 3" in errors[1]
+
+
+def test_host_rois_requests_behind_their_frames_find_them_in_the_depth_buffer():
+    depths = {s: scene_depth(seed=s) for s in range(1, 12)}
+    uv = {s: feature_uv(seed=s) for s in range(1, 12)}
+
+    def request(s):
+        return [("rois", m) for m in host_requests((320, 200), [(s, uv[s])])]
+
+    buffer = depth_points.DEPTH_BUFFER
+    first = list(range(1, buffer + 1))
+    # The Pi fetches `buffer` features messages at once and requests them all: their depth frames are already
+    # queued on the camera. Then buffer + 2 frames come before the next request (the Pi stalled): the oldest two
+    # are dropped from the queue, so the request for one of them misses, and the next one still pairs
+    late = list(range(buffer + 1, 2 * buffer + 3))
+    events = [("depth", DepthFrame(depths[s], s)) for s in first] + [e for s in first for e in request(s)]
+    events += [("depth", DepthFrame(depths[s], s)) for s in late]
+    events += request(late[0]) + request(late[-2])
+    node = run_device_script("host", events=events)
+    points = node.outputs["points"].sent
+    assert [p.getSequenceNum() for p in points] == first + [late[-2]]
+    for p in points:
+        s = p.getSequenceNum()
+        np.testing.assert_array_equal(depth_points.decode(p), expected_rows(depths[s], uv[s]))
+    misses = [r for r in statuses(node) if r["kind"] == "miss"]
+    assert len(misses) == 1 and f"request {late[0]}," in misses[0]["text"]
+    assert [f.getSequenceNum() for f in node.inputs["depth"].dropped] == late[:2]
 
 
 # --- the camera Script, rois "camera" -----------------------------------------------------------------------
@@ -338,7 +455,18 @@ def test_resolve_checks_count_rois_and_scales_a_normalized_echo():
     points, problem = depth_points.resolve(rows, uv, IMAGE, (320, 200), 7)
     assert problem is None and points.sequence == 7 and len(points.depth_mm) == len(uv)
     assert points.center["source"] == "depth_points" and points.center["x"] == 160
-    assert (points.samples == depth_points.SAMPLES_PER_WINDOW).all()
+    assert depth_points.SAMPLES_PER_WINDOW == 25 and (points.samples == 25).all() and points.other_algorithm == 0
+    np.testing.assert_array_equal(points.depth_mm, rows[:len(uv), depth_points.DEPTH_COLUMNS[depth_points.AVERAGE]])
+    assert points.center["algorithm"] == "average"
+    # A firmware that computed MEDIAN instead (only depthMedian filled): taken, with MEDIAN's 9 samples, counted
+    median_rows = rows.copy()
+    median_rows[:, 4], median_rows[:, 5] = rows[:, 5] + 1.0, 0.0
+    median_rows[rows[:, 5] <= 0, 4] = 0.0
+    other, problem = depth_points.resolve(median_rows, uv, IMAGE, (320, 200), 7)
+    filled = rows[:len(uv), 5] > 0
+    assert problem is None and other.other_algorithm == int(filled.sum())
+    np.testing.assert_array_equal(other.depth_mm[filled], rows[:len(uv), 5][filled] + 1.0)
+    assert (other.samples[filled] == 9).all() and (other.samples[~filled] == 25).all()
     _, problem = depth_points.resolve(rows[:-1], uv, IMAGE, (320, 200))
     assert problem[0] == "count"
     moved = uv + [10.0, 0.0]
@@ -369,16 +497,16 @@ class HostQueue:
         return None
 
 
-def make_receiver(roi_source="host", wait_s=0.3):
+def make_receiver(roi_source="host", wait_s=0.3, fps=10):
     clock = SimpleNamespace(t=0.0)
     queue = HostQueue(clock)
     sent = []
     logs = []
     receiver = depth_points.DepthPointsReceiver(
-        queue, IMAGE, roi_source, wait_s, send_config=sent.append,
+        queue, IMAGE, roi_source, wait_s, send=sent.append,
         build_config=lambda windows, limits, sequence: depth_points.make_config(FAKE_DAI, windows, limits, sequence),
-        thresholds=(199, 15001), frame_period_s=0.1, clock=lambda: clock.t, wall_clock=lambda: 1000.0,
-        log=logs.append)
+        build_tag=lambda sequence: depth_points.make_tag(FAKE_DAI, sequence), thresholds=(199, 15001),
+        frame_period_s=1.0 / fps, clock=lambda: clock.t, wall_clock=lambda: 1000.0, log=logs.append)
     return receiver, queue, sent, clock, logs
 
 
@@ -391,13 +519,64 @@ def test_receiver_pairs_by_sequence_and_validates_each_frame():
     depth = scene_depth()
     for sequence in (2, 3):
         assert receiver.request(sequence, uv)
-        queue.items.append(answer(sent[-1], depth, 100.0 + sequence / 10))
+        # The tag goes first, on the same queue, then the config
+        tag, config = sent[-2:]
+        assert isinstance(tag, HostBuffer) and tag.getSequenceNum() == sequence and isinstance(config, Config)
+        queue.items.append(answer(config, depth, 100.0 + sequence / 10))
         points, problem = receiver.take(sequence, uv, 100.0 + sequence / 10)
         assert problem is None and points.sequence == sequence
-        np.testing.assert_array_equal(points.depth_mm, expected_rows(depth, uv)[:len(uv), 4])
+        np.testing.assert_array_equal(points.depth_mm, expected_rows(depth, uv)[:len(uv), 5])
     status = receiver.status()
     assert status["frames"] == 3 and status["paired"] == 2 and status["missing_by_reason"] == {"not_requested": 1}
     assert status["depth_size"] == [320, 200] and status["configs_sent"] == 2 and status["feature_gaps"] == 0
+    assert len(sent) == 4
+
+
+def test_receiver_takes_requests_made_ahead_in_order():
+    receiver, queue, sent, clock, logs = make_receiver()
+    receiver.on_status(b"size\t0\t0\t0\t320 200")
+    depth = scene_depth()
+    uv = {s: feature_uv(seed=s) for s in range(1, 1 + depth_points.REQUESTS_AHEAD)}
+    for s in uv:
+        assert receiver.request(s, uv[s])
+    for s in uv:
+        queue.items.append(answer(sent[2 * s - 1], depth, 100.0 + s / 10))
+    for s in uv:
+        points, problem = receiver.take(s, uv[s], 100.0 + s / 10)
+        assert problem is None and points.sequence == s
+    assert receiver.status()["paired"] == depth_points.REQUESTS_AHEAD
+
+
+@pytest.mark.parametrize("fps", [10, 15, 20, 30])
+def test_receiver_wait_and_timestamp_limits_follow_the_frame_period(fps):
+    wait = depth_points.wait_s(fps)
+    assert wait == pytest.approx(max(depth_points.WAIT_MIN_S, depth_points.WAIT_PERIODS / fps))
+    assert depth_points.wait_s(fps, depth_points.ROIS_CAMERA) == pytest.approx(wait + depth_points.CAMERA_BUILD_S)
+    # The camera keeps a frame long enough for a request that comes as late as the Pi waits
+    assert depth_points.DEPTH_BUFFER >= math.ceil(wait * fps) + 1
+    receiver, queue, sent, clock, logs = make_receiver(wait_s=wait, fps=fps)
+    receiver.on_status(b"size\t0\t0\t0\t320 200")
+    depth = scene_depth()
+    uv = feature_uv(20)
+    period = 1.0 / fps
+    receiver.request(1, uv)
+    queue.items.append(answer(sent[-1], depth, 100.0 + 0.4 * period))
+    assert receiver.take(1, uv, 100.0)[1] is None
+    receiver.request(2, uv)
+    queue.items.append(answer(sent[-1], depth, 100.0 + period + 0.6 * period))
+    assert receiver.take(2, uv, 100.0 + period)[1] == "timestamp"
+    receiver.request(3, uv)
+    before = clock.t
+    assert receiver.take(3, uv, 100.0 + 2 * period) == (None, "timeout")
+    assert clock.t - before == pytest.approx(wait, abs=1e-6)
+    assert receiver.status()["wait_limit_ms"] == round(wait * 1000.0, 1)
+
+
+def test_wait_limits_scale_with_the_rate():
+    assert depth_points.wait_s(10) == pytest.approx(0.25)
+    assert depth_points.wait_s(30) == pytest.approx(2.5 / 30)
+    assert depth_points.wait_s(100) == depth_points.WAIT_MIN_S
+    assert depth_points.wait_s(10, depth_points.ROIS_CAMERA) == pytest.approx(0.4)
 
 
 def test_receiver_never_uses_another_frames_depth():
@@ -446,9 +625,15 @@ def test_receiver_status_shape_and_device_reports():
         "transport", "rois", "frames", "paired", "paired_percent", "missing", "missing_by_reason", "last_problem",
         "points_received", "orphan_points", "points_gaps", "points_gap_frames", "feature_gaps",
         "feature_gap_frames", "waiting", "wait_ms_mean", "wait_ms_max", "wait_limit_ms", "valid_percent",
-        "average_used", "pixel_count_missing_frames", "timestamp_diff_ms_max", "configs_sent", "config_errors",
-        "depth_size", "window_px", "samples_per_window", "device"}
+        "algorithm", "other_algorithm_rois", "pixel_count_missing_frames", "timestamp_diff_ms_max",
+        "configs_sent", "config_errors", "depth_size", "window_px", "samples_per_window", "depth_buffer_frames",
+        "device"}
     assert status["transport"] == "points" and status["rois"] == "camera" and status["window_px"] == 5
+    assert status["algorithm"] == "average" and status["samples_per_window"] == 25
+    assert status["depth_buffer_frames"] == depth_points.DEPTH_BUFFER and status["device"]["config_sequence"] is None
+    receiver.on_status(b"tagging\t3\t100\t2\t7 0")
+    assert receiver.status()["device"]["config_sequence"] == {"tag": 7, "config": 0, "survives": False}
+    assert any("lost on the link" in line for line in logs)
     device = status["device"]
     assert device["errors"] == 3 and device["misses"] == 2 and device["stats"]["build_ms_mean"] == 80.5
     assert device["last_error"]["text"] == "build: ValueError: x" and not device["fatal"]
@@ -528,7 +713,7 @@ def test_depth_from_points_applies_the_lookup_rules():
 
 
 def test_points_and_frame_lookup_agree_on_smooth_depth():
-    """On a smooth surface the camera's 3x3-sample median and the Pi's 5x5 median give the same depth."""
+    """On a smooth surface the camera's 5x5 average and the Pi's 5x5 median give the same depth."""
     yy, xx = np.mgrid[0:400, 0:640]
     depth = (1500 + xx * 0.5 + yy * 0.25).astype(np.uint16)
     uv = np.random.default_rng(4).uniform((10, 10), (630, 390), (50, 2))
@@ -545,4 +730,7 @@ def test_status_parsing():
     assert depth_points.parse_status(b"size\t0\t0\t0\t320 200")["size"] == [320, 200]
     assert depth_points.parse_status(b"miss\t0\t5\t1\trequest 4, next depth frame 5")["misses"] == 1
     assert depth_points.parse_status(b"stats\t0\t100\t0\t1 2 3 4 5 6")["slc_ms_max"] == 4.0
+    tagging = depth_points.parse_status(b"tagging\t0\t0\t0\t12 0")
+    assert (tagging["tag"], tagging["header"]) == (12, 0)
+    assert depth_points.parse_status(b"tagging\t0\t0\t0\t12") is None
     assert depth_points.parse_status(b"nonsense") is None

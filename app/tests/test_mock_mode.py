@@ -381,14 +381,15 @@ def test_the_mock_points_transport_pairs_every_frame_and_counts_its_streams(tmp_
     assert streams["depth_points"]["mbps"] == pytest.approx(points_mbps, rel=0.01)
     assert streams["depth_points"]["direction"] == "down"
     if rois == "host":
-        up = link_stats.spatial_config_bytes(n + depth_points.EXTRA_ROIS) * 15 * 8 / 1e6
+        up = link_stats.points_request_bytes(n + depth_points.EXTRA_ROIS) * 15 * 8 / 1e6
         assert streams["depth_points_rois"]["mbps"] == pytest.approx(up, rel=0.01)
         assert streams["depth_points_rois"]["direction"] == "up"
         assert link["up_mbps_10s"] > link["streams_up_sum_mbps"] >= up
     else:
         assert "depth_points_rois" not in streams
-    # Far below the ~41 Mbps of RAW16 depth at 640x400
-    assert link["down_mbps_10s"] < 6.0
+    # Far below the ~41 Mbps of RAW16 depth at 640x400 (here 300 features at 15 fps: ~3.3 Mbps of points, ~2.3
+    # of features)
+    assert link["down_mbps_10s"] < 7.0
 
 
 def test_the_mock_gate_sends_full_depth_frames_only_while_needed(tmp_path):
@@ -417,13 +418,13 @@ def test_the_mock_slc_matches_the_camera_rules():
     at = lambda u, v: depth[np.clip(v, 0, 9), np.clip(u, 0, 9)]  # noqa: E731
     windows = [[0, 0, 5, 5], [0, 0, 5, 5], [5, 5, 1, 1], [0, 0, 1, 1], [9, 9, 1, 1]]
     rows = mock_vio.slc_rows(at, windows, (1000, 3400))
-    # Every 2nd pixel: (0,0) 1000 and (4,4) 3400 are excluded (thresholds are exclusive), the rest of the 3x3 grid in
-    sampled = [depth[y, x] for y in (0, 2, 4) for x in (0, 2, 4)]
-    inside = [d for d in sampled if 1000 < d < 3400]
-    assert rows[0, 6] == len(inside) == 7 and rows[0, 4] == np.round(np.median(inside))
+    # AVERAGE, every pixel: (0,0) 1000 and (4,4) 3400 are excluded (thresholds are exclusive), the other 23 in;
+    # only the average is filled, as the firmware does
+    inside = [d for d in depth[0:5, 0:5].ravel() if 1000 < d < 3400]
+    assert rows[0, 6] == len(inside) == 23 and rows[0, 5] == pytest.approx(np.mean(inside)) and rows[0, 4] == 0
     assert rows[0, :4].tolist() == [0, 0, 5, 5]
     # The last EXTRA_ROIS use the centre thresholds (everything but 0)
-    assert rows[2, 6] == 0 and rows[3, 4] == 1000 and rows[3, 6] == 1 and rows[4, 6] == 0
+    assert rows[2, 6] == 0 and rows[3, 5] == 1000 and rows[3, 6] == 1 and rows[4, 6] == 0
 
 
 def test_the_mock_counts_the_camera_stream_jpegs(tmp_path):

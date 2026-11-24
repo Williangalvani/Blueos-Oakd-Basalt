@@ -58,8 +58,8 @@
 
   <h2 class="sub">Depth for PnP <span class="muted">(depth_transport)</span></h2>
   <div class="kv" id="transport-kv"><span class="muted">–</span><span></span></div>
-  <div class="hint">points: the camera computes the depth at each tracked feature (5×5 window, median of every 2nd
-    pixel) and sends only those numbers; a frame whose points are missing or do not match its features gets no
+  <div class="hint">points: the camera computes the depth at each tracked feature (the average of the 5×5
+    window) and sends only those numbers; a frame whose points are missing or do not match its features gets no
     depth (counted here), never older depth. Images (and full depth frames) cross the link only while someone
     watches a live stream or runs the depth probe; "video idle" means nothing image-like is sent.</div>
 
