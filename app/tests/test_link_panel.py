@@ -150,7 +150,7 @@ VIEWERS = {"total": 2, "video": 1, "video_idle": False, "by_client": {"page": 1,
 
 
 def test_transport_rows_points():
-    transport = {"configured": "points", "configured_rois": "host", "live": POINTS_LIVE, "camera_load": LOAD}
+    transport = {"configured": "points", "live": POINTS_LIVE, "camera_load": LOAD}
     (rows,) = run_panel(["transportRows", transport, VIEWERS])
     text = dict(rows)
     assert text["setting"] == "points (ROIs listed on the Pi)"
@@ -166,16 +166,16 @@ def test_transport_rows_points():
 
 
 def test_transport_rows_full_frame_and_not_running():
-    full = {"configured": "full_frame", "configured_rois": "host", "camera_load": None,
+    full = {"configured": "full_frame", "camera_load": None,
             "live": {"transport": "full_frame", "frames": 50, "feature_gaps": 0, "feature_gap_frames": 0}}
-    stopped = {"configured": "points", "configured_rois": "camera", "live": None, "camera_load": None}
+    stopped = {"configured": "points", "live": None, "camera_load": None}
     idle = {**VIEWERS, "total": 0, "video": 0, "video_idle": True, "by_client": {}, "text": "video idle"}
     (rows, stopped_rows) = run_panel(["transportRows", full, idle], ["transportRows", stopped, None])
     text = dict(rows)
     assert text["setting"] == "full_frame" and text["running"].startswith("full_frame: every depth frame")
     assert text["viewers"] == "video idle" and text["camera CPU"] == "–"
     stopped_text = dict(stopped_rows)
-    assert stopped_text["setting"] == "points (ROIs listed on the camera)"
+    assert stopped_text["setting"] == "points (ROIs listed on the Pi)"
     assert stopped_text["running"] == "n/a (VIO not running)" and stopped_text["viewers"] == "–"
 
 

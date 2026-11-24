@@ -214,7 +214,6 @@ def build_vio_command(config: dict) -> list:
         "--depth-stream-debug" if config.get("depth_stream_debug") else "--no-depth-stream-debug",
         "--pose-attitude-source", saved_choice(config, "pose_attitude_source"),
         "--depth-transport", saved_choice(config, "depth_transport"),
-        "--depth-points-rois", saved_choice(config, "depth_points_rois"),
         "--telemetry-dir", str(telemetry_dir()),
         "--intrinsics-from", config.get("intrinsics_from") or "rectified",
         "--depth-scale", str(float(config.get("depth_scale", 1.0))),
@@ -550,14 +549,13 @@ def image_streams_status(config: dict, depth: dict, telemetry: Optional[dict], p
 
 def depth_transport_status(config: dict, telemetry: Optional[dict]) -> dict:
     """
-    How PnP gets its depth: configured (depth_transport) and rois (depth_points_rois), plus what the running
+    How PnP gets its depth: configured (depth_transport), plus what the running
     VIO reports (live: depth_points.DepthPointsReceiver.status in points, frames and feature gaps in full_frame,
     and full_depth: the on-demand full depth frames, depth_points.FullDepthGate.status) and the camera's load
     (vio_telemetry.read_camera_load, every 5 s). live and camera_load are null while not running.
     """
     fresh = telemetry if telemetry and not telemetry.get("stale") else {}
     return {"configured": saved_choice(config, "depth_transport"),
-            "configured_rois": saved_choice(config, "depth_points_rois"),
             "live": fresh.get("depth_points"), "camera_load": fresh.get("camera_load")}
 
 

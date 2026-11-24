@@ -22,9 +22,8 @@ DVL_SOURCES = ("auto", "off")
 DEPTH_STREAM_ENCODINGS = ("auto", "mono_features", "disparity", "host_jpeg")
 # pose_stream.ATTITUDE_MODES
 POSE_ATTITUDE_SOURCES = ("autopilot", "gyro")
-# depth_points.TRANSPORTS and ROI_SOURCES
+# depth_points.TRANSPORTS
 DEPTH_TRANSPORTS = ("points", "full_frame")
-DEPTH_POINTS_ROIS = ("host", "camera")
 # snapshots.ENCODINGS
 SNAPSHOT_ENCODINGS = ("camera_jpeg", "raw")
 VEHICLE_IP_RE = re.compile(r"^[A-Za-z0-9.\-:\[\]]+$")
@@ -113,12 +112,6 @@ CONFIG_FIELDS = (
                 "feature) and sends only those (~2 Mbps instead of ~40 at 640x400 10 fps); full depth frames cross "
                 "the link only while the depth probe runs or someone watches a host_jpeg stream. full_frame = every "
                 "depth frame goes to the Pi (the previous behaviour, for comparison)", choices=DEPTH_TRANSPORTS),
-    ConfigField("depth_points_rois", "choice", "host", "PnP Depth Points ROIs",
-                "PnP, points only: who lists the per-feature windows for the camera. host = the Pi (from the "
-                "features it receives anyway; a few kB per frame up the link, almost no camera CPU); camera = SLOW: "
-                "a Script on the camera builds them (no upstream traffic, but ~110 ms of the camera's Leon CPU per "
-                "frame of ~255 features measured: under 10 fps, and the camera's CPU is then saturated)",
-                choices=DEPTH_POINTS_ROIS),
     ConfigField("snapshots", "bool", True, "Snapshots",
                 "PnP only: on-demand camera snapshots (live views); no bandwidth until requested"),
     ConfigField("snapshot_encoding", "choice", "camera_jpeg", "Snapshot Encoding",

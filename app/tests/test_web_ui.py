@@ -210,6 +210,7 @@ OLD_CONFIG = {
     "optical_flow_grid_size": 80, "optical_flow_max_iterations": 3, "optical_flow_levels": 2,
     "optical_flow_skip_frames": 1, "vio_max_states": 2, "vio_max_kfs": 4, "vio_max_iterations": 3,
     "dvl_source": "no_such_source", "stereo_median": "9x9", "depth_stream_encoding": "manip",
+    "depth_points_rois": "camera",
 }
 
 
@@ -668,15 +669,12 @@ def test_depth_transport_settings_reach_the_vio_command(client):
     import depth_points
     main, http = client
     assert config_schema.DEPTH_TRANSPORTS == depth_points.TRANSPORTS
-    assert config_schema.DEPTH_POINTS_ROIS == depth_points.ROI_SOURCES
     pnp = {**main.DEFAULT_CONFIG}
-    assert (pnp["depth_transport"], pnp["depth_points_rois"]) == ("points", "host")
+    assert pnp["depth_transport"] == "points" and "depth_points_rois" not in pnp
     command = main.build_vio_command(pnp)
-    assert command[command.index("--depth-transport") + 1] == "points"
-    assert command[command.index("--depth-points-rois") + 1] == "host"
-    command = main.build_vio_command({**pnp, "depth_transport": "full_frame", "depth_points_rois": "camera"})
+    assert command[command.index("--depth-transport") + 1] == "points" and "--depth-points-rois" not in command
+    command = main.build_vio_command({**pnp, "depth_transport": "full_frame"})
     assert command[command.index("--depth-transport") + 1] == "full_frame"
-    assert command[command.index("--depth-points-rois") + 1] == "camera"
     # A hand-edited config.json falls back to the default
     command = main.build_vio_command({**pnp, "depth_transport": "pigeons"})
     assert command[command.index("--depth-transport") + 1] == "points"
@@ -696,7 +694,7 @@ def test_max_features_reaches_the_vio_command(client):
     assert http.post("/api/config", json={**pnp, "depth_transport": "pigeons"}).status_code == 422
     assert http.post("/api/config", json={**pnp, "depth_transport": "full_frame"}).status_code == 200
     transport = http.get("/api/status").json()["depth_transport"]
-    assert transport == {"configured": "full_frame", "configured_rois": "host", "live": None, "camera_load": None}
+    assert transport == {"configured": "full_frame", "live": None, "camera_load": None}
 
 
 def test_status_reports_the_live_depth_transport_and_camera_load(client, tmp_path):

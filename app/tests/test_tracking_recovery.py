@@ -580,12 +580,12 @@ def pipeline_combinations():
     Each transport with each depth stream variant and stereo setting (the disparity variant needs the RAW8
     one), then each remaining option changed on its own for both transports.
     """
-    base = {"rois": "host", "snapshot_encoding": snapshots.CAMERA_JPEG, "rgb": True}
+    base = {"snapshot_encoding": snapshots.CAMERA_JPEG, "rgb": True}
     cases = [dict(base, transport=transport, stream=stream, stereo=stereo)
              for transport in ("points", "full_frame") for stream in depth_stream.VARIANTS
              for stereo in sorted(STEREO_VARIANTS)]
     for transport in ("points", "full_frame"):
-        for change in ({"rois": "camera"}, {"snapshot_encoding": snapshots.RAW}, {"rgb": False}):
+        for change in ({"snapshot_encoding": snapshots.RAW}, {"rgb": False}):
             cases.append(dict(base, transport=transport, stream="auto", stereo="subpixel", **change))
     return [pytest.param(case, id="-".join(str(value) for value in case.values())) for case in cases]
 
@@ -598,8 +598,8 @@ def test_build_pipeline_starts_in_every_combination(pnp_vio, case):
     checks (unique io names per node, link datatypes, stream names, the Scripts' ports).
     """
     dai = pnp_vio.dai
-    transport, rois = case["transport"], case["rois"]
-    argv = ["--depth-transport", transport, "--depth-points-rois", rois, "--depth-stream-encoding", case["stream"],
+    transport = case["transport"]
+    argv = ["--depth-transport", transport, "--depth-stream-encoding", case["stream"],
             "--snapshot-encoding", case["snapshot_encoding"], *STEREO_VARIANTS[case["stereo"]]]
     handles, created = build_fake_pipeline(pnp_vio, argv, cameras=[dai.CameraBoardSocket.CAM_A] if case["rgb"] else [],
                                            start=True)
@@ -610,7 +610,7 @@ def test_build_pipeline_starts_in_every_combination(pnp_vio, case):
     assert len(scripts) == expected
     if transport == "points":
         assert handles.points_queue is not None and handles.full_depth_queue is not None
-        assert (handles.rois_queue is None) == (rois == "camera")
+        assert handles.rois_queue is not None
 
 
 @pytest.mark.parametrize("argv", [["--no-depth-stream"], ["--no-snapshots"], ["--no-depth-stream", "--no-snapshots"]])
@@ -1473,24 +1473,12 @@ def test_build_pipeline_points_sends_no_depth_frames(pnp_vio):
     points_script.inputs["depth"].setBlocking.assert_called_with(False)
     points_script.inputs["depth"].setMaxSize.assert_called_with(depth_points.DEPTH_BUFFER)
     points_script.inputs["rois"].setMaxSize.assert_called_with(depth_points.ROIS_QUEUE)
-    # rois "host": the Pi's configs go up into the Script; the tracker's features only go to the Pi
+    # The Pi's configs go up into the Script; the tracker's features only go to the Pi
     assert handles.rois_queue is not None and handles.features_queue is not None
     assert mock.call(points_script.inputs["features"]) not in tracker.outputFeatures.link.call_args_list
-    code = points_script.setScript.call_args[0][0]
-    compile(code, "depth_points_script", "exec")
-    assert "CAMERA_ROIS = False" in code
+    compile(points_script.setScript.call_args[0][0], "depth_points_script", "exec")
     compile(gate_script.setScript.call_args[0][0], "gate_script", "exec")
     assert handles.full_depth_control_queue is not None and handles.full_depth_queue is not None
-
-
-def test_build_pipeline_points_with_camera_rois_feeds_the_tracker_to_the_script(pnp_vio):
-    dai = pnp_vio.dai
-    handles, created = build_fake_pipeline(pnp_vio, ["--depth-transport", "points", "--depth-points-rois", "camera"])
-    (tracker,) = nodes_of(created, dai.node.FeatureTracker)
-    points_script = nodes_of(created, dai.node.Script)[0]
-    tracker.outputFeatures.link.assert_any_call(points_script.inputs["features"])
-    assert handles.rois_queue is None
-    assert "CAMERA_ROIS = True" in points_script.setScript.call_args[0][0]
 
 
 class FeaturesMsg(FakeMsg):
@@ -1598,7 +1586,7 @@ def test_run_points_pairs_each_frame_and_a_missing_one_has_no_depth(pnp_vio, mon
     assert [s["reference_carried"] for s in steps] == [False] * 3 + [True, False, True, False, False]
     assert not any(s["reference_reset"] for s in steps)
     events = {line["event"]: line for line in lines if line["type"] == "event"}
-    assert events["depth_transport"]["transport"] == "points" and events["depth_transport"]["rois"] == "host"
+    assert events["depth_transport"]["transport"] == "points" and "rois" not in events["depth_transport"]
 
     (telemetry,) = created
     status = telemetry.depth_points_status()

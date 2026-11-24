@@ -171,11 +171,6 @@ def parse_args(argv=None):
                              'a 5x5 median per feature) and sends only those; full depth frames cross the link only '
                              'while the depth probe or a watched host_jpeg stream needs them. full_frame: every depth '
                              'frame goes to the Pi, which looks the depth up itself (the previous behaviour)')
-    parser.add_argument('--depth-points-rois', choices=depth_points.ROI_SOURCES,
-                        default=depth_points.DEFAULT_ROI_SOURCE,
-                        help='points only: who builds the per-feature ROI list: host (the Pi, from the features it '
-                             'receives anyway; ~12 kB/frame up the link) or camera (slow: a Script on the camera\'s '
-                             'Leon CPU, 111 ms per frame of ~255 features on test16b)')
 
     parser.add_argument('--pose-attitude-source', choices=pose_stream.ATTITUDE_MODES, default='autopilot',
                         help='Attitude of the 3D pose viewer: autopilot (ArduPilot ATTITUDE read from '
@@ -502,7 +497,7 @@ class PipelineHandles:
     features_queue: Optional[object] = None
     points_queue: Optional[object] = None
     points_status_queue: Optional[object] = None
-    rois_queue: Optional[object] = None  # rois "host": the ROI configs up
+    rois_queue: Optional[object] = None  # the ROI configs up
     # points: the on-demand full depth gate (control up, frames down)
     full_depth_control_queue: Optional[object] = None
     full_depth_queue: Optional[object] = None
@@ -652,32 +647,24 @@ def build_depth_stream(p, stereo, args, stereo_settings):
     return control_queue, frame_queue, status_queue, info, names
 
 
-def build_depth_points(p, stereo, feature_tracker, args):
+def build_depth_points(p, stereo):
     """
     points: the Script (depth_points.device_script) pairing each request with its depth frame, and the
     SpatialLocationCalculator it feeds in lockstep (blocking size-1 inputs both ways, inputConfig waiting for a
     message, so exactly one config and one depth frame are in flight). The Script's depth input is
     non-blocking and holds the newest DEPTH_BUFFER frames (a request comes up to WAIT_PERIODS after its frame).
-    rois "host": the tags and configs come from the host's 'rois' queue (ROIS_QUEUE: REQUESTS_AHEAD of each);
-    "camera": the Script builds the configs from the FeatureTracker output.
+    The tags and configs come from the host's 'rois' queue (ROIS_QUEUE: REQUESTS_AHEAD of each).
 
-    Returns (points queue, status queue, rois queue or None).
+    Returns (points queue, status queue, rois queue).
     """
-    thresholds = depth_points.thresholds_mm(args.min_depth, args.max_depth)
     script = p.create(dai.node.Script)
     slc = p.create(dai.node.SpatialLocationCalculator)
     stereo.depth.link(script.inputs["depth"])
     script.inputs["depth"].setBlocking(False)
     script.inputs["depth"].setMaxSize(depth_points.DEPTH_BUFFER)
-    rois_queue = None
-    if args.depth_points_rois == depth_points.ROIS_CAMERA:
-        feature_tracker.outputFeatures.link(script.inputs["features"])
-        script.inputs["features"].setBlocking(False)
-        script.inputs["features"].setMaxSize(2)
-    else:
-        script.inputs["rois"].setBlocking(False)
-        script.inputs["rois"].setMaxSize(depth_points.ROIS_QUEUE)
-        rois_queue = script.inputs["rois"].createInputQueue(maxSize=depth_points.ROIS_QUEUE, blocking=False)
+    script.inputs["rois"].setBlocking(False)
+    script.inputs["rois"].setMaxSize(depth_points.ROIS_QUEUE)
+    rois_queue = script.inputs["rois"].createInputQueue(maxSize=depth_points.ROIS_QUEUE, blocking=False)
     for name, slc_input in (("config", slc.inputConfig), (depth_points.SLC_DEPTH_OUT, slc.inputDepth)):
         script.outputs[name].link(slc_input)
         slc_input.setBlocking(True)
@@ -687,7 +674,7 @@ def build_depth_points(p, stereo, feature_tracker, args):
         output.link(script.inputs[name])
         script.inputs[name].setBlocking(True)
         script.inputs[name].setMaxSize(1)
-    script.setScript(depth_points.device_script(args.depth_points_rois, (args.width, args.height), thresholds))
+    script.setScript(depth_points.device_script())
     points_queue = script.outputs["points"].createOutputQueue(maxSize=8, blocking=False)
     status_queue = script.outputs["status"].createOutputQueue(maxSize=16, blocking=False)
     return points_queue, status_queue, rois_queue
@@ -736,7 +723,7 @@ def build_pipeline(p, device, args, stereo_settings):
     if points:
         handles.features_queue = feature_tracker.outputFeatures.createOutputQueue(maxSize=4, blocking=False)
         (handles.points_queue, handles.points_status_queue,
-         handles.rois_queue) = build_depth_points(p, stereo, feature_tracker, args)
+         handles.rois_queue) = build_depth_points(p, stereo)
         handles.full_depth_control_queue, handles.full_depth_queue = build_full_depth_gate(p, stereo)
     else:
         sync = p.create(dai.node.Sync)
@@ -895,7 +882,7 @@ class FetchedFeatures:
 class PointsSource:
     """
     points: the features straight from the FeatureTracker, then the camera's depth at them
-    (depth_points.DepthPointsReceiver: rois "host" sends each frame's tag and ROI config). Each features message
+    (depth_points.DepthPointsReceiver sends each frame's tag and ROI config). Each features message
     is requested as soon as it is fetched: get() takes the messages already queued and requests them, then
     hands out the oldest, so when the Pi falls behind the camera already works on the next frames while the Pi
     solves this one. At most REQUESTS_AHEAD are requested and not yet handed out (what the camera's 'rois' queue
@@ -913,18 +900,11 @@ class PointsSource:
         self.ahead = deque()
         self.ahead_max = self.behind_dropped = 0
         thresholds = depth_points.thresholds_mm(args.min_depth, args.max_depth)
-        rois_queue = handles.rois_queue
-
-        def send(message):
-            rois_queue.send(message)
-
         def counted(rows):
             link_streams.add("depth_points", link_stats.spatial_data_bytes(0 if rows is None else len(rows)))
 
         self.receiver = depth_points.DepthPointsReceiver(
-            handles.points_queue, self.image_size, args.depth_points_rois,
-            wait_s=depth_points.wait_s(args.fps, args.depth_points_rois),
-            send=send if rois_queue is not None else None,
+            handles.points_queue, self.image_size, wait_s=depth_points.wait_s(args.fps), send=handles.rois_queue.send,
             build_config=lambda windows, limits, sequence: depth_points.make_config(dai, windows, limits, sequence),
             build_tag=lambda sequence: depth_points.make_tag(dai, sequence),
             thresholds=thresholds, frame_period_s=1.0 / max(args.fps, 1), log=log, on_message=counted)
@@ -933,9 +913,8 @@ class PointsSource:
         self.on_status()
         ids, uv = tracked_arrays(msg)
         self.link_streams.add("features", link_stats.features_bytes(ids))
-        receiver = self.receiver
-        requested = receiver.request(msg.getSequenceNum(), uv)
-        if requested and receiver.roi_source == depth_points.ROIS_HOST:
+        requested = self.receiver.request(msg.getSequenceNum(), uv)
+        if requested:
             self.link_streams.add("depth_points_rois", link_stats.points_request_bytes(len(ids) + depth_points.EXTRA_ROIS))
         return FetchedFeatures(msg, ids, uv, requested)
 
@@ -1254,14 +1233,13 @@ def run_session(device, args, log_only, data_log, stereo_settings, telemetry, ma
                         handles.full_depth_control_queue.send(control)
                         link_streams.add("control", link_stats.BUFFER_OVERHEAD)
                     gate = depth_points.FullDepthGate(send_gate_control, log=logger.info)
-                logger.info(f"Depth transport: points (camera SpatialLocationCalculator, ROIs built on the "
-                            f"{args.depth_points_rois}); full depth frames only on demand")
+                logger.info("Depth transport: points (camera SpatialLocationCalculator, ROIs built on the Pi); "
+                            "full depth frames only on demand")
             else:
                 source = FullFrameSource(handles, link_streams)
                 logger.info("Depth transport: full_frame (every depth frame to the Pi)")
             data_log.event("depth_transport", transport=handles.depth_transport,
-                           rois=args.depth_points_rois if points_mode else None,
-                           wait_s=depth_points.wait_s(args.fps, args.depth_points_rois) if points_mode else None,
+                           wait_s=depth_points.wait_s(args.fps) if points_mode else None,
                            depth_buffer_frames=depth_points.DEPTH_BUFFER if points_mode else None)
             telemetry.depth_points_status = lambda: {**source.status(),
                                                      "full_depth": gate.status() if gate is not None else None}

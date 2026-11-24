@@ -108,8 +108,6 @@ def parse_args(argv=None):
     parser.add_argument("--depth-stream-debug", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--pose-attitude-source", choices=pose_stream.ATTITUDE_MODES, default=pose_stream.AUTOPILOT)
     parser.add_argument("--depth-transport", choices=depth_points.TRANSPORTS, default=depth_points.DEFAULT_TRANSPORT)
-    parser.add_argument("--depth-points-rois", choices=depth_points.ROI_SOURCES,
-                        default=depth_points.DEFAULT_ROI_SOURCE)
     parser.add_argument("--min-depth", type=float, default=0.2)
     parser.add_argument("--max-depth", type=float, default=15.0)
     parser.add_argument("--camera-angle", type=float, default=0.0)
@@ -333,17 +331,13 @@ class MockPointsCamera:
     Points mode's camera side in mock mode (depth_points.device_script + the SpatialLocationCalculator): it holds
     the latest depth frame (its time, pan offset and turbidity) and answers a request for that frame's
     sequence number with what the SLC computes on it (slc_rows), re-tagged with the frame's sequence number and
-    timestamp, into `queue`. rois "host": requests are the Pi's tag and ROI config (receive(): a config takes the
-    tag before it, as the camera Script does); "camera": the features themselves (frame()). Its status reports
-    (size, tagging, stats) go to on_status.
+    timestamp, into `queue`. Requests are the Pi's tag and ROI config (receive(): a config takes the tag before
+    it, as the camera Script does). Its status reports (size, tagging, stats) go to on_status.
     """
 
-    def __init__(self, scene, roi_source, image_size, thresholds, on_status, rng, link_streams):
+    def __init__(self, scene, image_size, on_status, rng, link_streams):
         self.scene = scene
-        self.roi_source = roi_source
-        self.image_size = tuple(image_size)
         self.depth_size = tuple(image_size)
-        self.thresholds = thresholds
         self.on_status = on_status
         self.rng = rng
         self.link_streams = link_streams
@@ -362,10 +356,8 @@ class MockPointsCamera:
     def start(self):
         self.status("size", f"{self.depth_size[0]} {self.depth_size[1]}")
 
-    def frame(self, sequence, t, offset, turbid, uv):
+    def frame(self, sequence, t, offset, turbid):
         self.held = (int(sequence), t, tuple(offset), turbid)
-        if self.roi_source == depth_points.ROIS_CAMERA:
-            self.answer(depth_points.all_windows(uv, self.image_size, self.depth_size), self.thresholds, sequence)
 
     def receive(self, message):
         if message[0] == "tag":
@@ -401,8 +393,7 @@ class MockPointsCamera:
         self.busy.append(took)
         if self.sent % depth_points.STATS_EVERY == 0:
             busy, self.busy = np.array(self.busy) * 1000.0, []
-            self.status("stats", f"0.1 0.2 {busy.mean():.1f} {busy.max():.1f} {self.depth_size[0]} "
-                                 f"{self.depth_size[1]}")
+            self.status("stats", f"{busy.mean():.1f} {busy.max():.1f} {self.depth_size[0]} {self.depth_size[1]}")
 
 
 class MockCameraLoad:
@@ -428,11 +419,7 @@ class MockCameraLoad:
 
     def getLeonMssCpuUsage(self):
         vio = self.vio
-        value = 0.31 + (0.02 if vio.points_mode else 0.0)
-        if vio.points_mode and vio.args.depth_points_rois == depth_points.ROIS_CAMERA:
-            # test16b: the camera Script's build took 111 ms of Leon MSS per frame of ~255 features
-            value += min(0.111 / 255 * vio.args.num_features * vio.args.fps, 0.67)
-        return self._cpu(value)
+        return self._cpu(0.31 + (0.02 if vio.points_mode else 0.0))
 
     def getDdrMemoryUsage(self):
         return self._memory(180e6, 343e6)
@@ -624,7 +611,6 @@ class FakeVio:
         """points: the real DepthPointsReceiver (pnp_vio.PointsSource's settings) and FullDepthGate, on MockPointsCamera."""
         args, streams = self.args, self.link.streams
         thresholds = depth_points.thresholds_mm(args.min_depth, args.max_depth)
-        host = args.depth_points_rois == depth_points.ROIS_HOST
 
         def send(message):
             self.points_camera.receive(message)
@@ -635,11 +621,10 @@ class FakeVio:
         def send_gate_control(every):
             streams.add("control", link_stats.BUFFER_OVERHEAD)
 
-        self.points_camera = MockPointsCamera(self.scene, args.depth_points_rois, (self.width, self.height),
-                                              thresholds, lambda data: self.points.on_status(data), self.rng, streams)
+        self.points_camera = MockPointsCamera(self.scene, (self.width, self.height),
+                                              lambda data: self.points.on_status(data), self.rng, streams)
         self.points = depth_points.DepthPointsReceiver(
-            self.points_camera.queue, (self.width, self.height), args.depth_points_rois,
-            wait_s=depth_points.wait_s(args.fps, args.depth_points_rois), send=send if host else None,
+            self.points_camera.queue, (self.width, self.height), wait_s=depth_points.wait_s(args.fps), send=send,
             build_config=lambda windows, limits, sequence: ("config", windows, limits),
             build_tag=lambda sequence: ("tag", sequence), thresholds=thresholds,
             frame_period_s=1.0 / max(args.fps, 1), log=print, on_message=counted)
@@ -649,9 +634,9 @@ class FakeVio:
     def points_frame(self, t, frame, sequence):
         """points: this frame's depth at its features (DepthPoints or None) and its validity in frame["valid"]."""
         uv = frame["uv"]
-        self.points_camera.frame(sequence, t, self.offset, self.turbidity(t), uv)
+        self.points_camera.frame(sequence, t, self.offset, self.turbidity(t))
         requested = self.points.request(sequence, uv)
-        if requested and self.args.depth_points_rois == depth_points.ROIS_HOST:
+        if requested:
             self.link.streams.add("depth_points_rois",
                                   link_stats.points_request_bytes(len(uv) + depth_points.EXTRA_ROIS))
         points, problem = self.points.take(sequence, uv, t, requested=requested)
@@ -786,8 +771,7 @@ class FakeVio:
             self.start_link()
             if self.points_mode:
                 self.start_points()
-            self.data_log.event("depth_transport", transport=args.depth_transport,
-                                rois=args.depth_points_rois if self.points_mode else None, mock=True)
+            self.data_log.event("depth_transport", transport=args.depth_transport, mock=True)
             self.telemetry.set_phase("configuring")
             writer = snapshots.SnapshotWriter(args.snapshot_dir, self.depth_range, log=print)
             pending = []

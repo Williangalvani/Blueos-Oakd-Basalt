@@ -65,7 +65,7 @@ LOG_MESSAGE_OVERHEAD = 64
 # uint16, the pixel count and a Point3f
 SPATIAL_LOCATION_BYTES = 90
 SPATIAL_DATA_OVERHEAD = 64
-# SpatialLocationCalculatorConfigData sent up (rois "host")
+# SpatialLocationCalculatorConfigData sent up
 SPATIAL_CONFIG_ROI_BYTES = 45
 SPATIAL_CONFIG_OVERHEAD = 56
 # libnop's unsigned integer widths: below each limit, the width at the same index (above the last: 9 B)
@@ -87,8 +87,7 @@ STREAMS = {
     "depth_stream_status": "depth stream Script status reports",
     "depth_points_status": "depth points Script status reports",
     "device_log": "camera log messages",
-    "depth_points_rois": "UP: tag + ROI config per frame, built on the Pi (depth_points_rois host; estimate per "
-                         "ROI)",
+    "depth_points_rois": "UP: tag + ROI config per frame, built on the Pi (estimate per ROI)",
     "control": "UP: gate, snapshot request and tracker control messages (estimate)",
 }
 # Streams the host sends to the camera
@@ -149,7 +148,7 @@ def spatial_config_bytes(rois):
 
 
 def points_request_bytes(rois):
-    """rois "host": one frame's tag (a Buffer) and ROI config."""
+    """One frame's tag (a Buffer) and ROI config."""
     return BUFFER_OVERHEAD + spatial_config_bytes(rois)
 
 

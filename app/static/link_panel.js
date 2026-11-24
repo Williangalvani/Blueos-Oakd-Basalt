@@ -132,7 +132,7 @@ function cameraLoadRows(load) {
 function transportRows(transport, viewers) {
   const t = transport || {};
   const rows = [['setting', !t.configured ? '–' : t.configured === 'points'
-    ? 'points (ROIs listed on the ' + (t.configured_rois === 'camera' ? 'camera' : 'Pi') + ')' : 'full_frame']];
+    ? 'points (ROIs listed on the Pi)' : 'full_frame']];
   const live = t.live;
   if (!live || live.error) {
     rows.push(['running', live && live.error ? 'status error: ' + live.error : 'n/a (VIO not running)']);

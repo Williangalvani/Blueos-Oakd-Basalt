@@ -369,13 +369,12 @@ def test_the_mock_link_emulates_plausible_counters_and_streams(tmp_path):
     assert status["share_of_100mbps"] == pytest.approx(status["down_mbps_10s"] / 100)
 
 
-@pytest.mark.parametrize("rois", ["host", "camera"])
-def test_the_mock_points_transport_pairs_every_frame_and_counts_its_streams(tmp_path, rois):
+def test_the_mock_points_transport_pairs_every_frame_and_counts_its_streams(tmp_path):
     import depth_points
     import link_stats
     import mock_vio
     now = [1795000000.0]
-    args = mock_vio.parse_args(["--fps", "15", "--snapshot-dir", str(tmp_path), "--depth-points-rois", rois])
+    args = mock_vio.parse_args(["--fps", "15", "--snapshot-dir", str(tmp_path)])
     assert args.depth_transport == "points"
     vio = mock_vio.FakeVio(args, np.random.default_rng(2), clock=lambda: now[0])
     vio.start_link()
@@ -393,7 +392,7 @@ def test_the_mock_points_transport_pairs_every_frame_and_counts_its_streams(tmp_
         if sequence % 15 == 0:
             vio.link.sample()
     status = vio.depth_transport_status()
-    assert status["transport"] == "points" and status["rois"] == rois and status["paired_percent"] == 100.0
+    assert status["transport"] == "points" and status["paired_percent"] == 100.0
     assert status["missing"] == 0 and status["device"]["size"] == [640, 400] and status["mock"] is True
     assert status["full_depth"] == {"on": False, "every": 0, "reasons": [], "frames": 0, "bytes": 0, "since": None}
     link = vio.link.status()
@@ -402,13 +401,10 @@ def test_the_mock_points_transport_pairs_every_frame_and_counts_its_streams(tmp_
     points_mbps = link_stats.spatial_data_bytes(n + depth_points.EXTRA_ROIS) * 15 * 8 / 1e6
     assert streams["depth_points"]["mbps"] == pytest.approx(points_mbps, rel=0.01)
     assert streams["depth_points"]["direction"] == "down"
-    if rois == "host":
-        up = link_stats.points_request_bytes(n + depth_points.EXTRA_ROIS) * 15 * 8 / 1e6
-        assert streams["depth_points_rois"]["mbps"] == pytest.approx(up, rel=0.01)
-        assert streams["depth_points_rois"]["direction"] == "up"
-        assert link["up_mbps_10s"] > link["streams_up_sum_mbps"] >= up
-    else:
-        assert "depth_points_rois" not in streams
+    up = link_stats.points_request_bytes(n + depth_points.EXTRA_ROIS) * 15 * 8 / 1e6
+    assert streams["depth_points_rois"]["mbps"] == pytest.approx(up, rel=0.01)
+    assert streams["depth_points_rois"]["direction"] == "up"
+    assert link["up_mbps_10s"] > link["streams_up_sum_mbps"] >= up
     # Far below the ~41 Mbps of RAW16 depth at 640x400 (here 300 features at 15 fps: ~3.3 Mbps of points, ~2.3
     # of features)
     assert link["down_mbps_10s"] < 7.0
@@ -494,7 +490,7 @@ def test_status_shows_mock_and_a_running_vio(server):
     assert {"depth_points", "depth_points_rois", "features", "imu"} <= names and "depth" not in names
     assert link["down_mbps"] > link["streams_sum_mbps"] * 0.5 > 0
     transport = s["depth_transport"]
-    assert transport["configured"] == "points" and transport["configured_rois"] == "host"
+    assert transport["configured"] == "points"
     deadline = time.monotonic() + 3.0
     while not (transport["live"] and transport["camera_load"]) and time.monotonic() < deadline:
         time.sleep(0.2)
