@@ -347,10 +347,12 @@ def test_feature_stream_forwards_the_vio_features(client, tmp_path, publishing_v
     assert status["problem"] is None and status["log_only"] is True and status["last_frame"]["inliers"] == 1
     assert status["last_failure"]["reason"] == "too_few_matches" and isinstance(status["fps"], float)
 
-    # Nobody watching: the lease runs out and the VIO stops writing
+    # Nobody watching: once the linger ends the lease is removed and the VIO stops writing
     lease = vio_telemetry.DEFAULT_DIR / feature_stream.LEASE_FILE
-    old = time.time() - feature_stream.LEASE_S - 1
-    os.utime(lease, (old, old))
+    assert lease.exists()
+    main.viewer_registry.linger_s = 0.0
+    main.viewer_registry.tick()
+    assert not lease.exists()
     deadline = time.time() + 3
     while publishing_vio.wanted and time.time() < deadline:
         time.sleep(0.02)

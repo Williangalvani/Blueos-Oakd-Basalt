@@ -258,7 +258,7 @@ def test_pose_viewer_module_is_relative_and_vendored(client):
     assert external_urls(js) == set() and not re.search(r"""['"`]/(api|static)""", js)
     imports = re.findall(r"""^import .* from '([^']+)';""", js, re.M)
     assert imports == ["./vendor/three/three.module.min.js", "./vendor/three/OrbitControls.js"]
-    assert "base + 'api/stream/pose'" in js and "EventSource" in js and "visibilityState" in js
+    assert "base + 'api/stream/pose?client='" in js and "EventSource" in js and "visibilityState" in js
     for control in ("Reset view", "Clear trail", "Follow"):
         assert control in js
     for field in ("x", "y", "z", "roll", "pitch", "yaw"):

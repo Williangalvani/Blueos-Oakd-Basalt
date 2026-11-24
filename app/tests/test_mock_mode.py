@@ -324,7 +324,7 @@ def test_the_mock_reports_the_camera_variant_and_its_debug_log(tmp_path, encodin
 def test_the_mock_link_emulates_plausible_counters_and_streams(tmp_path):
     import mock_vio
     now = [1795000000.0]
-    args = mock_vio.parse_args(["--fps", "15", "--snapshot-dir", str(tmp_path)])
+    args = mock_vio.parse_args(["--fps", "15", "--snapshot-dir", str(tmp_path), "--depth-transport", "full_frame"])
     vio = mock_vio.FakeVio(args, np.random.default_rng(2), clock=lambda: now[0])
     vio.start_link()
     vio.link.sample()
@@ -345,6 +345,85 @@ def test_the_mock_link_emulates_plausible_counters_and_streams(tmp_path):
     assert 0 < status["unaccounted_mbps"] < 0.05 * status["streams_sum_mbps"]
     assert 0 < status["up_mbps_10s"] < 0.1
     assert status["share_of_100mbps"] == pytest.approx(status["down_mbps_10s"] / 100)
+
+
+@pytest.mark.parametrize("rois", ["host", "camera"])
+def test_the_mock_points_transport_pairs_every_frame_and_counts_its_streams(tmp_path, rois):
+    import depth_points
+    import link_stats
+    import mock_vio
+    now = [1795000000.0]
+    args = mock_vio.parse_args(["--fps", "15", "--snapshot-dir", str(tmp_path), "--depth-points-rois", rois])
+    assert args.depth_transport == "points"
+    vio = mock_vio.FakeVio(args, np.random.default_rng(2), clock=lambda: now[0])
+    vio.start_link()
+    vio.start_points()
+    vio.link.sample()
+    n = len(vio.features.uv)
+    for sequence in range(1, 12 * 15 + 1):
+        now[0] += 1.0 / 15
+        frame = {"uv": vio.features.uv}
+        points = vio.points_frame(now[0], frame, sequence)
+        assert points is not None and points.sequence == sequence and frame["depth_problem"] is None
+        # The SLC's median at each feature: the synthetic depth at the window's sampled pixels
+        assert 0.9 < frame["valid"].mean() <= 1.0
+        vio.count_link_frame(n)
+        if sequence % 15 == 0:
+            vio.link.sample()
+    status = vio.depth_transport_status()
+    assert status["transport"] == "points" and status["rois"] == rois and status["paired_percent"] == 100.0
+    assert status["missing"] == 0 and status["device"]["size"] == [640, 400] and status["mock"] is True
+    assert status["full_depth"] == {"on": False, "every": 0, "reasons": [], "frames": 0, "bytes": 0, "since": None}
+    link = vio.link.status()
+    streams = {s["name"]: s for s in link["streams"]}
+    assert "depth" not in streams and "sync_group" not in streams
+    points_mbps = link_stats.spatial_data_bytes(n + depth_points.EXTRA_ROIS) * 15 * 8 / 1e6
+    assert streams["depth_points"]["mbps"] == pytest.approx(points_mbps, rel=0.01)
+    assert streams["depth_points"]["direction"] == "down"
+    if rois == "host":
+        up = link_stats.spatial_config_bytes(n + depth_points.EXTRA_ROIS) * 15 * 8 / 1e6
+        assert streams["depth_points_rois"]["mbps"] == pytest.approx(up, rel=0.01)
+        assert streams["depth_points_rois"]["direction"] == "up"
+        assert link["up_mbps_10s"] > link["streams_up_sum_mbps"] >= up
+    else:
+        assert "depth_points_rois" not in streams
+    # Far below the ~41 Mbps of RAW16 depth at 640x400
+    assert link["down_mbps_10s"] < 6.0
+
+
+def test_the_mock_gate_sends_full_depth_frames_only_while_needed(tmp_path):
+    import mock_vio
+    now = [1795000000.0]
+    vio = mock_vio.FakeVio(mock_vio.parse_args(["--fps", "10", "--snapshot-dir", str(tmp_path)]),
+                           np.random.default_rng(3), clock=lambda: now[0])
+    vio.start_link()
+    vio.start_points()
+    assert vio.full_depth(now[0], 1, {"depth_probe": 0, "host_jpeg": 0}) is None
+    frames = [vio.full_depth(now[0], s, {"depth_probe": 0, "host_jpeg": 2}) for s in range(2, 8)]
+    assert [f is not None for f in frames] == [True, False, True, False, True, False]
+    assert frames[0].shape == (400, 640) and frames[0].dtype == np.uint16
+    assert vio.full_depth(now[0], 9, {"depth_probe": 1, "host_jpeg": 2}) is not None
+    assert vio.full_depth(now[0], 10, {}) is None
+    gate = vio.gate.status()
+    assert gate["frames"] == 4 and gate["bytes"] == 4 * vio.link_stats.frame_bytes(640 * 400 * 2) and not gate["on"]
+    assert vio.link.streams.totals()["depth_on_demand"][0] == 4
+    assert vio.link.streams.totals()["control"][0] == 4  # off -> 2 -> 1 -> off: sent on each change
+
+
+def test_the_mock_slc_matches_the_camera_rules():
+    import mock_vio
+    depth = np.zeros((10, 10), np.uint16)
+    depth[0:5, 0:5] = np.arange(25, dtype=np.uint16).reshape(5, 5) * 100 + 1000
+    at = lambda u, v: depth[np.clip(v, 0, 9), np.clip(u, 0, 9)]  # noqa: E731
+    windows = [[0, 0, 5, 5], [0, 0, 5, 5], [5, 5, 1, 1], [0, 0, 1, 1], [9, 9, 1, 1]]
+    rows = mock_vio.slc_rows(at, windows, (1000, 3400))
+    # Every 2nd pixel: (0,0) 1000 and (4,4) 3400 are excluded (thresholds are exclusive), the rest of the 3x3 grid in
+    sampled = [depth[y, x] for y in (0, 2, 4) for x in (0, 2, 4)]
+    inside = [d for d in sampled if 1000 < d < 3400]
+    assert rows[0, 6] == len(inside) == 7 and rows[0, 4] == np.round(np.median(inside))
+    assert rows[0, :4].tolist() == [0, 0, 5, 5]
+    # The last EXTRA_ROIS use the centre thresholds (everything but 0)
+    assert rows[2, 6] == 0 and rows[3, 4] == 1000 and rows[3, 6] == 1 and rows[4, 6] == 0
 
 
 def test_the_mock_counts_the_camera_stream_jpegs(tmp_path):
@@ -387,8 +466,20 @@ def test_status_shows_mock_and_a_running_vio(server):
     while not link["streams"] and time.monotonic() < deadline:  # rates need two samples, 1 s apart
         time.sleep(0.2)
         link = get_json(port, "/api/status")[1]["telemetry"]["link"]
-    assert {"depth", "features", "imu"} <= {stream["name"] for stream in link["streams"]}
+    names = {stream["name"] for stream in link["streams"]}
+    # points (the default): no depth frames, the depth at the features and the ROI configs up
+    assert {"depth_points", "depth_points_rois", "features", "imu"} <= names and "depth" not in names
     assert link["down_mbps"] > link["streams_sum_mbps"] * 0.5 > 0
+    transport = s["depth_transport"]
+    assert transport["configured"] == "points" and transport["configured_rois"] == "host"
+    deadline = time.monotonic() + 3.0
+    while not (transport["live"] and transport["camera_load"]) and time.monotonic() < deadline:
+        time.sleep(0.2)
+        transport = get_json(port, "/api/status")[1]["depth_transport"]
+    assert transport["live"]["transport"] == "points" and transport["live"]["paired_percent"] > 90
+    assert transport["live"]["full_depth"]["on"] is False
+    assert 0 < transport["camera_load"]["leon_css_cpu_percent"] < 100
+    assert s["viewers"]["video_idle"] is True and s["viewers"]["total"] == 0
     assert s["cpu_percent"] is None or 0 <= s["cpu_percent"] <= 100
     assert s["vehicle"]["armed"] is False and "mock" in s["vehicle"]["detail"]
     assert s["camera"]["intrinsics"] and s["camera"]["mock"]
@@ -418,10 +509,13 @@ def test_the_depth_stream_sends_three_jpeg_parts(server):
     while True:  # the metadata (with the centre depth) is rewritten once a second while streaming
         _, s = get_json(port, "/api/status")
         depth = s["depth_stream"]
-        if (depth["center"] and depth["frames_total"] >= 3) or time.monotonic() > deadline:
+        # The centre patch can be all invalid for a moment (the mock's turbid water): wait for a valid one
+        valid = depth["center"] and depth["center"]["median_mm"] is not None
+        if (valid and depth["frames_total"] >= 3) or time.monotonic() > deadline:
             break
         time.sleep(0.2)
-    assert depth["frames_total"] >= 3 and 300 < depth["center"]["median_mm"] < 4000
+    assert depth["frames_total"] >= 3 and valid, depth["center"]
+    assert 300 < depth["center"]["median_mm"] < 4000
 
 
 def test_the_pose_stream_follows_the_mock_survey(server):
@@ -497,6 +591,14 @@ def test_snapshots_probe_and_focal_check_give_synthetic_results(server):
     assert status == 200 and headers["x-overlay"] == "features"
     assert sum(int(headers[f"x-overlay-{kind}"]) for kind in ("inliers", "outliers", "unmatched")) == 300
     assert cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_UNCHANGED).shape == (400, 640, 3)
+    # Without an overlay: the (mock) camera's JPEG as it came over the link
+    status, headers, jpeg = request(port, "GET", "/api/snapshot?stream=rect_left")
+    assert status == 200 and headers["content-type"] == "image/jpeg" and headers["x-snapshot-encoded-on"] == "camera"
+    assert cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_UNCHANGED).shape == (400, 640)
+    _, s = get_json(port, "/api/status")
+    shots = {item["name"]: item for item in s["image_streams"]["streams"]}
+    assert shots["snapshot_rect_left"]["encoded_on"] == "camera" and shots["snapshot_rect_left"]["last_bytes"] > 0
+    assert shots["snapshot_depth"]["encoded_on"] == "pi" and s["image_streams"]["fallbacks"] == []
     status, _, png = request(port, "GET", "/api/snapshot?stream=depth&raw=1")
     raw = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_UNCHANGED)
     assert status == 200 and raw.dtype == np.uint16 and 300 < np.median(raw[raw > 0]) < 4000

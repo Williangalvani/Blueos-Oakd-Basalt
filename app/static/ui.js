@@ -216,6 +216,8 @@ function renderStatus(s) {
   }
 
   renderLink(t && t.link);
+  renderKv('transport-kv', transportRows(s.depth_transport, s.viewers));
+  renderKv('images-kv', imageStreamRows(s.image_streams));
 
   const out = (t && t.output) || {};
   setText('out-mode', out.mode || (s.log_only ? 'log-only' : 'sending'));
@@ -233,14 +235,18 @@ function renderStatus(s) {
   renderDepthStream(s);
 }
 
-// Camera link box: link_panel.js formats telemetry.link
-function renderLink(link) {
-  const kv = $('link-kv');
+function renderKv(id, rows) {
+  const kv = $(id);
   kv.replaceChildren();
-  for (const [label, value] of linkSummaryRows(link)) {
+  for (const [label, value] of rows) {
     kv.append(Object.assign(document.createElement('span'), { textContent: label }),
               Object.assign(document.createElement('span'), { textContent: value }));
   }
+}
+
+// Camera link box: link_panel.js formats telemetry.link
+function renderLink(link) {
+  renderKv('link-kv', linkSummaryRows(link));
   const rows = linkStreamRows(link);
   $('link-streams').hidden = !rows.length;
   $('link-streams-body').replaceChildren(...rows.map(r => {
@@ -841,7 +847,7 @@ function depthStreamProblem(s) {
 
 function depthEncodingText(d) {
   if (d.stale || !d.variant) return d.configured_encoding ? d.configured_encoding + ' (configured)' : '–';
-  const parts = [d.variant + (d.encoded_on === 'pi' ? ' · encoded on the Pi' : ' · encoded on the camera')];
+  const parts = [d.variant + (d.encoded_on === 'pi' ? ' · fallback: raw depth over the link, encoded on the Pi' : ' · encoded on the camera')];
   if (d.requested_variant && d.requested_variant !== d.variant) parts.push('requested ' + d.requested_variant);
   if (d.variant_reason && d.requested_variant !== 'auto') parts.push(d.variant_reason);
   if (d.fallback) parts.push('fallback: ' + d.fallback.reason + (d.fallback.at_start ? '' : ' (from ' + d.fallback.from + ')'));
@@ -928,6 +934,9 @@ function renderDepthStream(s) {
   setText('ds-cost', cost ? (d.encoded_on === 'pi' ? 'Pi encode ' : '') + fmt(cost.convert_ms_mean, 1) + ' ms mean, '
     + fmt(cost.convert_ms_max, 1) + ' ms max' : '–');
   setText('ds-errors', depthErrorsText(d, s.server_time));
+  const v = s.viewers;
+  setText('ds-viewers', v ? v.text + (d.depth_frames === 'on_demand' && d.encoded_on === 'pi'
+    ? ' · full depth frames sent only while watched' : '') : '–');
   renderDeviceLog(d, s.server_time);
   renderFeatureCounts();
 

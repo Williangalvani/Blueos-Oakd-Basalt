@@ -278,3 +278,75 @@ def test_vio_loop_cost_is_tiny(tmp_path):
     print(f"record_frame + publish_due: {idle_ms:.4f} ms/frame idle, {watched_ms:.4f} ms/frame with the page open")
     assert idle_ms < 0.2
     assert watched_ms < 0.2
+
+
+class FakeLoadDevice:
+    """The DeviceBase load RPCs read_camera_load calls (CpuUsage.average 0-1, MemoryInfo used/total bytes)."""
+
+    def __init__(self, broken=()):
+        self.broken = set(broken)
+        self.calls = 0
+
+    def _get(self, name, value):
+        self.calls += 1
+        if name in self.broken:
+            raise RuntimeError(f"{name} failed")
+        return value
+
+    def getLeonCssCpuUsage(self):
+        return self._get("leon_css", type("CpuUsage", (), {"average": 0.425})())
+
+    def getLeonMssCpuUsage(self):
+        return self._get("leon_mss", type("CpuUsage", (), {"average": 0.3})())
+
+    def getDdrMemoryUsage(self):
+        return self._get("ddr", type("MemoryInfo", (), {"used": 100, "total": 400})())
+
+    def getCmxMemoryUsage(self):
+        return self._get("cmx", type("MemoryInfo", (), {"used": 3, "total": 4})())
+
+    def getLeonCssHeapUsage(self):
+        return self._get("leon_css_heap", type("MemoryInfo", (), {"used": 1, "total": 0})())
+
+    def getLeonMssHeapUsage(self):
+        return self._get("leon_mss_heap", type("MemoryInfo", (), {"used": 5, "total": 10})())
+
+
+def test_read_camera_load_reports_each_getter_and_its_errors():
+    load = vio_telemetry.read_camera_load(FakeLoadDevice())
+    assert load["leon_css_cpu_percent"] == 42.5 and load["leon_mss_cpu_percent"] == 30.0
+    assert load["ddr"] == {"used": 100, "total": 400, "used_percent": 25.0}
+    assert load["leon_css_heap"]["used_percent"] is None and load["errors"] is None
+    load = vio_telemetry.read_camera_load(FakeLoadDevice(broken={"leon_mss", "cmx"}))
+    assert load["leon_mss_cpu_percent"] is None and load["cmx"] is None
+    assert load["errors"] == {"leon_mss": "leon_mss failed", "cmx": "cmx failed"}
+    assert load["leon_css_cpu_percent"] == 42.5
+
+
+def test_camera_load_is_sampled_on_the_publisher_every_five_seconds(tmp_path):
+    device = FakeLoadDevice()
+    telemetry, clock = make(tmp_path, camera_load=lambda: vio_telemetry.read_camera_load(device),
+                            depth_points_status=lambda: {"transport": "points", "paired": 3})
+    frame(telemetry, 99.9)  # the VIO loop never calls the device
+    assert device.calls == 0
+    telemetry.publish_due(100.0)
+    telemetry.publish_due(104.0)
+    assert device.calls == 6
+    telemetry.publish_due(105.0)
+    assert device.calls == 12
+    status = telemetry.status()
+    assert status["camera_load"]["leon_css_cpu_percent"] == 42.5 and status["camera_load"]["unix_time"]
+    assert status["depth_points"] == {"transport": "points", "paired": 3}
+
+
+def test_camera_load_and_depth_points_errors_do_not_stop_the_publisher(tmp_path):
+    def broken():
+        raise RuntimeError("device gone")
+
+    telemetry, clock = make(tmp_path, camera_load=broken, depth_points_status=broken)
+    telemetry.publish_due(100.0)
+    status = telemetry.status()
+    assert status["camera_load"]["errors"] == {"camera_load": "device gone"}
+    assert status["depth_points"] == {"error": "device gone"}
+    telemetry_none, _ = make(tmp_path / "other")
+    assert telemetry_none.status()["camera_load"] is None and telemetry_none.status()["depth_points"] is None

@@ -242,7 +242,7 @@ class Replay:
         writer = snapshots.SnapshotWriter(self.snapshot_dir, log=lambda m: None)
         pending = []
         service = snapshots.SnapshotService(
-            ("rect_left", "rect_right", "depth"), pending.append, writer, self.snapshot_dir,
+            ("rect_left", "rect_right", "depth"), lambda stream, raw: pending.append(stream), writer, self.snapshot_dir,
             unavailable={"rgb": "this device has no CAM_A (RGB) camera"}, poll_interval=0.1, log=print,
             overlay=lambda: self.camera.overlay(**self.last))
         probe = depth_probe.DepthProbeService(self.snapshot_dir / "depth_probe", (300, 4000), 1.0, (WIDTH, HEIGHT),

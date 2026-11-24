@@ -7,9 +7,12 @@ On-demand snapshots of the PnP VIO camera streams, taken without stopping or slo
    (it keeps only the latest frame of each stream, in non-blocking size-1 queues), so nothing crosses
    the PoE link until a snapshot is asked for. One request is in flight at a time, at most one per
    min_interval.
-3. A background thread converts and encodes the frame and atomically writes <stream>.png (depth:
-   colorized, invalid black, plus 16-bit depth_raw.png) and then <stream>.json, which echoes the
-   request time it serves.
+3. A background thread writes the frame atomically, then <stream>.json, which echoes the request time it
+   serves and lists the files. rect_left, rect_right and rgb (CAMERA_JPEG_STREAMS) come JPEG-encoded by the
+   camera's MJPEG encoder and are written as they are (<stream>.jpg). depth is 16-bit millimetres, which a
+   JPEG cannot carry: it crosses raw and the Pi writes depth.png (colorized, invalid black) and the 16-bit
+   depth_raw.png. If the camera's encoder returns nothing for a stream, that stream is sent raw for the rest
+   of the run and PNG-encoded on the Pi, flagged as a fallback (SnapshotService.status, encoding.json).
 4. The endpoint waits up to ~3 s for a <stream>.json that serves its request.
 
 rect_left snapshots also carry the tracked features of the last processed frame ("overlay" in the JSON:
@@ -31,8 +34,22 @@ import numpy as np
 
 SNAPSHOT_DIR = Path("/app/data/snapshots")
 STREAMS = ("rect_left", "rect_right", "depth", "rgb")
+# Images JPEG-encoded on the camera; depth (measurement data, 16-bit mm) always crosses raw
+CAMERA_JPEG_STREAMS = ("rect_left", "rect_right", "rgb")
+# High enough for the focal check's feature matching on rect_left / rect_right
+JPEG_QUALITY = 95
 # Camera matrix and calibration the running PnP VIO uses, for /api/status and /api/focal_check
 CAMERA_STATUS = "camera.json"
+# How each stream is encoded in the running VIO (SnapshotService.status), for /api/status
+ENCODING_STATUS = "encoding.json"
+RAW_FALLBACK = "fallback: raw frames over the link, encoded on the Pi"
+CAMERA_JPEG, RAW = "camera_jpeg", "raw"
+ENCODINGS = (CAMERA_JPEG, RAW)
+
+
+def request_number(stream, raw=False):
+    """The request message's sequence number: the stream's index, + len(STREAMS) to ask for the raw frame."""
+    return STREAMS.index(stream) + (len(STREAMS) if raw else 0)
 
 
 class SnapshotUnavailable(Exception):
@@ -91,16 +108,29 @@ def read_metadata(stream, snapshot_dir=SNAPSHOT_DIR):
         return None
 
 
-def snapshot_path(stream, raw=False, snapshot_dir=SNAPSHOT_DIR):
-    return Path(snapshot_dir) / (f"{stream}_raw.png" if raw else f"{stream}.png")
+def snapshot_path(stream, raw=False, snapshot_dir=SNAPSHOT_DIR, meta=None):
+    """The image file a snapshot's metadata lists (<stream>.jpg from the camera, else <stream>.png)."""
+    files = (meta or {}).get("files") or []
+    raw_file = f"{stream}_raw.png"
+    if raw:
+        return Path(snapshot_dir) / raw_file
+    shown = [name for name in files if name != raw_file]
+    return Path(snapshot_dir) / (shown[0] if shown else f"{stream}.png")
+
+
+def read_encoding_status(snapshot_dir=SNAPSHOT_DIR):
+    try:
+        return json.loads((Path(snapshot_dir) / ENCODING_STATUS).read_text())
+    except (OSError, ValueError):
+        return None
 
 
 def wait_for_snapshot(stream, requested_at, raw=False, timeout=3.0, snapshot_dir=SNAPSHOT_DIR,
                       poll=0.05, clock=time.monotonic, sleep=time.sleep):
     """
-    PNG bytes and metadata of the first snapshot of stream that serves a request made at
-    requested_at. Raises SnapshotUnavailable if the VIO process answered with an error, or
-    SnapshotTimeout after timeout seconds.
+    Image bytes (JPEG or PNG: meta["format"]) and metadata of the first snapshot of stream that serves a
+    request made at requested_at. Raises SnapshotUnavailable if the VIO process answered with an error,
+    or SnapshotTimeout after timeout seconds.
     """
     deadline = clock() + timeout
     while True:
@@ -109,7 +139,7 @@ def wait_for_snapshot(stream, requested_at, raw=False, timeout=3.0, snapshot_dir
             if meta.get("error"):
                 raise SnapshotUnavailable(meta["error"])
             try:
-                return snapshot_path(stream, raw, snapshot_dir).read_bytes(), meta
+                return snapshot_path(stream, raw, snapshot_dir, meta).read_bytes(), meta
             except OSError:
                 pass  # replaced by a newer snapshot between the two reads; retry
         if clock() >= deadline:
@@ -194,19 +224,47 @@ def encode_png(image):
     return data.tobytes()
 
 
+def jpeg_size(data):
+    """(width, height) from a JPEG's SOF header, without decoding it; ValueError if it is not a JPEG."""
+    data = bytes(data)
+    if data[:2] != b"\xff\xd8":
+        raise ValueError(f"not a JPEG ({len(data)} bytes)")
+    i = 2
+    while i + 9 <= len(data):
+        if data[i] != 0xFF:
+            raise ValueError("corrupt JPEG header")
+        marker, length = data[i + 1], int.from_bytes(data[i + 2:i + 4], "big")
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            return int.from_bytes(data[i + 7:i + 9], "big"), int.from_bytes(data[i + 5:i + 7], "big")
+        i += 2 + length
+    raise ValueError("JPEG without a frame header")
+
+
 def write_snapshot(snapshot_dir, stream, image, meta, depth_range_mm=(300, 4000), clock=time.time):
-    """Write the PNG(s) for one frame, then <stream>.json (so the metadata never points at an older PNG)."""
+    """
+    Write one frame, then <stream>.json (so the metadata never points at an older image). image is the
+    camera's JPEG (bytes) or a raw frame (numpy), which is PNG-encoded here.
+    """
     snapshot_dir = Path(snapshot_dir)
     snapshot_dir.mkdir(parents=True, exist_ok=True)
-    image = np.asarray(image)
-    files = [f"{stream}.png"]
-    if stream == "depth":
-        atomic_write(snapshot_dir / "depth_raw.png", encode_png(image.astype(np.uint16)))
-        atomic_write(snapshot_dir / "depth.png", encode_png(colorize_depth(image, *depth_range_mm)))
-        files.append("depth_raw.png")
+    if isinstance(image, (bytes, bytearray, memoryview)):
+        data = bytes(image)
+        width, height = jpeg_size(data)
+        files = [f"{stream}.jpg"]
+        atomic_write(snapshot_dir / files[0], data)
+        record = {"format": "jpeg", "encoded_on": "camera", "bytes": len(data)}
     else:
-        atomic_write(snapshot_dir / f"{stream}.png", encode_png(image))
-    record = {**meta, "stream": stream, "width": int(image.shape[1]), "height": int(image.shape[0]),
+        image = np.asarray(image)
+        height, width = image.shape[:2]
+        files = [f"{stream}.png"]
+        if stream == "depth":
+            atomic_write(snapshot_dir / "depth_raw.png", encode_png(image.astype(np.uint16)))
+            atomic_write(snapshot_dir / "depth.png", encode_png(colorize_depth(image, *depth_range_mm)))
+            files.append("depth_raw.png")
+        else:
+            atomic_write(snapshot_dir / f"{stream}.png", encode_png(image))
+        record = {"format": "png", "encoded_on": "pi", "bytes": int(image.nbytes)}
+    record = {**meta, **record, "stream": stream, "width": int(width), "height": int(height),
               "written_at": clock(), "files": files}
     atomic_write(snapshot_dir / f"{stream}.json", json.dumps(record).encode())
 
@@ -269,38 +327,84 @@ class SnapshotService:
     VIO-side request handling. Call tick() once per VIO frame (cheap: at most one scandir every
     poll_interval) and on_frame() with each message from the device's snapshot queue.
 
-    send_request(stream) must ask the device for one frame of stream without blocking.
+    send_request(stream, raw) must ask the device for one frame of stream without blocking: raw for the
+    frame as it is, else the camera's JPEG of it (streams in encoded only).
     unavailable maps streams that can't be served (e.g. no CAM_A) to the error to answer with.
+    encoded: the streams the camera JPEG-encodes; not_encoded maps the others to why (shown in status()).
+    A reply timeout on an encoded stream sends that stream raw from then on (fallback, with the reason).
     overlay(), if given, is called when a rect_left frame arrives and returns a zero-argument function
     (run on the writer thread) that builds that snapshot's feature overlay, or None.
     """
 
     def __init__(self, available, send_request, writer, snapshot_dir=SNAPSHOT_DIR, unavailable=None,
                  min_interval=1.0, poll_interval=0.2, reply_timeout=2.0, clock=time.monotonic, log=print,
-                 overlay=None):
+                 overlay=None, encoded=(), not_encoded=None, quality=JPEG_QUALITY):
         self.available = set(available)
         self.unavailable = dict(unavailable or {})
+        self.encoded = set(encoded) & self.available
+        self.not_encoded = dict(not_encoded or {})
+        self.quality = quality
+        self.fallback = {}  # stream -> {"reason", "unix_time"}
         self.send_request = send_request
         self.writer = writer
         self.overlay = overlay
-        self.request_dir = Path(snapshot_dir) / "requests"
+        self.snapshot_dir = Path(snapshot_dir)
+        self.request_dir = self.snapshot_dir / "requests"
         self.min_interval = min_interval
         self.poll_interval = poll_interval
         self.reply_timeout = reply_timeout
         self.clock = clock
         self.log = log
-        self.pending = None  # (stream, requested_at, sent_at)
+        self.pending = None  # (stream, requested_at, sent_at, raw)
         self.last_poll = float("-inf")
         self.last_request = float("-inf")
         self.served = 0
+        self.last_bytes = {}
+        self.write_status()
+
+    def raw(self, stream):
+        return stream not in self.encoded or stream in self.fallback
+
+    def status(self):
+        """Per stream: codec, quality, encoded_on, what crosses the link, the fallback (or why not encoded)."""
+        streams = {}
+        for stream in STREAMS:
+            if stream not in self.available:
+                streams[stream] = {"available": False, "reason": self.unavailable.get(stream)}
+                continue
+            raw = self.raw(stream)
+            fallback = self.fallback.get(stream)
+            streams[stream] = {
+                "available": True, "codec": "png" if raw else "mjpeg", "quality": None if raw else self.quality,
+                "encoded_on": "pi" if raw else "camera", "over_link": "raw" if raw else "jpeg",
+                "fallback": None if fallback is None else {**fallback, "text": f"{RAW_FALLBACK}: {fallback['reason']}"},
+                "measurement": stream == "depth",
+                "reason": (None if not raw or fallback else self.not_encoded.get(stream) or (
+                    "16-bit millimetres (measurement data) do not fit a JPEG" if stream == "depth" else None)),
+                "last_bytes": self.last_bytes.get(stream)}
+        return {"streams": streams, "served": self.served, "unix_time": time.time()}
+
+    def write_status(self):
+        try:
+            self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+            atomic_write(self.snapshot_dir / ENCODING_STATUS, json.dumps(self.status()).encode())
+        except OSError as e:
+            self.log(f"Snapshot encoding status not written: {e}")
 
     def tick(self):
         now = self.clock()
         if self.pending is not None and now - self.pending[2] > self.reply_timeout:
-            stream, requested_at, _ = self.pending
+            stream, requested_at, _, raw = self.pending
             self.pending = None
-            self.log(f"No {stream} snapshot from the device within {self.reply_timeout:.0f} s")
-            self.writer.submit_error(stream, requested_at, "the device did not return a frame")
+            error = "the device did not return a frame"
+            if not raw:
+                reason = f"no JPEG from the camera's encoder within {self.reply_timeout:.0f} s"
+                self.fallback[stream] = {"reason": reason, "unix_time": time.time()}
+                error = f"{reason}; the next {stream} snapshot is sent raw ({RAW_FALLBACK})"
+                self.write_status()
+            self.log(f"No {stream} snapshot from the device within {self.reply_timeout:.0f} s"
+                     f"{'' if raw else f' (camera JPEG): {RAW_FALLBACK} from now on'}")
+            self.writer.submit_error(stream, requested_at, error)
         if now - self.last_poll < self.poll_interval:
             return
         self.last_poll = now
@@ -316,18 +420,29 @@ class SnapshotService:
             requested_at = self._claim(stream)
             if requested_at is None:
                 continue
-            self.send_request(stream)
-            self.pending = (stream, requested_at, now)
+            raw = self.raw(stream)
+            self.send_request(stream, raw)
+            self.pending = (stream, requested_at, now, raw)
             self.last_request = now
 
-    def on_frame(self, load, device_timestamp=None, sequence=None):
-        """load(stream) returns the frame as a numpy array; it runs on the writer thread."""
+    def on_frame(self, load, device_timestamp=None, sequence=None, encoded=None, nbytes=None):
+        """
+        load(stream) returns the frame (JPEG bytes or a numpy array); it runs on the writer thread.
+        encoded: whether it came from the camera's encoder (None: unknown); a frame of the other kind
+        than the pending request (a late reply) is dropped.
+        """
         if self.pending is None:
             return False  # late reply to a request that already timed out
-        stream, requested_at, _ = self.pending
+        stream, requested_at, _, raw = self.pending
+        if encoded is not None and encoded == raw:
+            return False
         self.pending = None
         meta = {"requested_at": requested_at, "unix_time": time.time(),
-                "device_timestamp": device_timestamp, "sequence": sequence}
+                "device_timestamp": device_timestamp, "sequence": sequence, "link_bytes": nbytes,
+                "fallback": self.status()["streams"][stream]["fallback"]}
+        if nbytes is not None:
+            self.last_bytes[stream] = nbytes
+            self.write_status()
         if stream == "rect_left" and self.overlay is not None:
             build = self.overlay()
             if build is not None:

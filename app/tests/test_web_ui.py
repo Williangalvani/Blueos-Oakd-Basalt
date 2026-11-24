@@ -399,10 +399,15 @@ def test_depth_stream_forwards_the_camera_jpegs(client, tmp_path, streaming_vio)
     assert status["center"]["median_mm"] == 1234.0 and status["center"]["pixel_mm"] == 1234
     assert status["frames_total"] >= 3 and status["kbps"] > 0
 
-    # Nobody watching: the lease runs out and the camera is told to stop
+    # The viewer left; until its linger ends the lease stays (a reload reconnects), then it is removed and
+    # the camera is told to stop
     lease = vio_telemetry.DEFAULT_DIR / depth_stream.LEASE_FILE
-    old = time.time() - depth_stream.LEASE_S - 1
-    os.utime(lease, (old, old))
+    assert lease.exists() and service.enabled
+    viewers = http.get("/api/status").json()["viewers"]
+    assert viewers["video"] == 0 and viewers["video_idle"] is False and "video" in viewers["lingering_s"]
+    main.viewer_registry.linger_s = 0.0
+    assert http.get("/api/status").json()["viewers"]["video_idle"] is True
+    assert not lease.exists()
     deadline = time.time() + 3
     while service.enabled and time.time() < deadline:
         time.sleep(0.02)
@@ -581,3 +586,115 @@ def test_api_snapshot_overlay_unavailable(client, tmp_path):
     thread.join()
     writer.close()
     assert result["r"].status_code == 200 and result["r"].headers["x-overlay"] == "unavailable"
+
+
+def test_depth_transport_settings_reach_the_vio_command(client):
+    import depth_points
+    main, http = client
+    assert config_schema.DEPTH_TRANSPORTS == depth_points.TRANSPORTS
+    assert config_schema.DEPTH_POINTS_ROIS == depth_points.ROI_SOURCES
+    pnp = {**main.DEFAULT_CONFIG, "algorithm": "pnp"}
+    assert (pnp["depth_transport"], pnp["depth_points_rois"]) == ("points", "host")
+    command = main.build_vio_command(pnp)
+    assert command[command.index("--depth-transport") + 1] == "points"
+    assert command[command.index("--depth-points-rois") + 1] == "host"
+    command = main.build_vio_command({**pnp, "depth_transport": "full_frame", "depth_points_rois": "camera"})
+    assert command[command.index("--depth-transport") + 1] == "full_frame"
+    assert command[command.index("--depth-points-rois") + 1] == "camera"
+    # A hand-edited config.json falls back to the default
+    command = main.build_vio_command({**pnp, "depth_transport": "pigeons"})
+    assert command[command.index("--depth-transport") + 1] == "points"
+    assert http.post("/api/config", json={**pnp, "depth_transport": "pigeons"}).status_code == 422
+    assert http.post("/api/config", json={**pnp, "depth_transport": "full_frame"}).status_code == 200
+    transport = http.get("/api/status").json()["depth_transport"]
+    assert transport == {"configured": "full_frame", "configured_rois": "host", "live": None, "camera_load": None}
+
+
+def test_status_reports_the_live_depth_transport_and_camera_load(client, tmp_path):
+    main, http = client
+    save_config(tmp_path, algorithm="pnp")
+    running(http)
+    live = {"transport": "points", "paired_percent": 99.5, "missing": 2, "last_problem": None,
+            "full_depth": {"on": False}}
+    load = {"leon_css_cpu_percent": 30.0, "leon_mss_cpu_percent": 20.0, "errors": None}
+    telemetry = live_telemetry(depth_points_status=lambda: live, camera_load=lambda: load)
+    telemetry.sample_camera_load()
+    telemetry.write_status()
+    s = http.get("/api/status").json()
+    assert s["depth_transport"]["live"] == live
+    assert s["depth_transport"]["camera_load"]["leon_css_cpu_percent"] == 30.0
+    assert s["telemetry"]["camera_load"]["leon_mss_cpu_percent"] == 20.0
+
+
+def test_stream_clients_are_counted_as_viewers(client, tmp_path):
+    main, http = client
+    s = http.get("/api/status").json()["viewers"]
+    assert s["total"] == 0 and s["video_idle"] is True and s["text"] == "video idle"
+    http.get("/api/stream/features?events=1&client=widget")
+    http.get("/api/stream/pose?events=1")
+    s = http.get("/api/status").json()["viewers"]
+    # Gone, but lingering: a reload reconnects without the VIO stopping and starting again
+    assert s["total"] == 0 and set(s["lingering_s"]) == {"features", "pose"}
+    assert s["opened_total"] == {"features": 1, "pose": 1} and s["video_idle"] is True
+    assert (vio_telemetry.DEFAULT_DIR / "features.lease").exists() and (vio_telemetry.DEFAULT_DIR / "pose.lease").exists()
+    main.viewer_registry.linger_s = 0.0
+    http.get("/api/status")
+    assert not (vio_telemetry.DEFAULT_DIR / "features.lease").exists()
+    assert not (vio_telemetry.DEFAULT_DIR / "pose.lease").exists()
+
+
+def test_a_one_shot_request_s_lease_survives_the_viewers_linger_ending(client, tmp_path):
+    import feature_stream
+    main, http = client
+    http.get("/api/stream/features?events=1")
+    lease = vio_telemetry.DEFAULT_DIR / feature_stream.LEASE_FILE
+    later = time.time() + 5
+    os.utime(lease, (later, later))  # renewed by someone else (e.g. /api/features) after the viewer's touch
+    main.viewer_registry.linger_s = 0.0
+    main.viewer_registry.tick()
+    assert lease.exists()
+
+
+def test_status_lists_every_image_stream_and_flags_the_raw_fallbacks(client, tmp_path):
+    main, http = client
+    save_config(tmp_path, algorithm="pnp")
+    stopped = http.get("/api/status").json()["image_streams"]
+    # Not running: the settings only
+    assert [s["name"] for s in stopped["streams"]] == ["live_stream"] + [f"snapshot_{s}" for s in snapshots.STREAMS]
+    assert stopped["fallbacks"] == [] and stopped["streams"][1]["configured"] == "camera_jpeg"
+    running(http)
+    meta = {"pid": os.getpid(), "unix_time": time.time(), "streaming": True, "variant": "host_jpeg",
+            "encoded_on": "pi", "codec": "mjpeg", "quality": 70, "depth_frames": "on_demand", "kbps": 300.0,
+            "fallback": {"reason": "blank frames from manip", "from": "manip"}}
+    vio_telemetry.DEFAULT_DIR.mkdir(parents=True, exist_ok=True)
+    snapshots.atomic_write(vio_telemetry.DEFAULT_DIR / depth_stream.META_FILE, json.dumps(meta).encode())
+    service = snapshots.SnapshotService(("rect_left", "rect_right", "depth"), lambda stream, raw: None, None,
+                                        main.SNAPSHOT_DIR, unavailable={"rgb": "no CAM_A"}, log=lambda m: None,
+                                        encoded=("rect_left", "rect_right"))
+    service.fallback["rect_right"] = {"reason": "no JPEG from the camera's encoder within 2 s", "unix_time": 1.0}
+    service.write_status()
+    images = http.get("/api/status").json()["image_streams"]
+    by_name = {s["name"]: s for s in images["streams"]}
+    assert set(by_name) == {"live_stream", "snapshot_rect_left", "snapshot_rect_right", "snapshot_depth"}
+    live = by_name["live_stream"]
+    assert (live["codec"], live["quality"], live["encoded_on"], live["over_link"], live["viewed"]) == (
+        "mjpeg", 70, "pi", "raw", True)
+    assert live["fallback"] == "fallback: raw depth over the link, encoded on the Pi: blank frames from manip"
+    left = by_name["snapshot_rect_left"]
+    assert (left["codec"], left["quality"], left["encoded_on"], left["fallback"]) == ("mjpeg", 95, "camera", None)
+    assert by_name["snapshot_depth"]["measurement"] is True and by_name["snapshot_depth"]["fallback"] is None
+    assert images["fallbacks"] == [live["fallback"], by_name["snapshot_rect_right"]["fallback"]]
+    assert by_name["snapshot_rect_right"]["fallback"].startswith(snapshots.RAW_FALLBACK)
+    widget = main.widget_status_now()
+    assert widget["raw_fallbacks"] == images["fallbacks"]
+
+
+def test_snapshot_encoding_setting_reaches_the_vio_command(client):
+    main, http = client
+    assert config_schema.SNAPSHOT_ENCODINGS == snapshots.ENCODINGS
+    pnp = {**main.DEFAULT_CONFIG, "algorithm": "pnp"}
+    command = main.build_vio_command(pnp)
+    assert command[command.index("--snapshot-encoding") + 1] == "camera_jpeg"
+    command = main.build_vio_command({**pnp, "snapshot_encoding": "raw"})
+    assert command[command.index("--snapshot-encoding") + 1] == "raw"
+    assert http.post("/api/config", json={**pnp, "snapshot_encoding": "png"}).status_code == 422

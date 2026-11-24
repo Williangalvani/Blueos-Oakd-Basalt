@@ -697,3 +697,52 @@ def test_lever_arm_correction_is_omega_cross_r_to_first_order():
 def test_rotation_angle():
     assert rotation_angle(np.eye(3)) == pytest.approx(0.0)
     assert rotation_angle(rotvec_to_matrix([0, 0, 0.3])) == pytest.approx(0.3)
+
+
+def test_a_frame_with_missing_depth_carries_the_reference_so_no_delta_is_lost():
+    """
+    process_depths(depth_missing=True): frame 1 has no depth (points mode: its points never came) but solves
+    against frame 0; frame 0's inliers, moved into frame 1's camera, are the reference frame 2 solves against.
+    """
+    rng = np.random.default_rng(7)
+    P0 = random_scene(rng)
+    ids = np.arange(len(P0))
+    steps = [(np.radians([0.5, -1.0, 0.8]), np.array([0.04, -0.01, 0.06])),
+             (np.radians([-0.4, 0.6, -0.5]), np.array([-0.02, 0.03, 0.05]))]
+    odometry = PnPOdometry(K, PnPParams(refractive_index=1.0))
+    noise = lambda: rng.normal(0, 0.2, (len(P0), 2))  # noqa: E731
+    first = odometry.process_depths(ids, project(P0), P0[:, 2], 1.0)
+    assert first.pose.reason == "no_reference"
+    points = P0
+    results = []
+    for k, (rotvec, delta) in enumerate(steps):
+        _, R_10, t_10 = make_motion(rotvec, delta)
+        points = transform(points, R_10, t_10)
+        missing = k == 0
+        z = np.full(len(P0), np.nan) if missing else points[:, 2]
+        results.append(odometry.process_depths(ids, project(points) + noise(), z, 1.1 + 0.1 * k,
+                                               depth_missing=missing))
+        if missing:
+            carried = np.array([odometry.prev_points[i] for i in sorted(odometry.prev_points)])
+            truth = points[sorted(odometry.prev_points)]
+            assert len(carried) >= 0.9 * len(P0)
+            np.testing.assert_allclose(carried, truth, atol=0.03)
+    (one, two) = results
+    assert one.pose.ok and one.reference_carried and one.valid_depth == 0 and not one.reference_reset
+    assert two.pose.ok and not two.reference_carried and two.dt == pytest.approx(0.1)
+    for result, (rotvec, delta) in zip(results, steps):
+        np.testing.assert_allclose(result.pose.position_delta, delta, atol=6e-3)
+        np.testing.assert_allclose(result.pose.angle_delta, rotvec, atol=math.radians(0.15))
+
+
+def test_without_depth_missing_an_all_invalid_frame_still_becomes_the_reference():
+    """full_frame's behaviour, unchanged: a solved frame with no valid depth is the (empty) next reference."""
+    rng = np.random.default_rng(8)
+    P0 = random_scene(rng)
+    ids = np.arange(len(P0))
+    odometry = PnPOdometry(K, PnPParams(refractive_index=1.0))
+    odometry.process_depths(ids, project(P0), P0[:, 2], 1.0)
+    _, R_10, t_10 = make_motion(np.radians([0.2, 0.1, 0.0]), [0.02, 0.0, 0.03])
+    P1 = transform(P0, R_10, t_10)
+    result = odometry.process_depths(ids, project(P1), np.full(len(P0), np.nan), 1.1)
+    assert result.pose.ok and not result.reference_carried and odometry.prev_points == {}

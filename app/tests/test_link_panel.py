@@ -109,3 +109,108 @@ def test_the_stream_list_without_a_measured_total_is_relative_to_the_sum():
     monitor.sample()
     (rows,) = run_panel(["linkStreamRows", monitor.status()])
     assert [r["fraction"] for r in rows] == [0.75, 0.25]
+
+
+def test_up_streams_are_marked_and_measured_against_the_up_total():
+    clock = SimpleNamespace(t=0.0)
+    counters = SimpleNamespace(read=0, written=0)
+    monitor = link_stats.LinkMonitor(clock=lambda: clock.t)
+    monitor.set_device(lambda: SimpleNamespace(numBytesRead=counters.read, numBytesWritten=counters.written))
+    monitor.sample()
+    for _ in range(3):
+        clock.t += 1.0
+        monitor.streams.add("depth_points", 10 * link_stats.spatial_data_bytes(303), 10)
+        monitor.streams.add("depth_points_rois", 10 * link_stats.spatial_config_bytes(303), 10)
+        counters.read += 10 * link_stats.spatial_data_bytes(303) * 2
+        counters.written += 10 * link_stats.spatial_config_bytes(303) * 2
+        monitor.sample()
+    status = monitor.status()
+    (rows, summary) = run_panel(["linkStreamRows", status], ["linkSummaryRows", status])
+    by_name = {r["name"]: r for r in rows}
+    assert by_name["↑ depth_points_rois"]["direction"] == "up" and by_name["depth_points"]["direction"] == "down"
+    # Each bar is a share of its own direction's measured total (half of it: the counters doubled the bytes)
+    assert by_name["↑ depth_points_rois"]["fraction"] == pytest.approx(0.5, rel=0.02)
+    assert by_name["depth_points"]["fraction"] == pytest.approx(0.5, rel=0.02)
+    assert dict(summary)["streams up (estimate)"].endswith("Mbps")
+
+
+POINTS_LIVE = {
+    "transport": "points", "rois": "host", "frames": 1000, "paired": 990, "paired_percent": 99.0, "missing": 10,
+    "missing_by_reason": {"timeout": 7, "roi": 3}, "last_problem": {"reason": "roi", "text": "1 ROIs differ"},
+    "points_received": 995, "orphan_points": 5, "points_gaps": 2, "points_gap_frames": 4, "feature_gaps": 1,
+    "feature_gap_frames": 2, "waiting": True, "wait_ms_mean": 3.25, "wait_ms_max": 40.0, "wait_limit_ms": 300.0,
+    "valid_percent": 87.5, "device": {"errors": 0, "misses": 3, "fatal": False,
+                                      "stats": {"slc_ms_mean": 4.0, "slc_ms_max": 6.0}},
+    "full_depth": {"on": True, "every": 2, "reasons": ["host_jpeg"], "frames": 12, "bytes": 1, "since": 1.0},
+}
+LOAD = {"leon_css_cpu_percent": 41.0, "leon_mss_cpu_percent": 30.0, "ddr": {"used_percent": 52.0},
+        "cmx": {"used_percent": 76.0}, "leon_css_heap": {"used_percent": 56.0}, "leon_mss_heap": None}
+VIEWERS = {"total": 2, "video": 1, "video_idle": False, "by_client": {"page": 1, "widget": 1},
+           "text": "1 watching video, 1 other"}
+
+
+def test_transport_rows_points():
+    transport = {"configured": "points", "configured_rois": "host", "live": POINTS_LIVE, "camera_load": LOAD}
+    (rows,) = run_panel(["transportRows", transport, VIEWERS])
+    text = dict(rows)
+    assert text["setting"] == "points (ROIs listed on the Pi)"
+    assert text["frames with depth"] == "99.00% (990 of 1000)"
+    assert text["missing depth"] == "10 (timeout 7, roi 3)" and text["last problem"] == "roi: 1 ROIs differ"
+    assert text["frame drops"] == "features 2 (1 gaps) · points 4 (2 gaps) · unpaired points 5"
+    assert text["wait for points"] == "3.3 ms mean, 40.0 max (limit 300 ms)"
+    assert text["camera script"] == "0 errors · 3 misses · SLC 4.0 ms mean"
+    assert text["full depth frames"] == "on, every 2 frame(s), for host_jpeg · 12 sent"
+    assert text["camera CPU (Leon)"] == "CSS 41% · MSS 30%"
+    assert text["camera memory"] == "DDR 52% · CMX 76% · heap CSS 56% / MSS –"
+    assert text["viewers"] == "1 watching video, 1 other (page 1, widget 1)"
+
+
+def test_transport_rows_full_frame_and_not_running():
+    full = {"configured": "full_frame", "configured_rois": "host", "camera_load": None,
+            "live": {"transport": "full_frame", "frames": 50, "feature_gaps": 0, "feature_gap_frames": 0}}
+    stopped = {"configured": "points", "configured_rois": "camera", "live": None, "camera_load": None}
+    idle = {**VIEWERS, "total": 0, "video": 0, "video_idle": True, "by_client": {}, "text": "video idle"}
+    (rows, stopped_rows) = run_panel(["transportRows", full, idle], ["transportRows", stopped, None])
+    text = dict(rows)
+    assert text["setting"] == "full_frame" and text["running"].startswith("full_frame: every depth frame")
+    assert text["viewers"] == "video idle" and text["camera CPU"] == "–"
+    stopped_text = dict(stopped_rows)
+    assert stopped_text["setting"] == "points (ROIs listed on the camera)"
+    assert stopped_text["running"] == "n/a (VIO not running)" and stopped_text["viewers"] == "–"
+
+
+def test_transport_widget_parts():
+    (good, bad, full, none) = run_panel(
+        ["transportWidgetParts", {"transport": "points", "paired_percent": 99.4}, VIEWERS],
+        ["transportWidgetParts", {"transport": "points", "paired_percent": 50.0}, None],
+        ["transportWidgetParts", {"transport": "full_frame"}, {"text": "video idle"}],
+        ["transportWidgetParts", None, None])
+    assert good == [["depth points 99%", "muted"], ["1 watching video, 1 other", "muted"]]
+    assert bad == [["depth points 50%", "bad"]]
+    assert full == [["depth: full frames", "muted"], ["video idle", "muted"]]
+    assert none == []
+
+
+def test_image_stream_rows_flag_raw_fallbacks():
+    images = {"streams": [
+        {"name": "live_stream", "label": "Live stream", "codec": "mjpeg", "quality": 70, "encoded_on": "camera",
+         "viewed": True, "mbps": 0.912},
+        {"name": "live_stream", "label": "Live stream", "codec": "mjpeg", "quality": 70, "encoded_on": "pi",
+         "viewed": False, "mbps": None,
+         "fallback": "fallback: raw depth over the link, encoded on the Pi: blank frames from manip"},
+        {"name": "snapshot_rect_left", "label": "Snapshot rect_left", "codec": "mjpeg", "quality": 95,
+         "encoded_on": "camera", "per_request": True, "last_bytes": 61440},
+        {"name": "snapshot_depth", "label": "Snapshot depth", "codec": "png", "quality": None, "encoded_on": "pi",
+         "per_request": True, "measurement": True, "reason": "16-bit millimetres"},
+        {"name": "snapshot_rect_right", "label": "Snapshot rect_right", "codec": "png", "encoded_on": "pi",
+         "per_request": True, "fallback": "fallback: raw frames over the link, encoded on the Pi: no JPEG"},
+        {"name": "snapshot_rgb", "label": "Snapshot rgb", "per_request": True}]}
+    (rows, empty) = run_panel(["imageStreamRows", images], ["imageStreamRows", None])
+    camera, pi, left, depth, right, rgb = (value for _, value in rows)
+    assert camera == "MJPEG q70 · encoded on the camera · viewed · 0.91 Mbps"
+    assert pi.startswith("MJPEG q70 · encoded on the Pi · not viewed: nothing sent · fallback: raw depth over the link")
+    assert left.startswith("MJPEG q95 · encoded on the camera · one frame per request, last ")
+    assert depth == "PNG · encoded on the Pi · one frame per request · 16-bit measurement data, raw"
+    assert right.endswith("fallback: raw frames over the link, encoded on the Pi: no JPEG")
+    assert rgb == "– · n/a (VIO not running) · one frame per request"
+    assert empty == [["image streams", "–"]]

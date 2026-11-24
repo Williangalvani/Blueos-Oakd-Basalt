@@ -22,6 +22,11 @@ DVL_SOURCES = ("auto", "off")
 DEPTH_STREAM_ENCODINGS = ("auto", "mono_features", "disparity", "manip", "nv12", "yuv400p", "host_jpeg")
 # pose_stream.ATTITUDE_MODES
 POSE_ATTITUDE_SOURCES = ("autopilot", "gyro")
+# depth_points.TRANSPORTS and ROI_SOURCES
+DEPTH_TRANSPORTS = ("points", "full_frame")
+DEPTH_POINTS_ROIS = ("host", "camera")
+# snapshots.ENCODINGS
+SNAPSHOT_ENCODINGS = ("camera_jpeg", "raw")
 VEHICLE_IP_RE = re.compile(r"^[A-Za-z0-9.\-:\[\]]+$")
 
 GROUPS = (
@@ -100,8 +105,23 @@ CONFIG_FIELDS = (
     ConfigField("intrinsics_override", "intrinsics", None, "PnP Intrinsics Override",
                 "PnP only: wins over the source; pixels on the width x height grid. Empty = off", nullable=True,
                 placeholder="fx,fy,cx,cy"),
+    ConfigField("depth_transport", "choice", "points", "PnP Depth Transport",
+                "PnP only: points = the camera computes the depth at the tracked features (a 5x5 median per "
+                "feature) and sends only those (~2 Mbps instead of ~40 at 640x400 10 fps); full depth frames cross "
+                "the link only while the depth probe runs or someone watches a host_jpeg stream. full_frame = every "
+                "depth frame goes to the Pi (the previous behaviour, for comparison)", choices=DEPTH_TRANSPORTS),
+    ConfigField("depth_points_rois", "choice", "host", "PnP Depth Points ROIs",
+                "PnP, points only: who lists the per-feature windows for the camera. host = the Pi (from the "
+                "features it receives anyway; a few kB per frame up the link, almost no camera CPU); camera = a "
+                "Script on the camera (no upstream traffic, but ~84 ms of the camera's Leon CPU per 300 features "
+                "estimated: may not keep up above ~10 fps)", choices=DEPTH_POINTS_ROIS),
     ConfigField("snapshots", "bool", True, "Snapshots",
                 "PnP only: on-demand camera snapshots (live views); no bandwidth until requested"),
+    ConfigField("snapshot_encoding", "choice", "camera_jpeg", "Snapshot Encoding",
+                "PnP only: camera_jpeg = rect_left, rect_right and rgb snapshots are JPEG-encoded on the camera "
+                "(quality 95, instead of 256 kB raw at 640x400); raw = sent raw and PNG-encoded on the Pi (the fallback, "
+                "also used automatically if the camera's encoder returns nothing). The depth snapshot is always "
+                "raw: 16-bit millimetres do not fit a JPEG", choices=SNAPSHOT_ENCODINGS),
     ConfigField("depth_stream", "bool", True, "Live depth stream",
                 "PnP only: the camera image with the tracked features (or the depth), MJPEG-encoded on the "
                 "camera for the Live panel; sent only while the panel is open"),

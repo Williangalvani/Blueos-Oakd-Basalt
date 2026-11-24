@@ -2,9 +2,10 @@
 """
 BlueOS OAK-D PnP VIO (option D)
 
-All pixel work runs on the OAK-D: stereo depth and LK feature tracking on the rectified left image.
-The host only looks up depth at the tracked features and solves frame-to-frame PnP with a gyro
-rotation prior (pnp_odometry.py), then sends VISION_POSITION_DELTA over MAVLink.
+All pixel work runs on the OAK-D: stereo depth and LK feature tracking on the rectified left image, and
+(--depth-transport points, the default) the depth at the tracked features (depth_points.py). The host solves
+frame-to-frame PnP with a gyro rotation prior (pnp_odometry.py), then sends VISION_POSITION_DELTA over
+MAVLink. --depth-transport full_frame sends every depth frame and looks the depth up on the host.
 """
 
 import argparse
@@ -23,6 +24,7 @@ import depthai as dai
 import numpy as np
 from loguru import logger
 
+import depth_points
 import depth_probe
 import depth_stream
 import feature_stream
@@ -35,8 +37,8 @@ from autopilot_params import AutopilotParams
 from device_open import DEFAULT_TIMEOUT, DeviceOpenTimeout, DeviceRestartWatch, open_oak_device
 from mavlink_sender import MavlinkSender
 from pnp_odometry import (Intrinsics, PnPOdometry, PnPParams, camera_to_body_frd, camera_to_body_rotation,
-                          integrate_gyro, intrinsics_from_frame, lever_arm_correction, matrix_to_rotvec,
-                          refracted_intrinsics)
+                          depth_from_points, integrate_gyro, intrinsics_from_frame, lever_arm_correction,
+                          matrix_to_rotvec, refracted_intrinsics)
 from rectified_intrinsics import StereoCalibration, as_list, choose_intrinsics, rectified_for_settings
 from stereo_config import (DEFAULT_LEVER_ARM_M, DEFAULT_REFRACTIVE_INDEX, INTRINSICS_SOURCES, add_stereo_arguments,
                            apply_stereo_config, disparity_format, effective_stereo_config, parse_depth_scale,
@@ -138,6 +140,9 @@ def parse_args(argv=None):
 
     parser.add_argument('--snapshots', action=argparse.BooleanOptionalAction, default=True,
                         help='On-demand camera snapshots for /api/snapshot (no bandwidth until requested)')
+    parser.add_argument('--snapshot-encoding', choices=snapshots.ENCODINGS, default=snapshots.CAMERA_JPEG,
+                        help='camera_jpeg: rect_left, rect_right and rgb snapshots JPEG-encoded on the camera; raw: '
+                             'sent raw, PNG-encoded on the Pi (the fallback). depth snapshots are always raw')
     parser.add_argument('--snapshot-dir', type=Path, default=snapshots.SNAPSHOT_DIR)
     parser.add_argument('--telemetry-dir', type=Path, default=None,
                         help='Live status and plot history for the web page (default: <snapshot-dir>/telemetry)')
@@ -160,6 +165,16 @@ def parse_args(argv=None):
     parser.add_argument('--depth-stream-debug', action=argparse.BooleanOptionalAction, default=False,
                         help='While the depth stream runs, raise the camera log level to DEBUG; the stream nodes\' '
                              'log lines appear in /api/status depth_stream.device_log')
+    parser.add_argument('--depth-transport', choices=depth_points.TRANSPORTS, default=depth_points.DEFAULT_TRANSPORT,
+                        help='points: the camera computes the depth at the tracked features (SpatialLocationCalculator, '
+                             'a 5x5 median per feature) and sends only those; full depth frames cross the link only '
+                             'while the depth probe or a watched host_jpeg stream needs them. full_frame: every depth '
+                             'frame goes to the Pi, which looks the depth up itself (the previous behaviour)')
+    parser.add_argument('--depth-points-rois', choices=depth_points.ROI_SOURCES,
+                        default=depth_points.DEFAULT_ROI_SOURCE,
+                        help='points only: who builds the per-feature ROI list: host (the Pi, from the features it '
+                             'receives anyway; a few kB/frame up the link) or camera (a Script on the camera\'s '
+                             'Leon CPU, ~84 ms per 300 features estimated)')
 
     parser.add_argument('--pose-attitude-source', choices=pose_stream.ATTITUDE_MODES, default='autopilot',
                         help='Attitude of the 3D pose viewer: autopilot (ArduPilot ATTITUDE read from '
@@ -218,6 +233,8 @@ class Stats:
         self.temperature = temperature
         # Returns the camera link summary (link_stats.LinkMonitor.summary), from the samples Telemetry takes
         self.link = link
+        # Returns the depth transport / camera load part of the line (depth_summary)
+        self.depth_summary = None
         self.reset()
 
     def reset(self):
@@ -249,7 +266,13 @@ class Stats:
         return "" if value is None else f", chip {value:.1f}°C"
 
     def link_summary(self):
-        return "" if self.link is None else f", {self.link()}"
+        text = "" if self.link is None else f", {self.link()}"
+        if self.depth_summary is not None:
+            try:
+                text += self.depth_summary()
+            except Exception as e:
+                text += f", depth summary failed: {e}"
+        return text
 
     def maybe_report(self):
         elapsed = time.monotonic() - self.start
@@ -267,6 +290,21 @@ class Stats:
         else:
             logger.warning(f"📊 {elapsed:.1f}s: no frames received{self.chip_temperature()}{self.link_summary()}")
         self.reset()
+
+
+def depth_summary(status, camera_load=None):
+    """The depth transport and camera load part of the 10-s log line."""
+    if status.get("transport") == depth_points.POINTS:
+        text = (f", depth points {status.get('paired')}/{status.get('frames')} paired"
+                f"{', missing ' + str(status.get('missing_by_reason')) if status.get('missing') else ''}"
+                f", feature gaps {status.get('feature_gap_frames')}, points gaps {status.get('points_gap_frames')}")
+    else:
+        text = f", depth full frames, feature gaps {status.get('feature_gap_frames')}"
+    if camera_load:
+        css, mss = camera_load.get("leon_css_cpu_percent"), camera_load.get("leon_mss_cpu_percent")
+        if css is not None or mss is not None:
+            text += f", Leon CSS {css}% MSS {mss}%"
+    return text
 
 
 def log_device_info(device):
@@ -326,6 +364,9 @@ def load_calibration(device, args):
 
 def frame_intrinsics(depth_msg, image_size):
     """(Intrinsics or None, problem) from the depth frame's transformation, on the image_size grid."""
+    if depth_msg is None:
+        return None, ("no depth frame on the Pi to read its camera matrix from (--depth-transport points; "
+                      "full_frame has one)")
     try:
         transformation = depth_msg.getTransformation()
         intrinsics = intrinsics_from_frame(transformation.getIntrinsicMatrix(), transformation.getSize(), image_size)
@@ -402,28 +443,59 @@ def configure_feature_tracker(config, args, maintainer=True):
     return config
 
 
-def snapshot_script(available):
-    """Device-side gate: forward one frame of the requested stream per request message."""
+def snapshot_script(available, encoders=None):
+    """
+    Device-side gate: forward one frame of the requested stream per request message (snapshots.request_number):
+    to the stream's JPEG encoder output (encoders: stream -> output name), or raw to 'snapshot' when asked so
+    or when the stream has no encoder.
+    """
     return "\n".join([
         f"streams = {list(snapshots.STREAMS)!r}",
         f"available = {sorted(available)!r}",
+        f"encoders = {dict(sorted((encoders or {}).items()))!r}",
         "while True:",
-        "    index = node.inputs['request'].get().getSequenceNum()",
-        "    if 0 <= index < len(streams) and streams[index] in available:",
-        "        node.outputs['snapshot'].send(node.inputs[streams[index]].get())",
+        "    number = node.inputs['request'].get().getSequenceNum()",
+        "    index, raw = number % len(streams), number >= len(streams)",
+        "    if 0 <= number < 2 * len(streams) and streams[index] in available:",
+        "        name = streams[index]",
+        "        output = 'snapshot' if raw or name not in encoders else encoders[name]",
+        "        node.outputs[output].send(node.inputs[name].get())",
     ])
 
 
 @dataclass
+class SnapshotGate:
+    request_queue: object
+    raw_queue: object
+    encoded_queues: tuple  # the JPEG encoders' output queues
+    streams: tuple
+    unavailable: dict
+    encoded: tuple  # streams the camera JPEG-encodes
+    not_encoded: dict  # stream -> why it crosses raw
+
+
+@dataclass
 class PipelineHandles:
-    sync_queue: object
+    sync_queue: Optional[object]  # full_frame: features + depth groups
     imu_queue: object
     feature_config_queue: object
     stereo_effective: dict
+    depth_transport: str = depth_points.FULL_FRAME
+    # points: the features straight from the FeatureTracker, the camera's depth at them and its Script's reports
+    features_queue: Optional[object] = None
+    points_queue: Optional[object] = None
+    points_status_queue: Optional[object] = None
+    rois_queue: Optional[object] = None  # rois "host": the ROI configs up
+    # points: the on-demand full depth gate (control up, frames down)
+    full_depth_control_queue: Optional[object] = None
+    full_depth_queue: Optional[object] = None
     snapshot_request_queue: Optional[object] = None
-    snapshot_queue: Optional[object] = None
+    snapshot_queue: Optional[object] = None  # raw frames
     snapshot_streams: tuple = ()
     snapshot_unavailable: dict = field(default_factory=dict)
+    snapshot_encoded_queues: tuple = ()  # the camera's JPEGs
+    snapshot_encoded: tuple = ()
+    snapshot_not_encoded: dict = field(default_factory=dict)
     depth_stream_control_queue: Optional[object] = None
     depth_stream_queue: Optional[object] = None
     depth_stream_status_queue: Optional[object] = None
@@ -433,10 +505,21 @@ class PipelineHandles:
     depth_stream_nodes: tuple = ()
 
 
-def build_snapshot_gate(p, device, stereo):
+def snapshot_encoder(p, fps):
+    encoder = p.create(dai.node.VideoEncoder)
+    encoder.setDefaultProfilePreset(fps, dai.VideoEncoderProperties.Profile.MJPEG)
+    encoder.setQuality(snapshots.JPEG_QUALITY)
+    encoder.input.setBlocking(False)
+    encoder.input.setMaxSize(1)
+    return encoder
+
+
+def build_snapshot_gate(p, device, stereo, args):
     """
     Script node holding the latest frame of each stream in non-blocking size-1 queues; it forwards a
     single frame per host request, so the snapshot outputs cost no link bandwidth until asked.
+    camera_jpeg: rect_left and rect_right (StereoDepth's pooled RAW8 frames, as the mono_features stream
+    sends them) go through one MJPEG encoder ('mono'), rgb (NV12) through another ('color'); depth is raw.
     """
     sources = {"rect_left": stereo.rectifiedLeft, "rect_right": stereo.rectifiedRight, "depth": stereo.depth}
     unavailable = {}
@@ -446,6 +529,20 @@ def build_snapshot_gate(p, device, stereo):
     else:
         unavailable["rgb"] = "this device has no CAM_A (RGB) camera"
 
+    not_encoded = {}
+    groups = {}
+    if args.snapshot_encoding == snapshots.RAW:
+        not_encoded = {s: "Snapshot Encoding is raw" for s in snapshots.CAMERA_JPEG_STREAMS if s in sources}
+    else:
+        problem = depth_stream.size_problem(args.width, args.height)
+        if problem:
+            not_encoded.update(rect_left=problem, rect_right=problem)
+        else:
+            groups["mono"] = (("rect_left", "rect_right"), float(args.fps))
+        if "rgb" in sources:
+            groups["color"] = (("rgb",), SNAPSHOT_RGB_FPS)
+    encoders = {stream: output for output, (streams, _) in groups.items() for stream in streams}
+
     script = p.create(dai.node.Script)
     for name, output in sources.items():
         output.link(script.inputs[name])
@@ -453,11 +550,18 @@ def build_snapshot_gate(p, device, stereo):
         script.inputs[name].setMaxSize(1)
     script.inputs["request"].setBlocking(False)
     script.inputs["request"].setMaxSize(4)
-    script.setScript(snapshot_script(sources))
+    script.setScript(snapshot_script(sources, encoders))
 
-    request_queue = script.inputs["request"].createInputQueue(maxSize=4, blocking=False)
-    snapshot_queue = script.outputs["snapshot"].createOutputQueue(maxSize=2, blocking=False)
-    return request_queue, snapshot_queue, tuple(sources), unavailable
+    encoded_queues = []
+    for output, (_, fps) in groups.items():
+        encoder = snapshot_encoder(p, fps)
+        script.outputs[output].link(encoder.input)
+        encoded_queues.append(encoder.out.createOutputQueue(maxSize=2, blocking=False))
+    return SnapshotGate(
+        request_queue=script.inputs["request"].createInputQueue(maxSize=4, blocking=False),
+        raw_queue=script.outputs["snapshot"].createOutputQueue(maxSize=2, blocking=False),
+        encoded_queues=tuple(encoded_queues), streams=tuple(sources), unavailable=unavailable,
+        encoded=tuple(encoders), not_encoded=not_encoded)
 
 
 def node_log_name(node):
@@ -547,13 +651,67 @@ def build_depth_stream(p, stereo, args, stereo_settings):
     return control_queue, frame_queue, status_queue, info, names
 
 
+def build_depth_points(p, stereo, feature_tracker, args):
+    """
+    points: the Script (depth_points.device_script) pairing each request with its depth frame, and the
+    SpatialLocationCalculator it feeds in lockstep (blocking size-1 inputs both ways, inputConfig waiting for a
+    message, so exactly one config and one depth frame are in flight). The Script's depth input is
+    non-blocking (DEPTH_QUEUE frames: the request may come a little after its frame). rois "host": the configs
+    come from the host's 'rois' queue; "camera": the Script builds them from the FeatureTracker output.
+
+    Returns (points queue, status queue, rois queue or None).
+    """
+    thresholds = depth_points.thresholds_mm(args.min_depth, args.max_depth)
+    script = p.create(dai.node.Script)
+    slc = p.create(dai.node.SpatialLocationCalculator)
+    stereo.depth.link(script.inputs["depth"])
+    script.inputs["depth"].setBlocking(False)
+    script.inputs["depth"].setMaxSize(depth_points.DEPTH_QUEUE)
+    rois_queue = None
+    if args.depth_points_rois == depth_points.ROIS_CAMERA:
+        feature_tracker.outputFeatures.link(script.inputs["features"])
+        script.inputs["features"].setBlocking(False)
+        script.inputs["features"].setMaxSize(2)
+    else:
+        script.inputs["rois"].setBlocking(False)
+        script.inputs["rois"].setMaxSize(4)
+        rois_queue = script.inputs["rois"].createInputQueue(maxSize=4, blocking=False)
+    for name, slc_input in (("config", slc.inputConfig), ("depth", slc.inputDepth)):
+        script.outputs[name].link(slc_input)
+        slc_input.setBlocking(True)
+        slc_input.setMaxSize(1)
+    slc.inputConfig.setWaitForMessage(True)
+    for name, output in (("spatial", slc.out), ("passthrough", slc.passthroughDepth)):
+        output.link(script.inputs[name])
+        script.inputs[name].setBlocking(True)
+        script.inputs[name].setMaxSize(1)
+    script.setScript(depth_points.device_script(args.depth_points_rois, (args.width, args.height), thresholds))
+    points_queue = script.outputs["points"].createOutputQueue(maxSize=8, blocking=False)
+    status_queue = script.outputs["status"].createOutputQueue(maxSize=16, blocking=False)
+    return points_queue, status_queue, rois_queue
+
+
+def build_full_depth_gate(p, stereo):
+    """points: a Script forwarding every n-th stereo.depth frame while the host asks (depth_points.gate_script)."""
+    script = p.create(dai.node.Script)
+    stereo.depth.link(script.inputs["depth"])
+    script.inputs["depth"].setBlocking(False)
+    script.inputs["depth"].setMaxSize(1)
+    script.inputs["control"].setBlocking(False)
+    script.inputs["control"].setMaxSize(4)
+    script.setScript(depth_points.gate_script())
+    control_queue = script.inputs["control"].createInputQueue(maxSize=4, blocking=False)
+    frame_queue = script.outputs["depth"].createOutputQueue(maxSize=2, blocking=False)
+    return control_queue, frame_queue
+
+
 def build_pipeline(p, device, args, stereo_settings):
     left = p.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B, sensorFps=float(args.fps))
     right = p.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C, sensorFps=float(args.fps))
     imu = p.create(dai.node.IMU)
     stereo = p.create(dai.node.StereoDepth)
     feature_tracker = p.create(dai.node.FeatureTracker)
-    sync = p.create(dai.node.Sync)
+    points = args.depth_transport == depth_points.POINTS
 
     imu.enableIMUSensor([dai.IMUSensor.ACCELEROMETER_RAW, dai.IMUSensor.GYROSCOPE_RAW], 200)
     imu.setBatchReportThreshold(1)
@@ -564,24 +722,35 @@ def build_pipeline(p, device, args, stereo_settings):
     feature_tracker.setHardwareResources(1, 2)
     configure_feature_tracker(feature_tracker.initialConfig, args)
 
-    sync.setSyncThreshold(timedelta(seconds=0.5 / args.fps))
-
     left.requestOutput((args.width, args.height)).link(stereo.left)
     right.requestOutput((args.width, args.height)).link(stereo.right)
     stereo.rectifiedLeft.link(feature_tracker.inputImage)
-    feature_tracker.outputFeatures.link(sync.inputs["features"])
-    stereo.depth.link(sync.inputs["depth"])
 
     handles = PipelineHandles(
-        # Non-blocking: if the host falls behind, old frames are dropped and the next delta spans the gap
-        sync_queue=sync.out.createOutputQueue(maxSize=4, blocking=False),
+        sync_queue=None,
         imu_queue=imu.out.createOutputQueue(maxSize=200, blocking=False),
         feature_config_queue=feature_tracker.inputConfig.createInputQueue(maxSize=4, blocking=False),
         stereo_effective=effective_stereo_config(stereo, stereo_settings),
+        depth_transport=args.depth_transport,
     )
+    # Non-blocking: if the host falls behind, old frames are dropped and the next delta spans the gap
+    if points:
+        handles.features_queue = feature_tracker.outputFeatures.createOutputQueue(maxSize=4, blocking=False)
+        (handles.points_queue, handles.points_status_queue,
+         handles.rois_queue) = build_depth_points(p, stereo, feature_tracker, args)
+        handles.full_depth_control_queue, handles.full_depth_queue = build_full_depth_gate(p, stereo)
+    else:
+        sync = p.create(dai.node.Sync)
+        sync.setSyncThreshold(timedelta(seconds=0.5 / args.fps))
+        feature_tracker.outputFeatures.link(sync.inputs["features"])
+        stereo.depth.link(sync.inputs["depth"])
+        handles.sync_queue = sync.out.createOutputQueue(maxSize=4, blocking=False)
     if args.snapshots:
-        (handles.snapshot_request_queue, handles.snapshot_queue, handles.snapshot_streams,
-         handles.snapshot_unavailable) = build_snapshot_gate(p, device, stereo)
+        shots = build_snapshot_gate(p, device, stereo, args)
+        handles.snapshot_request_queue, handles.snapshot_queue = shots.request_queue, shots.raw_queue
+        handles.snapshot_streams, handles.snapshot_unavailable = shots.streams, shots.unavailable
+        handles.snapshot_encoded_queues, handles.snapshot_encoded = shots.encoded_queues, shots.encoded
+        handles.snapshot_not_encoded = shots.not_encoded
     else:
         handles.snapshot_unavailable = {s: "snapshots are disabled (--no-snapshots)" for s in snapshots.STREAMS}
     if args.depth_stream:
@@ -589,12 +758,18 @@ def build_pipeline(p, device, args, stereo_settings):
          handles.depth_stream_info, handles.depth_stream_nodes) = build_depth_stream(p, stereo, args, stereo_settings)
     # One extra frame per stereo output pool for the frame each gate queue holds, plus the one the
     # depth stream Script is converting; the forwarding variants (mono_features, disparity) send
-    # StereoDepth's own frame on, which then also waits in (and is read by) the encoder
+    # StereoDepth's own frame on, which then also waits in (and is read by) the encoder (so does a
+    # rectified snapshot on its way to the mono encoder). points: the depth points Script's queue, the
+    # frame it keeps for the next request, the SLC's input and passthrough, and the full depth gate's frame
     stream_extra = 0
     if handles.depth_stream_control_queue is not None:
         forwarding = handles.depth_stream_info.get("variant") in depth_stream.FORWARD_VARIANTS
         stream_extra = 3 if forwarding else 2
-    extra = (1 if args.snapshots else 0) + stream_extra
+    points_extra = depth_points.POOL_FRAMES + 1 if points else 0
+    snapshot_extra = 0
+    if args.snapshots:
+        snapshot_extra = 2 if "rect_left" in handles.snapshot_encoded else 1
+    extra = snapshot_extra + stream_extra + points_extra
     if extra:
         stereo.setNumFramesPool(STEREO_FRAMES_POOL + extra)
     return handles
@@ -636,6 +811,157 @@ class OverlayState:
         values = (self.ids, self.uv, self.matched_index, self.inlier_index, self.previous_ids, self.previous_uv,
                   self.sequence, image_size, self.ok, self.reason)
         return lambda: snapshots.build_overlay(*values)
+
+
+def tracked_arrays(features_msg):
+    """(ids int64 (N,), uv float64 (N, 2)) of a TrackedFeatures message."""
+    tracked = features_msg.trackedFeatures
+    ids = np.fromiter((f.id for f in tracked), dtype=np.int64, count=len(tracked))
+    uv = np.array([(f.position.x, f.position.y) for f in tracked], dtype=np.float64).reshape(-1, 2)
+    return ids, uv
+
+
+@dataclass
+class FrameInput:
+    """One frame for the PnP: the features and either the depth frame (full_frame) or the depth at them (points)."""
+    sequence: int
+    t: float
+    ids: np.ndarray
+    uv: np.ndarray
+    depth_shape: tuple  # (height, width) of the depth grid
+    depth: Optional[np.ndarray] = None
+    depth_msg: Optional[object] = None
+    points: Optional[object] = None  # depth_points.DepthPoints
+    depth_problem: Optional[str] = None  # points: why this frame has no depth (it gets none, never older depth)
+
+
+class SequenceGaps:
+    """Frames missing between consecutive sequence numbers (a restarted camera starts again)."""
+
+    def __init__(self):
+        self.last = None
+        self.gaps = self.frames = 0
+
+    def add(self, sequence):
+        if self.last is not None and sequence > self.last + 1:
+            self.gaps += 1
+            self.frames += sequence - self.last - 1
+        self.last = sequence
+
+
+class FullFrameSource:
+    """full_frame: Sync groups of the features and the depth frame, every frame over the link."""
+
+    def __init__(self, handles, link_streams):
+        self.queue = handles.sync_queue
+        self.link_streams = link_streams
+        self.gaps = SequenceGaps()
+        self.depth_frames = 0
+
+    def get(self):
+        return self.queue.get()
+
+    @staticmethod
+    def stamp(group):
+        depth_msg = group["depth"]
+        return depth_msg.getSequenceNum(), timestamp_seconds(depth_msg, exposure_middle=True)
+
+    def frame(self, group, sequence, t):
+        features_msg, depth_msg = group["features"], group["depth"]
+        if features_msg.getSequenceNum() != sequence:
+            logger.warning(f"Sequence mismatch: features {features_msg.getSequenceNum()} depth {sequence}")
+        ids, uv = tracked_arrays(features_msg)
+        depth = depth_msg.getFrame()
+        self.link_streams.add("depth", link_stats.frame_bytes(link_stats.data_bytes(depth_msg)))
+        self.link_streams.add("features", link_stats.features_bytes(len(ids)))
+        self.link_streams.add("sync_group", link_stats.MESSAGE_GROUP_OVERHEAD)
+        self.gaps.add(sequence)
+        self.depth_frames += 1
+        return FrameInput(sequence, t, ids, uv, depth.shape[:2], depth=depth, depth_msg=depth_msg)
+
+    def on_status(self):
+        pass
+
+    def status(self):
+        return {"transport": depth_points.FULL_FRAME, "frames": self.depth_frames, "feature_gaps": self.gaps.gaps,
+                "feature_gap_frames": self.gaps.frames}
+
+
+class PointsSource:
+    """
+    points: the features straight from the FeatureTracker, then the camera's depth at them
+    (depth_points.DepthPointsReceiver: rois "host" sends this frame's ROI config first). t is the features'
+    device timestamp: the end of the exposure (a TrackedFeatures message has no exposure time), the same
+    for every frame, so the deltas' dt are unchanged.
+    """
+
+    def __init__(self, handles, link_streams, args, decimation=1, log=print):
+        self.handles = handles
+        self.queue = handles.features_queue
+        self.link_streams = link_streams
+        self.image_size = (args.width, args.height)
+        self.fallback_size = (args.width // max(decimation, 1), args.height // max(decimation, 1))
+        thresholds = depth_points.thresholds_mm(args.min_depth, args.max_depth)
+        rois_queue = handles.rois_queue
+
+        def send_config(config):
+            rois_queue.send(config)
+
+        def counted(rows):
+            link_streams.add("depth_points", link_stats.spatial_data_bytes(0 if rows is None else len(rows)))
+
+        self.receiver = depth_points.DepthPointsReceiver(
+            handles.points_queue, self.image_size, args.depth_points_rois, wait_s=points_wait_s(args.fps),
+            send_config=send_config if rois_queue is not None else None,
+            build_config=lambda windows, limits, sequence: depth_points.make_config(dai, windows, limits, sequence),
+            thresholds=thresholds, frame_period_s=1.0 / max(args.fps, 1), log=log, on_message=counted)
+
+    def get(self):
+        return self.queue.get()
+
+    @staticmethod
+    def stamp(features_msg):
+        return features_msg.getSequenceNum(), features_msg.getTimestampDevice().total_seconds()
+
+    def on_status(self):
+        if self.handles.points_status_queue is None:
+            return
+        for report in self.handles.points_status_queue.tryGetAll():
+            data = report.getData()
+            self.link_streams.add("depth_points_status", link_stats.buffer_bytes(len(data)))
+            self.receiver.on_status(data)
+
+    def frame(self, features_msg, sequence, t):
+        self.on_status()
+        ids, uv = tracked_arrays(features_msg)
+        self.link_streams.add("features", link_stats.features_bytes(len(ids)))
+        receiver = self.receiver
+        requested = receiver.request(sequence, uv)
+        if requested and receiver.roi_source == depth_points.ROIS_HOST:
+            self.link_streams.add("depth_points_rois", link_stats.spatial_config_bytes(len(ids) + depth_points.EXTRA_ROIS))
+        try:
+            features_ts = features_msg.getTimestamp().total_seconds()
+        except Exception:
+            features_ts = None
+        points, problem = receiver.take(sequence, uv, features_ts, requested=requested)
+        size = points.depth_size if points is not None else (receiver.depth_size or self.fallback_size)
+        return FrameInput(sequence, t, ids, uv, (size[1], size[0]), points=points, depth_problem=problem)
+
+    def status(self):
+        return self.receiver.status()
+
+
+def points_wait_s(fps):
+    """How long the host waits for a frame's depth points: three frame periods, at least 0.25 s."""
+    return max(0.25, 3.0 / max(float(fps), 1.0))
+
+
+def frame_depths(frame_in, params):
+    """(N,) metres per feature for PnPOdometry.process_depths (points mode; NaN where there is none)."""
+    points = frame_in.points
+    if points is None:
+        return np.full(len(frame_in.ids), np.nan)
+    return depth_from_points(points.depth_mm, points.pixels, points.samples, params, points.pixel_count_reported)
 
 
 def _raise_system_exit(signum, frame):
@@ -744,12 +1070,14 @@ def run_pipeline(args, log_only, data_log, stereo_settings, telemetry):
                 data_log.event("error", error=str(e))
                 sys.exit(2)
             telemetry.temperature = device.getChipTemperature
+            telemetry.camera_load = lambda device=device: vio_telemetry.read_camera_load(device)
             telemetry.set_phase("configuring")
             reason = run_session(device, args, log_only, data_log, stereo_settings, telemetry, mavlink, params,
                                  pose_out, log_warning)
             if reason is None:
                 return
             telemetry.temperature = None
+            telemetry.camera_load = None
             telemetry.link.clear_device(f"camera reconnecting: {reason}")
             reconnects += 1
             logger.warning(f"🔌 {reason}: restarting the pipeline (reconnect #{reconnects}) so snapshots, the depth "
@@ -827,10 +1155,11 @@ def run_session(device, args, log_only, data_log, stereo_settings, telemetry, ma
             reinit = FeatureTrackerReinit(lambda maintainer: handles.feature_config_queue.send(
                 configure_feature_tracker(dai.FeatureTrackerConfig(), args, maintainer)))
 
-            def send_snapshot_request(stream):
+            def send_snapshot_request(stream, raw):
                 request = dai.Buffer()
-                request.setSequenceNum(snapshots.STREAMS.index(stream))
+                request.setSequenceNum(snapshots.request_number(stream, raw))
                 handles.snapshot_request_queue.send(request)
+                link_streams.add("control", link_stats.BUFFER_OVERHEAD)
 
             writer = snapshots.SnapshotWriter(
                 args.snapshot_dir, (stereo_settings["stereo_depth_min_mm"], stereo_settings["stereo_depth_max_mm"]),
@@ -838,9 +1167,12 @@ def run_session(device, args, log_only, data_log, stereo_settings, telemetry, ma
             snapshot_service = snapshots.SnapshotService(
                 handles.snapshot_streams, send_snapshot_request, writer, args.snapshot_dir,
                 unavailable=handles.snapshot_unavailable, log=logger.warning,
-                overlay=lambda: overlay.builder((args.width, args.height)))
+                overlay=lambda: overlay.builder((args.width, args.height)),
+                encoded=handles.snapshot_encoded, not_encoded=handles.snapshot_not_encoded)
             data_log.event("snapshots", streams=list(handles.snapshot_streams),
-                           unavailable=handles.snapshot_unavailable)
+                           unavailable=handles.snapshot_unavailable, encoding=args.snapshot_encoding,
+                           encoded_on_camera=list(handles.snapshot_encoded),
+                           not_encoded=handles.snapshot_not_encoded)
 
             def send_depth_stream_control(enabled):
                 control = dai.Buffer()
@@ -854,12 +1186,15 @@ def run_session(device, args, log_only, data_log, stereo_settings, telemetry, ma
                 info["disparity"] = depth_stream.disparity_scale(
                     focal, calibration.baseline_m, *info["depth_range_mm"],
                     info.get("disparity_max", depth_stream.DISPARITY_MAX))
+            points_mode = handles.depth_transport == depth_points.POINTS
             if info:
                 on_camera = handles.depth_stream_control_queue is not None
                 host = device_log = debug = None
                 if not on_camera or info.get("requested_variant") == depth_stream.AUTO:
+                    # points: the full depth gate already sends only every n-th frame, and only while it streams
                     host = depth_stream.HostJpegEncoder(*info["depth_range_mm"], args.depth_stream_quality,
-                                                        info.get("every", 1))
+                                                        1 if points_mode else info.get("every", 1))
+                info["depth_frames"] = "on_demand" if points_mode else "every_frame"
                 if on_camera:
                     device_log = depth_stream.DeviceLog(handles.depth_stream_nodes)
                     try:
@@ -884,6 +1219,29 @@ def run_session(device, args, log_only, data_log, stereo_settings, telemetry, ma
             features_out = feature_stream.FeatureStreamService(telemetry.directory, (args.width, args.height),
                                                                log=logger.info)
 
+            gate = None
+            if points_mode:
+                source = PointsSource(handles, link_streams, args,
+                                      int(stereo_settings.get("stereo_decimation") or 1), log=logger.warning)
+                if handles.full_depth_control_queue is not None:
+                    def send_gate_control(every):
+                        control = dai.Buffer()
+                        control.setSequenceNum(int(every))
+                        handles.full_depth_control_queue.send(control)
+                        link_streams.add("control", link_stats.BUFFER_OVERHEAD)
+                    gate = depth_points.FullDepthGate(send_gate_control, log=logger.info)
+                logger.info(f"Depth transport: points (camera SpatialLocationCalculator, ROIs built on the "
+                            f"{args.depth_points_rois}); full depth frames only on demand")
+            else:
+                source = FullFrameSource(handles, link_streams)
+                logger.info("Depth transport: full_frame (every depth frame to the Pi)")
+            data_log.event("depth_transport", transport=handles.depth_transport,
+                           rois=args.depth_points_rois if points_mode else None,
+                           wait_s=points_wait_s(args.fps) if points_mode else None)
+            telemetry.depth_points_status = lambda: {**source.status(),
+                                                     "full_depth": gate.status() if gate is not None else None}
+            stats.depth_summary = lambda: depth_summary(source.status(), telemetry.camera_load_value)
+
             p.start()
             telemetry.set_phase("running")
             print("✅ Pipeline started!")
@@ -893,26 +1251,24 @@ def run_session(device, args, log_only, data_log, stereo_settings, telemetry, ma
                 print("📡 Sending VIO data via MAVLink...")
 
             while p.isRunning() and not restart.triggered:
-                group = handles.sync_queue.get()
+                item = source.get()
                 if restart.triggered:
                     break
                 start = time.perf_counter()
-                features_msg = group["features"]
-                depth_msg = group["depth"]
-                t = timestamp_seconds(depth_msg, exposure_middle=True)
-                if restart.on_frame(depth_msg.getSequenceNum(), t):
+                sequence, t = source.stamp(item)
+                if restart.on_frame(sequence, t):
                     break
                 reinit.step()
 
                 for imu_data in handles.imu_queue.tryGetAll():
                     link_streams.add("imu", link_stats.imu_bytes(gyro.add(imu_data)))
 
-                if features_msg.getSequenceNum() != depth_msg.getSequenceNum():
-                    logger.warning(f"Sequence mismatch: features {features_msg.getSequenceNum()} "
-                                   f"depth {depth_msg.getSequenceNum()}")
+                frame_in = source.frame(item, sequence, t)
+                item = None
+                ids, uv = frame_in.ids, frame_in.uv
 
                 if odometry is None:
-                    choice = select_intrinsics(args, calibration, depth_msg, rectified, rectified_problem)
+                    choice = select_intrinsics(args, calibration, frame_in.depth_msg, rectified, rectified_problem)
                     for message in choice.warnings:
                         log_warning(f"Intrinsics: {message}")
                     intrinsics = choice.intrinsics
@@ -935,13 +1291,6 @@ def run_session(device, args, log_only, data_log, stereo_settings, telemetry, ma
                     odometry = PnPOdometry(intrinsics, params, image_size=(args.width, args.height))
                     probe.set_intrinsics(intrinsics, choice.source)
 
-                tracked = features_msg.trackedFeatures
-                ids = np.fromiter((f.id for f in tracked), dtype=np.int64, count=len(tracked))
-                uv = np.array([(f.position.x, f.position.y) for f in tracked], dtype=np.float64).reshape(-1, 2)
-                depth = depth_msg.getFrame()
-                link_streams.add("depth", link_stats.frame_bytes(link_stats.data_bytes(depth_msg)))
-                link_streams.add("features", link_stats.features_bytes(len(tracked)))
-                link_streams.add("sync_group", link_stats.MESSAGE_GROUP_OVERHEAD)
                 id_list = ids.tolist()
                 new_features, tracked_features = feature_id_counts(previous_ids, id_list)
                 previous_ids = set(id_list)
@@ -953,10 +1302,14 @@ def run_session(device, args, log_only, data_log, stereo_settings, telemetry, ma
                     R_prior = gyro.rotation(reference_t, t, R_cam_imu)
                 gyro.prune((t if reference_t is None else min(t, reference_t)) - GYRO_BUFFER_SECONDS)
 
-                frame = odometry.process(ids, uv, depth, t, R_prior)
+                if frame_in.depth is not None:
+                    frame = odometry.process(ids, uv, frame_in.depth, t, R_prior)
+                else:
+                    frame = odometry.process_depths(ids, uv, frame_depths(frame_in, params), t, R_prior,
+                                                    depth_missing=frame_in.depth_problem is not None)
                 pose = frame.pose
-                overlay.update(ids, uv, frame, depth_msg.getSequenceNum())
-                features_out.tick(uv, depth.shape, depth_msg.getSequenceNum(), pose.ok, pose.reason,
+                overlay.update(ids, uv, frame, sequence)
+                features_out.tick(uv, frame_in.depth_shape, sequence, pose.ok, pose.reason,
                                   frame.depth_valid, frame.matched_index, pose.inlier_index)
 
                 angle_delta = position_delta = time_delta_us = yaw_delta = rotation_delta = None
@@ -999,13 +1352,38 @@ def run_session(device, args, log_only, data_log, stereo_settings, telemetry, ma
                 if handles.snapshot_queue is not None:
                     snapshot_msg = handles.snapshot_queue.tryGet()
                     if snapshot_msg is not None:
-                        link_streams.add("snapshot", link_stats.frame_bytes(link_stats.data_bytes(snapshot_msg)))
+                        nbytes = link_stats.frame_bytes(link_stats.data_bytes(snapshot_msg))
+                        link_streams.add("snapshot", nbytes)
                         snapshot_service.on_frame(lambda stream, m=snapshot_msg: snapshot_frame(m, stream),
-                                                  timestamp_seconds(snapshot_msg), snapshot_msg.getSequenceNum())
+                                                  timestamp_seconds(snapshot_msg), snapshot_msg.getSequenceNum(),
+                                                  encoded=False, nbytes=nbytes)
+                for encoded_queue in handles.snapshot_encoded_queues:
+                    jpeg = encoded_queue.tryGet()
+                    if jpeg is not None:
+                        nbytes = link_stats.encoded_bytes(link_stats.data_bytes(jpeg))
+                        link_streams.add("snapshot", nbytes)
+                        snapshot_service.on_frame(lambda stream, m=jpeg: bytes(m.getData()), timestamp_seconds(jpeg),
+                                                  jpeg.getSequenceNum(), encoded=True, nbytes=nbytes)
                 probe.tick()
-                probe.on_depth(depth, t, depth_msg.getSequenceNum())
+                stream_depth, stream_sequence = frame_in.depth, sequence
+                if frame_in.depth is not None:
+                    probe.on_depth(frame_in.depth, t, sequence)
+                elif handles.full_depth_queue is not None:
+                    # points: the full frames the gate forwarded (each its own frame, not this one)
+                    for msg in handles.full_depth_queue.tryGetAll():
+                        nbytes = link_stats.frame_bytes(link_stats.data_bytes(msg))
+                        link_streams.add("depth_on_demand", nbytes)
+                        if gate is not None:
+                            gate.on_frame(nbytes)
+                        stream_depth, stream_sequence = msg.getFrame(), msg.getSequenceNum()
+                        probe.on_depth(stream_depth, timestamp_seconds(msg, exposure_middle=True), stream_sequence)
                 if stream is not None:
-                    stream.tick(depth, depth_msg.getSequenceNum())
+                    if frame_in.depth is not None:
+                        stream.tick(frame_in.depth, sequence)
+                    else:
+                        points = frame_in.points
+                        stream.tick(stream_depth, stream_sequence, center=points.center if points else None,
+                                    sample=depth_points.depth_sample(points))
                     encoded = handles.depth_stream_queue.tryGetAll() if handles.depth_stream_queue is not None else ()
                     for jpeg in encoded:
                         link_streams.add("depth_stream", link_stats.encoded_bytes(link_stats.data_bytes(jpeg)))
@@ -1019,12 +1397,18 @@ def run_session(device, args, log_only, data_log, stereo_settings, telemetry, ma
                             data = report.getData()
                             link_streams.add("depth_stream_status", link_stats.buffer_bytes(len(data)))
                             stream.on_device_status(data)
+                if gate is not None:
+                    watched_host_jpeg = stream is not None and stream.on_host and stream.enabled
+                    gate.update({"depth_probe": 1 if probe.active is not None else 0,
+                                 "host_jpeg": int(stream.info.get("every") or 1) if watched_host_jpeg else 0})
                 proc_ms = (time.perf_counter() - start) * 1000.0
 
                 lever = lever_arm_fields(position_delta, R_prior, pose.rotation, args) if args.lever_arm else {}
                 data_log.step(
                     device_timestamp=t,
-                    sequence=depth_msg.getSequenceNum(),
+                    sequence=sequence,
+                    depth_source="frame" if frame_in.depth is not None else "points",
+                    depth_problem=frame_in.depth_problem,
                     time_delta_us=time_delta_us,
                     position_delta=position_delta,
                     angle_delta=angle_delta,
@@ -1044,6 +1428,7 @@ def run_session(device, args, log_only, data_log, stereo_settings, telemetry, ma
                     reference_age_s=frame.reference_age_s,
                     gap_frames=frame.gap_frames,
                     reference_reset=frame.reference_reset,
+                    reference_carried=frame.reference_carried,
                     **lever,
                 )
                 now_s = time.time()

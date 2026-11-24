@@ -53,7 +53,21 @@
   <div class="hint" id="link-hint">Measured: depthai's XLink byte counters (device.getProfilingData), about
     once a second; they count message payloads, not the USB/Ethernet framing. Streams: what the Pi reads from
     each queue plus header estimates, over the last 10 s; the rest is protocol traffic and frames dropped in the
-    Pi's queues. 100 Mbps is the raw Ethernet rate of a PoE camera; the usable rate is lower.</div>
+    Pi's queues. 100 Mbps is the raw Ethernet rate of a PoE camera; the usable rate is lower. ↑ streams go from
+    the Pi to the camera.</div>
+
+  <h2 class="sub">Depth for PnP <span class="muted">(depth_transport)</span></h2>
+  <div class="kv" id="transport-kv"><span class="muted">–</span><span></span></div>
+  <div class="hint">points: the camera computes the depth at each tracked feature (5×5 window, median of every 2nd
+    pixel) and sends only those numbers; a frame whose points are missing or do not match its features gets no
+    depth (counted here), never older depth. Images (and full depth frames) cross the link only while someone
+    watches a live stream or runs the depth probe; "video idle" means nothing image-like is sent.</div>
+
+  <h2 class="sub">Image streams <span class="muted">(what crosses the link to be viewed)</span></h2>
+  <div class="kv" id="images-kv"><span class="muted">–</span><span></span></div>
+  <div class="hint">Images are JPEG-encoded on the camera. Raw frames encoded on the Pi are a fallback and are
+    flagged here and in the widget. The depth snapshot is 16-bit millimetres (measurement data for the focal check
+    and depth_raw.png), so it always crosses raw, one frame per request.</div>
 
   <h2 class="sub">Output</h2>
   <div class="kv">
@@ -153,6 +167,7 @@
         <span>features</span><span id="ds-features">–</span>
         <span>camera conversion</span><span id="ds-cost">–</span>
         <span>camera errors</span><span id="ds-errors">–</span>
+        <span>viewers</span><span id="ds-viewers">–</span>
       </div>
       <details id="ds-log-box" hidden><summary class="muted" id="ds-log-summary">camera log</summary>
         <pre id="ds-log" class="probe"></pre></details>

@@ -290,3 +290,27 @@ def test_device_link_info_reads_usb_speed_and_protocol():
         raise RuntimeError("no info")
     info = link_stats.device_link_info(SimpleNamespace(getDeviceInfo=broken), None)
     assert info["protocol"] is None and info["usb_speed"] is None
+
+
+def test_upstream_streams_are_marked_and_summed_apart():
+    import link_stats
+    clock = FakeClock()
+    monitor = LinkMonitor(clock=clock)
+    monitor.sample()
+    for _ in range(3):
+        clock.t += 1.0
+        monitor.streams.add("depth_points", 10 * link_stats.spatial_data_bytes(303), 10)
+        monitor.streams.add("depth_points_rois", 10 * link_stats.spatial_config_bytes(303), 10)
+        monitor.streams.add("control", link_stats.BUFFER_OVERHEAD)
+        monitor.sample()
+    status = monitor.status()
+    by_name = {s["name"]: s for s in status["streams"]}
+    assert by_name["depth_points"]["direction"] == "down"
+    assert by_name["depth_points_rois"]["direction"] == "up" and by_name["control"]["direction"] == "up"
+    assert status["streams_sum_mbps"] == pytest.approx(by_name["depth_points"]["mbps"])
+    assert status["streams_up_sum_mbps"] == pytest.approx(by_name["depth_points_rois"]["mbps"]
+                                                          + by_name["control"]["mbps"])
+    assert link_stats.UP_STREAMS == {"depth_points_rois", "control"}
+    # 303 ROIs (300 features + 3): ~27 kB down and ~14 kB up per frame
+    assert link_stats.spatial_data_bytes(303) == 48 + 303 * 90
+    assert link_stats.spatial_config_bytes(303) == 40 + 303 * 45

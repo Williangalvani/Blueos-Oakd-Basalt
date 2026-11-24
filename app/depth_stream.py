@@ -927,7 +927,11 @@ class DepthStreamService:
     def on_host(self):
         return self.variant == HOST_JPEG and self.host_encoder is not None
 
-    def tick(self, depth=None, sequence=None):
+    def tick(self, depth=None, sequence=None, center=None, sample=None):
+        """
+        depth: this frame's depth (None in points mode, except the on-demand frames host_jpeg asked for);
+        center (a center_depth dict) and sample (the feature depths, mm) stand in for it in points mode.
+        """
         now = self.clock()
         if now - self._last_poll >= self.poll_interval:
             self._last_poll = now
@@ -948,11 +952,15 @@ class DepthStreamService:
                 self._store_frame(jpeg, frame_sequence)
             for report in self.host_encoder.reports():
                 self._on_status(report)
-        elif self.enabled and depth is not None and now - self._last_expect >= EXPECT_INTERVAL_S:
-            self._last_expect = now
-            self._expect(depth, now)
+        elif self.enabled and now - self._last_expect >= EXPECT_INTERVAL_S:
+            source = depth if depth is not None else sample
+            if source is not None:
+                self._last_expect = now
+                self._expect(source, now)
         if self.enabled and now - self._last_meta >= self.meta_interval:
-            if depth is not None:
+            if center is not None:
+                self.center = center
+            elif depth is not None:
                 self.center = center_depth(depth)
             self.write_meta(now)
 
@@ -1010,9 +1018,13 @@ class DepthStreamService:
         return True
 
     def _expect(self, depth, now):
-        """Whether the host's depth of about now would make a varying stream image."""
-        sample = np.asarray(depth)[::4, ::4]
-        if sample.ndim != 2 or not sample.size:
+        """Whether the host's depth of about now (a frame, or the feature depths) would make a varying stream image."""
+        sample = np.asarray(depth)
+        if sample.ndim == 2:
+            sample = sample[::4, ::4]
+        elif sample.ndim != 1:
+            return
+        if not sample.size:
             return
         valid = float(np.count_nonzero(sample)) / sample.size
         min_mm, max_mm = self.info.get("depth_range_mm") or (1, 65535)

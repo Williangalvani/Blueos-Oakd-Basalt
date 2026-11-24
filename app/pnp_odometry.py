@@ -169,6 +169,9 @@ class FrameResult:
     gap_frames: int = 0
     # This frame failed and replaced a reference that was too old or had too few matches left
     reference_reset: bool = False
+    # This frame had no depth of its own (process_depths depth_missing) but solved: the reference's inlier
+    # points, moved into this frame's camera by the solved pose, became the next reference
+    reference_carried: bool = False
     # Indices into this frame's ids/uv of the features matched to the reference (pose.inlier_index refers to these)
     matched_index: Optional[np.ndarray] = None
     # Per feature of this frame's ids/uv: True where the depth lookup gave a valid depth
@@ -201,6 +204,23 @@ def lookup_depth(depth, uv, params=PnPParams()):
         z = np.nanmedian(samples, axis=1)
     enough = valid.sum(axis=1) >= max(1, math.ceil(params.min_valid_depth_fraction * samples.shape[1]))
     z[~enough] = np.nan
+    return z * (params.depth_correction * params.refractive_index)
+
+
+def depth_from_points(depth_mm, pixels, samples, params=PnPParams(), pixel_count_reported=True):
+    """
+    Depth in metres per feature from the camera's per-window depth (depth_points: the SpatialLocationCalculator's
+    median of the valid pixels in each feature's window, depth_mm, from pixels valid samples of `samples` taken),
+    with lookup_depth's rules: within min_depth_m..max_depth_m, at least min_valid_depth_fraction of the samples
+    valid, times depth_correction and refractive_index; NaN otherwise. pixel_count_reported False (the camera
+    gave no counts) skips the fraction rule.
+    """
+    z = np.asarray(depth_mm, dtype=np.float64).ravel() * params.depth_unit_scale
+    valid = (z >= params.min_depth_m) & (z <= params.max_depth_m)
+    if pixel_count_reported:
+        need = np.maximum(1, np.ceil(params.min_valid_depth_fraction * np.asarray(samples, dtype=np.float64) - 1e-9))
+        valid &= np.asarray(pixels, dtype=np.float64).ravel() >= need
+    z = np.where(valid, z, np.nan)
     return z * (params.depth_correction * params.refractive_index)
 
 
@@ -425,6 +445,13 @@ class PnPOdometry:
         self.prev_timestamp = timestamp
         self.gap_frames = 0
 
+    def _carried(self, id_list, matched_index, pose):
+        """The reference points of the pose's inliers (all matches without RANSAC) in the current camera."""
+        keep = matched_index if pose.inlier_index is None else [matched_index[k] for k in pose.inlier_index]
+        R_10 = np.asarray(pose.rotation).T
+        t_10 = -np.asarray(pose.position_delta, dtype=np.float64)
+        return {id_list[k]: R_10 @ self.prev_points[id_list[k]] + t_10 for k in keep}
+
     def _reference_exhausted(self, age, matches):
         max_age = self.params.max_reference_age_s
         return (max_age > 0 and age > max_age) or matches < self.params.min_inliers
@@ -435,10 +462,25 @@ class PnPOdometry:
         depth: depth image (uint16 mm) aligned to the same image, timestamp: seconds.
         R_prior: gyro rotation R_01 between the reference (prev_timestamp) and this frame (or None).
         """
+        uv = np.asarray(uv, dtype=np.float64).reshape(-1, 2)
+        z = lookup_depth(depth, scale_to_depth_grid(uv, self.image_size, depth.shape), self.params)
+        return self.process_depths(ids, uv, z, timestamp, R_prior)
+
+    def process_depths(self, ids, uv, z, timestamp, R_prior=None, depth_missing=False):
+        """
+        process() with the depth already looked up: z (N,) metres per feature, NaN where there is none
+        (lookup_depth on a depth frame, or depth_from_points on the camera's depth at the features). A frame
+        whose depth is missing altogether is all NaN: it still solves against the reference.
+
+        depth_missing: this frame's depth never arrived (points mode: no or mismatched points). If it solves,
+        its own points cannot be the next reference (it has none); the reference's RANSAC inliers, moved into
+        this frame's camera by the solved pose (P1 = R_10 P0 + t_10), are instead (frame.reference_carried),
+        so one missing frame costs no delta. Without it such a frame becomes an empty reference, the next frame
+        has nothing to match and the reference is reset (full_frame's behaviour for an all-invalid depth frame).
+        """
         ids = np.asarray(ids, dtype=np.int64).ravel()
         uv = np.asarray(uv, dtype=np.float64).reshape(-1, 2)
-
-        z = lookup_depth(depth, scale_to_depth_grid(uv, self.image_size, depth.shape), self.params)
+        z = np.asarray(z, dtype=np.float64).ravel()
         valid = np.isfinite(z)
         points = back_project(uv[valid], z[valid], self.intrinsics)
         current = dict(zip(ids[valid].tolist(), points))
@@ -467,7 +509,10 @@ class PnPOdometry:
         else:
             frame.pose = PoseResult(ok=False, reason="too_few_matches", matches=0)
 
-        if frame.pose.ok:
+        if frame.pose.ok and depth_missing:
+            self._set_reference(self._carried(id_list, matched_index, frame.pose), timestamp)
+            frame.reference_carried = True
+        elif frame.pose.ok:
             self._set_reference(current, timestamp)
         elif self._reference_exhausted(frame.dt, len(matched)):
             frame.reference_reset = True

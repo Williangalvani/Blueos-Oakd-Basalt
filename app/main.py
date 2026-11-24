@@ -31,6 +31,7 @@ import mock_mode
 import snapshots
 import stereo_probe
 import system_stats
+import viewers
 import vio_log
 import vio_telemetry
 from autopilot_params import AutopilotParams
@@ -57,10 +58,9 @@ MAX_TAIL_ROWS = 300
 TELEMETRY_STALE_S = 3.0
 # No processed frame for this long while running: the camera counts as disconnected
 CAMERA_FRAME_TIMEOUT_S = 3.0
-# /api/stream/depth: how often each client checks for a new frame and renews the stream lease
+# /api/stream/*: how often each client checks for a new frame or event (the leases: viewer_registry)
 DEPTH_STREAM_POLL_S = 0.05
-DEPTH_STREAM_LEASE_REFRESH_S = 1.0
-# /api/stream/features: the same polling and lease renewal, plus the widget's status line this often
+# /api/stream/features and /api/stream/pose: the widget's status line this often
 WIDGET_STATUS_INTERVAL_S = 1.0
 # ArduPilot panel: per-request timeout and attempts of each parameter read, and how long a write waits
 # for a new HEARTBEAT to prove the vehicle is live and disarmed
@@ -139,6 +139,45 @@ def telemetry_dir() -> Path:
     return Path(TELEMETRY_DIR) if TELEMETRY_DIR is not None else vio_telemetry.DEFAULT_DIR
 
 
+def _lease(touch, lease_file, with_status=False):
+    """(touch, remove) for viewers.ViewerRegistry: remove() spares a lease renewed since (e.g. by /api/pose)."""
+    touched = {}
+
+    def renew():
+        directory = telemetry_dir()
+        touch(directory)
+        if with_status:
+            vio_telemetry.touch_lease(vio_telemetry.STATUS_LEASE, directory)
+        touched["at"] = time.time()
+
+    def remove():
+        path = telemetry_dir() / lease_file
+        at = touched.pop("at", None)
+        try:
+            if at is not None and path.stat().st_mtime <= at:
+                path.unlink()
+        except FileNotFoundError:
+            pass
+
+    return renew, remove
+
+
+def make_viewer_registry(**kwargs):
+    """
+    The live viewers of the streams: video (/api/stream/depth: makes the camera send images), features and pose
+    (/api/stream/features and /api/stream/pose, plus the status lease for their status lines).
+    """
+    kwargs.setdefault("log", print)
+    return viewers.ViewerRegistry({
+        "video": _lease(depth_stream.touch_lease, depth_stream.LEASE_FILE),
+        "features": _lease(feature_stream.touch_lease, feature_stream.LEASE_FILE, with_status=True),
+        "pose": _lease(pose_stream.touch_lease, pose_stream.LEASE_FILE, with_status=True),
+    }, **kwargs)
+
+
+viewer_registry = make_viewer_registry()
+
+
 def saved_choice(config: dict, key: str) -> str:
     """A saved choice, or its default if a hand-edited config.json has something else."""
     field = config_schema.FIELDS_BY_KEY[key]
@@ -170,12 +209,15 @@ def build_vio_command(config: dict) -> list:
             "--recovery-frames", str(int(config["tracking_recovery_frames"])),
             "--max-reference-age", str(float(config["max_reference_age"])),
             "--snapshots" if config["snapshots"] else "--no-snapshots",
+            "--snapshot-encoding", saved_choice(config, "snapshot_encoding"),
             "--depth-stream" if config.get("depth_stream", True) else "--no-depth-stream",
             "--depth-stream-fps", str(saved_number(config, "depth_stream_fps")),
             "--depth-stream-quality", str(saved_number(config, "depth_stream_quality")),
             "--depth-stream-encoding", saved_depth_stream_encoding(config),
             "--depth-stream-debug" if config.get("depth_stream_debug") else "--no-depth-stream-debug",
             "--pose-attitude-source", saved_choice(config, "pose_attitude_source"),
+            "--depth-transport", saved_choice(config, "depth_transport"),
+            "--depth-points-rois", saved_choice(config, "depth_points_rois"),
             "--telemetry-dir", str(telemetry_dir()),
             "--intrinsics-from", config.get("intrinsics_from") or "rectified",
             "--depth-scale", str(float(config.get("depth_scale", 1.0))),
@@ -464,6 +506,72 @@ def depth_stream_status(config: dict, process_status: dict, now: float) -> dict:
             "age_s": now - float(meta["unix_time"]) if meta.get("unix_time") else None}
 
 
+HOST_JPEG_FALLBACK = "fallback: raw depth over the link, encoded on the Pi"
+
+
+def _link_mbps(telemetry: Optional[dict], name: str):
+    link = (telemetry or {}).get("link") or {}
+    for stream in link.get("streams") or ():
+        if stream.get("name") == name:
+            return stream.get("mbps")
+    return None
+
+
+def image_streams_status(config: dict, depth: dict, telemetry: Optional[dict], process_status: dict,
+                         viewers: dict) -> dict:
+    """
+    Every image stream that can cross the camera link: codec, quality, encoded_on ("camera" or "pi"), what
+    crosses (over_link "jpeg" or "raw"), whether it is being viewed and its link Mbps (telemetry.link's
+    per-stream estimate, 10 s mean). Raw frames encoded on the Pi are fallbacks, listed in fallbacks.
+    """
+    fresh = telemetry if telemetry and not telemetry.get("stale") else None
+    streams = []
+    if depth.get("enabled"):
+        on_pi = depth.get("encoded_on") == "pi"
+        reason = ((depth.get("fallback") or {}).get("reason") or depth.get("variant_reason")
+                  or ("Depth Stream Encoding is host_jpeg" if depth.get("variant") == "host_jpeg" else None))
+        link_name = ("depth_on_demand" if depth.get("depth_frames") == "on_demand" else None) if on_pi \
+            else "depth_stream"
+        streams.append({
+            "name": "live_stream", "label": "Live stream", "variant": depth.get("variant"),
+            "codec": depth.get("codec") or "mjpeg", "quality": depth.get("quality"),
+            "encoded_on": depth.get("encoded_on"), "over_link": None if depth.get("stale") else (
+                "raw" if on_pi else "jpeg"),
+            "viewed": bool(depth.get("streaming")) or bool((viewers or {}).get("video")),
+            "mbps": _link_mbps(fresh, link_name) if link_name else None,
+            "jpeg_kbps": depth.get("kbps"),
+            "note": ("the PnP depth frame crosses anyway (full_frame): no extra link traffic"
+                     if on_pi and depth.get("depth_frames") == "every_frame" else None),
+            "fallback": f"{HOST_JPEG_FALLBACK}: {reason}" if on_pi and not depth.get("stale") else None})
+    shots = snapshots.read_encoding_status(SNAPSHOT_DIR) if process_status.get("running") else None
+    if config.get("snapshots", True) and config.get("algorithm") == "pnp":
+        live = (shots or {}).get("streams") or {}
+        for stream in snapshots.STREAMS:
+            entry = live.get(stream)
+            if entry is not None and not entry.get("available"):
+                continue
+            streams.append({
+                "name": f"snapshot_{stream}", "label": f"Snapshot {stream}", **(entry or {}),
+                "configured": saved_choice(config, "snapshot_encoding") if stream != "depth" else "raw",
+                "viewed": None, "mbps": None, "per_request": True,
+                "fallback": ((entry or {}).get("fallback") or {}).get("text")})
+    return {"streams": streams, "fallbacks": [s["fallback"] for s in streams if s.get("fallback")],
+            "snapshot_mbps": _link_mbps(fresh, "snapshot")}
+
+
+def depth_transport_status(config: dict, telemetry: Optional[dict]) -> dict:
+    """
+    How PnP gets its depth: configured (depth_transport) and rois (depth_points_rois), plus what the running
+    VIO reports (live: depth_points.DepthPointsReceiver.status in points, frames and feature gaps in full_frame,
+    and full_depth: the on-demand full depth frames, depth_points.FullDepthGate.status) and the camera's load
+    (vio_telemetry.read_camera_load, every 5 s). live and camera_load are null while not running.
+    """
+    fresh = telemetry if telemetry and not telemetry.get("stale") else {}
+    return {"configured": saved_choice(config, "depth_transport"),
+            "configured_rois": saved_choice(config, "depth_points_rois"),
+            "live": fresh.get("depth_points"), "camera_load": fresh.get("camera_load")}
+
+
 @app.get("/api/status")
 def get_status():
     """
@@ -476,18 +584,24 @@ def get_status():
     now = time.time()
     process = supervisor.status()
     vio_telemetry.touch_lease(vio_telemetry.STATUS_LEASE, telemetry_dir())
+    viewer_registry.tick()
     telemetry = live_telemetry(process, now)
     with vehicle_state_lock:
         vehicle = dict(vehicle_state)
     started = telemetry.get("started_at") if telemetry else None
     config = load_config()
+    depth = depth_stream_status(config, process, now)
+    viewers = viewer_registry.status()
     return {
         "mock": MOCK,
         **process,
         **log_only_status(config),
         "camera": snapshots.read_camera_status(SNAPSHOT_DIR),
         "algorithm": config.get("algorithm"),
-        "depth_stream": depth_stream_status(config, process, now),
+        "depth_stream": depth,
+        "depth_transport": depth_transport_status(config, telemetry),
+        "image_streams": image_streams_status(config, depth, telemetry, process, viewers),
+        "viewers": viewers,
         "pose": pose_status(config, telemetry),
         "telemetry": telemetry,
         "camera_connected": camera_connected(telemetry),
@@ -585,8 +699,9 @@ def get_snapshot(stream: Literal[snapshots.STREAMS], raw: bool = False, crosshai
                  x: Optional[float] = None, y: Optional[float] = None, w: Optional[int] = None,
                  h: Optional[int] = None, overlay: bool = False):
     """
-    PNG of one fresh frame from the running PnP VIO, without stopping it: rect_left, rect_right,
-    depth (colorized, invalid black; raw=1 for 16-bit millimetres) or rgb. Waits up to ~3 s.
+    One fresh frame from the running PnP VIO, without stopping it: rect_left, rect_right or rgb (the
+    camera's JPEG; PNG if sent raw: X-Snapshot-Fallback says why), depth (PNG, colorized, invalid black;
+    raw=1 for 16-bit millimetres). Waits up to ~3 s. The overlays below return a PNG.
     crosshair=1 draws the depth probe's ROI (x, y, w, h as for /api/depth_probe) on rect_left, rect_right or depth.
     overlay=1 (rect_left) draws the tracked features of the last processed frame: inliers green, outliers
     red, unmatched grey, with a line from each feature's previous position; X-Overlay-* headers count them.
@@ -617,11 +732,16 @@ def get_snapshot(stream: Literal[snapshots.STREAMS], raw: bool = False, crosshai
         "X-Snapshot-Unix-Time": str(meta.get("unix_time")),
         "X-Snapshot-Device-Timestamp": str(meta.get("device_timestamp")),
         "X-Snapshot-Sequence": str(meta.get("sequence")),
+        "X-Snapshot-Encoded-On": str(meta.get("encoded_on")),
     }
+    if (meta.get("fallback") or {}).get("text"):
+        headers["X-Snapshot-Fallback"] = meta["fallback"]["text"]
+    media_type = "image/jpeg" if meta.get("format") == "jpeg" and not raw else "image/png"
     if overlay:
         features = meta.get("overlay")
         if features:
             data = snapshots.draw_feature_overlay(data, features, features.get("image_size") or image_size)
+            media_type = "image/png"
             headers.update({"X-Overlay": "features", "X-Overlay-Inliers": str(features.get("inliers")),
                             "X-Overlay-Outliers": str(features.get("outliers")),
                             "X-Overlay-Unmatched": str(features.get("unmatched")),
@@ -630,7 +750,8 @@ def get_snapshot(stream: Literal[snapshots.STREAMS], raw: bool = False, crosshai
             headers["X-Overlay"] = "unavailable"
     if probe_request is not None:
         data = depth_probe.draw_probe_overlay(data, probe_request, image_size)
-    return Response(content=data, media_type="image/png", headers=headers)
+        media_type = "image/png"
+    return Response(content=data, media_type=media_type, headers=headers)
 
 
 def require_pnp_running(what):
@@ -642,38 +763,40 @@ def require_pnp_running(what):
     return config
 
 
-async def depth_stream_parts(directory: Path, limit: int):
-    """Multipart parts of each new depth_stream.jpg, renewing the lease that keeps the camera streaming."""
+async def depth_stream_parts(directory: Path, limit: int, client: str = "page"):
+    """Multipart parts of each new depth_stream.jpg, as a video viewer (whose lease keeps the camera streaming)."""
     reader = depth_stream.FrameReader(directory)
-    sent, leased = 0, float("-inf")
-    while True:
-        now = time.monotonic()
-        if now - leased >= DEPTH_STREAM_LEASE_REFRESH_S:
-            depth_stream.touch_lease(directory)
-            leased = now
-        frame = reader.read_new()
-        if frame is not None:
-            yield depth_stream.multipart_part(frame)
-            sent += 1
-            if limit and sent >= limit:
-                return
-        await asyncio.sleep(DEPTH_STREAM_POLL_S)
+    sent = 0
+    token = viewer_registry.open("video", client)
+    try:
+        while True:
+            viewer_registry.tick()
+            frame = reader.read_new()
+            if frame is not None:
+                yield depth_stream.multipart_part(frame)
+                sent += 1
+                if limit and sent >= limit:
+                    return
+            await asyncio.sleep(DEPTH_STREAM_POLL_S)
+    finally:
+        viewer_registry.close(token)
 
 
 @app.get("/api/stream/depth", include_in_schema=False)
-async def stream_depth(frames: int = Query(0, ge=0, le=100000)):
+async def stream_depth(frames: int = Query(0, ge=0, le=100000), client: str = "page"):
     """
     Live depth of the running PnP VIO as multipart/x-mixed-replace MJPEG (for an <img>): the JPEGs the
     camera encodes, forwarded as they are. Gray, linear in depth over stereo_depth_min_mm..max_mm, near
     bright, invalid black (see depth_stream.py; /api/status depth_stream has the scale and the centre
-    depth). The camera only streams while a client is connected. frames > 0 stops after that many.
+    depth). The camera only streams while a client is connected (and viewers.LINGER_S after the last one
+    left); /api/status viewers counts them. client: "page" or "widget", for that count. frames > 0 stops
+    after that many.
     """
     config = require_pnp_running("the depth stream")
     if not config.get("depth_stream", True):
         raise HTTPException(status_code=503, detail="the depth stream is off in the settings (Live depth stream)")
     directory = telemetry_dir()
-    depth_stream.touch_lease(directory)
-    return StreamingResponse(depth_stream_parts(directory, frames),
+    return StreamingResponse(depth_stream_parts(directory, frames, client),
                              media_type=f"multipart/x-mixed-replace; boundary={depth_stream.BOUNDARY}",
                              headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
@@ -683,94 +806,100 @@ def widget_status_now() -> dict:
     process = supervisor.status()
     config = load_config()
     telemetry = live_telemetry(process, now)
+    depth = depth_stream_status(config, process, now)
+    viewers = viewer_registry.status()
     return cockpit_widget.widget_status(cockpit_widget.widget_problem(config, process, telemetry), telemetry,
-                                        depth_stream_status(config, process, now),
-                                        log_only_status(config)["log_only"], now, mock=MOCK)
+                                        depth, log_only_status(config)["log_only"], now, mock=MOCK,
+                                        viewers=viewers,
+                                        image_streams=image_streams_status(config, depth, telemetry, process,
+                                                                           viewers))
 
 
-async def feature_events(directory: Path, limit: int):
+async def feature_events(directory: Path, limit: int, client: str = "page"):
     """Server-sent events: each new features.json as it is, and the widget status once a second."""
     reader = feature_stream.LatestFile(directory / feature_stream.FEATURES_FILE)
-    sent, leased, status_at = 0, float("-inf"), float("-inf")
-    yield b"retry: 3000\n\n"
-    while True:
-        now = time.monotonic()
-        if now - leased >= DEPTH_STREAM_LEASE_REFRESH_S:
-            feature_stream.touch_lease(directory)
-            vio_telemetry.touch_lease(vio_telemetry.STATUS_LEASE, directory)
-            leased = now
-        events = []
-        if now - status_at >= WIDGET_STATUS_INTERVAL_S:
-            status_at = now
-            events.append(feature_stream.sse_event("status", json.dumps(widget_status_now())))
-        data = reader.read_new()
-        if data is not None:
-            events.append(feature_stream.sse_event("features", data))
-        for event in events:
-            yield event
-            sent += 1
-            if limit and sent >= limit:
-                return
-        await asyncio.sleep(DEPTH_STREAM_POLL_S)
+    sent, status_at = 0, float("-inf")
+    token = viewer_registry.open("features", client)
+    try:
+        yield b"retry: 3000\n\n"
+        while True:
+            now = time.monotonic()
+            viewer_registry.tick()
+            events = []
+            if now - status_at >= WIDGET_STATUS_INTERVAL_S:
+                status_at = now
+                events.append(feature_stream.sse_event("status", json.dumps(widget_status_now())))
+            data = reader.read_new()
+            if data is not None:
+                events.append(feature_stream.sse_event("features", data))
+            for event in events:
+                yield event
+                sent += 1
+                if limit and sent >= limit:
+                    return
+            await asyncio.sleep(DEPTH_STREAM_POLL_S)
+    finally:
+        viewer_registry.close(token)
 
 
 @app.get("/api/stream/features", include_in_schema=False)
-async def stream_features(events: int = Query(0, ge=0, le=100000)):
+async def stream_features(events: int = Query(0, ge=0, le=100000), client: str = "page"):
     """
     text/event-stream for the Cockpit widget. "features": the PnP tracker's features of a recent frame,
     about 5 per second, as the VIO process wrote them (feature_stream.py: points [u, v, state] on the
     depth stream's pixel grid). "status": the widget's status line (cockpit_widget.widget_status) once a
     second, with "problem" set while there is nothing to show. Always 200, so EventSource keeps
-    reconnecting. The VIO process only publishes features while a client is connected. events > 0 stops
-    after that many events.
+    reconnecting. The VIO process only publishes features while a client is connected (a "features" viewer,
+    counted in /api/status viewers; client "page" or "widget"); they are not an image, so they never make the
+    camera send video. events > 0 stops after that many events.
     """
     directory = telemetry_dir()
-    feature_stream.touch_lease(directory)
-    return StreamingResponse(feature_events(directory, events), media_type="text/event-stream",
+    return StreamingResponse(feature_events(directory, events, client), media_type="text/event-stream",
                              headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
 
-async def pose_events(directory: Path, limit: int):
+async def pose_events(directory: Path, limit: int, client: str = "page"):
     """
     Server-sent events: "trail" when the VIO's trail file is new for this connection (once, and again after a
     VIO restart), each new pose.json as "pose", and the widget status once a second.
     """
     poses = feature_stream.LatestFile(directory / pose_stream.POSE_FILE)
     trails = feature_stream.LatestFile(directory / pose_stream.TRAIL_FILE)
-    sent, leased, status_at, trail_epoch = 0, float("-inf"), float("-inf"), None
-    yield b"retry: 3000\n\n"
-    while True:
-        now = time.monotonic()
-        if now - leased >= DEPTH_STREAM_LEASE_REFRESH_S:
-            pose_stream.touch_lease(directory)
-            vio_telemetry.touch_lease(vio_telemetry.STATUS_LEASE, directory)
-            leased = now
-        events = []
-        if now - status_at >= WIDGET_STATUS_INTERVAL_S:
-            status_at = now
-            events.append(feature_stream.sse_event("status", json.dumps(widget_status_now())))
-        trail = trails.read_new()
-        if trail is not None:
-            try:
-                epoch = json.loads(trail).get("epoch")
-            except ValueError:
-                epoch = None
-            if epoch is not None and epoch != trail_epoch:
-                trail_epoch = epoch
-                events.append(feature_stream.sse_event("trail", trail))
-        pose = poses.read_new()
-        if pose is not None:
-            events.append(feature_stream.sse_event("pose", pose))
-        for event in events:
-            yield event
-            sent += 1
-            if limit and sent >= limit:
-                return
-        await asyncio.sleep(DEPTH_STREAM_POLL_S)
+    sent, status_at, trail_epoch = 0, float("-inf"), None
+    token = viewer_registry.open("pose", client)
+    try:
+        yield b"retry: 3000\n\n"
+        while True:
+            now = time.monotonic()
+            viewer_registry.tick()
+            events = []
+            if now - status_at >= WIDGET_STATUS_INTERVAL_S:
+                status_at = now
+                events.append(feature_stream.sse_event("status", json.dumps(widget_status_now())))
+            trail = trails.read_new()
+            if trail is not None:
+                try:
+                    epoch = json.loads(trail).get("epoch")
+                except ValueError:
+                    epoch = None
+                if epoch is not None and epoch != trail_epoch:
+                    trail_epoch = epoch
+                    events.append(feature_stream.sse_event("trail", trail))
+            pose = poses.read_new()
+            if pose is not None:
+                events.append(feature_stream.sse_event("pose", pose))
+            for event in events:
+                yield event
+                sent += 1
+                if limit and sent >= limit:
+                    return
+            await asyncio.sleep(DEPTH_STREAM_POLL_S)
+    finally:
+        viewer_registry.close(token)
 
 
 @app.get("/api/stream/pose", include_in_schema=False)
-async def stream_pose(events: int = Query(0, ge=0, le=100000)):
+async def stream_pose(events: int = Query(0, ge=0, le=100000), client: str = "page"):
     """
     text/event-stream for the 3D pose viewer (main page panel and /widget/pose). "pose": the VIO's integrated
     pose, at most pose_stream.RATE_HZ (10) per second: x, y, z (m), roll, pitch, yaw (radians, ZYX),
@@ -780,11 +909,11 @@ async def stream_pose(events: int = Query(0, ge=0, le=100000)):
     ATTITUDE, attitude_age_s old) or "gyro" (gyro-integrated, drifting); see pose_stream. "trail": the recent
     path, [t, x, y, z] points, sent again when its epoch changes (VIO restart, start-FRD -> NED). "status":
     the widget status line once a second. Always 200; the VIO process only publishes while a client is
-    connected. events > 0 stops after that many.
+    connected (a "pose" viewer in /api/status viewers; client "page" or "widget"). events > 0 stops after that
+    many.
     """
     directory = telemetry_dir()
-    pose_stream.touch_lease(directory)
-    return StreamingResponse(pose_events(directory, events), media_type="text/event-stream",
+    return StreamingResponse(pose_events(directory, events, client), media_type="text/event-stream",
                              headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
 

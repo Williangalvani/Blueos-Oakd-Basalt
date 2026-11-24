@@ -124,7 +124,7 @@ function startDepth() {
   w.depthRetry = null;
   if (w.depthOn || !visible()) return;
   w.depthOn = true;
-  $('depth-img').src = DEPTH_URL + '?t=' + Date.now();
+  $('depth-img').src = DEPTH_URL + '?client=widget&t=' + Date.now();
   const fps = (w.status && w.status.depth && w.status.depth.fps_target) || 5;
   clearInterval(w.colorTimer);
   w.colorTimer = setInterval(colorize, Math.max(60, Math.min(500, 500 / fps)));
@@ -259,11 +259,21 @@ function renderStatus(s) {
     blank.title = d.blank.text;
     parts.push(blank);
   } else if (!s.problem && d.streaming && d.encoded_on === 'pi') {
-    const pi = span('depth: encoded on the Pi' + (d.fallback ? ' (fallback: ' + d.fallback.reason + ')' : ''), 'muted');    if (d.fallback && d.fallback.detail) pi.title = d.fallback.detail;
+    const pi = span('depth: fallback: raw depth over the link, encoded on the Pi', 'warn');
+    pi.title = d.fallback ? d.fallback.reason + (d.fallback.detail ? ': ' + d.fallback.detail : '') : (d.variant_reason || 'Depth Stream Encoding is host_jpeg');
     parts.push(pi);
+  }
+  const rawShots = (s.raw_fallbacks || []).filter((text) => text.indexOf('raw frames') >= 0);
+  if (!s.problem && rawShots.length) {
+    const shots = span('snapshots: fallback: raw frames over the link, encoded on the Pi', 'warn');
+    shots.title = rawShots.join('\n');
+    parts.push(shots);
   }
   const link = s.problem ? '' : linkWidgetText(s.link);
   if (link) parts.push(span(link, 'muted'));
+  if (!s.problem) {
+    for (const [text, cls] of transportWidgetParts(s.depth_transport, s.viewers)) parts.push(span(text, cls));
+  }
   const pose = s.pose;
   if (!s.problem && pose && pose.attitude_source === 'gyro') {
     const gyro = span('3D pose attitude: gyro-integrated, drifting', 'warn');
@@ -287,7 +297,7 @@ function startEvents() {
   clearTimeout(w.eventsRetry);
   w.eventsRetry = null;
   if (w.events || !visible()) return;
-  const es = new EventSource(EVENTS_URL);
+  const es = new EventSource(EVENTS_URL + '?client=widget');
   w.events = es;
   es.addEventListener('status', e => { try { renderStatus(JSON.parse(e.data)); } catch (err) { /* partial */ } });
   es.addEventListener('features', e => {

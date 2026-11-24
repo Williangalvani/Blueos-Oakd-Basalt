@@ -405,7 +405,7 @@ export function mountPoseViewer(root, options = {}) {
 
   function connect() {
     if (state.es) return;
-    const es = new EventSource(base + 'api/stream/pose');
+    const es = new EventSource(base + 'api/stream/pose?client=' + (options.fill ? 'widget' : 'page'));
     es.addEventListener('pose', e => onPose(JSON.parse(e.data)));
     es.addEventListener('trail', e => onTrail(JSON.parse(e.data)));
     es.addEventListener('status', e => onStatus(JSON.parse(e.data)));

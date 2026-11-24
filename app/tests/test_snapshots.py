@@ -45,32 +45,52 @@ class SyncWriter:
         return True
 
 
-class FakeDevice:
-    """Plays the device side: a request for a stream yields one frame of it on the snapshot queue."""
+def camera_jpeg(image):
+    ok, data = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, snapshots.JPEG_QUALITY])
+    assert ok
+    return data.tobytes()
 
-    def __init__(self):
+
+class FakeDevice:
+    """
+    Plays the device side (pnp_vio.snapshot_script): a request yields one frame of the stream, raw on the
+    snapshot queue or JPEG from the stream's encoder. Asking a stream without an encoder for a JPEG fails;
+    broken_encoder: the encoders return nothing (as the test12 variants did).
+    """
+
+    def __init__(self, encoded=()):
+        self.encoded = set(encoded)
+        self.broken_encoder = False
         self.requests = []
+        self.raw = []
         self.queue = []
 
-    def send_request(self, stream):
+    def send_request(self, stream, raw):
+        assert raw or stream in self.encoded, f"JPEG asked for {stream}, which has no encoder"
         self.requests.append(stream)
-        self.queue.append(FRAMES[stream])
+        self.raw.append(raw)
+        if raw:
+            self.queue.append((FRAMES[stream], False))
+        elif not self.broken_encoder:
+            self.queue.append((camera_jpeg(FRAMES[stream]), True))
 
     def try_get(self):
-        return self.queue.pop(0) if self.queue else None
+        return self.queue.pop(0) if self.queue else (None, None)
 
 
 def make_service(tmp_path, clock, device, available=snapshots.STREAMS, unavailable=None, writer=None):
     return snapshots.SnapshotService(available, device.send_request, writer or SyncWriter(tmp_path), tmp_path,
-                                     unavailable=unavailable, clock=clock, log=lambda m: None)
+                                     unavailable=unavailable, clock=clock, log=lambda m: None,
+                                     encoded=device.encoded)
 
 
 def vio_tick(service, device):
     """One VIO frame worth of snapshot handling, as in pnp_vio.run()."""
     service.tick()
-    frame = device.try_get()
+    frame, encoded = device.try_get()
     if frame is not None:
-        service.on_frame(lambda stream, f=frame: f, device_timestamp=12.5, sequence=42)
+        service.on_frame(lambda stream, f=frame: f, device_timestamp=12.5, sequence=42, encoded=encoded,
+                         nbytes=len(frame) if encoded else frame.nbytes)
 
 
 def decode(data, flags=cv2.IMREAD_UNCHANGED):
@@ -158,7 +178,7 @@ def test_request_written_after_claim_is_served_next(tmp_path):
     snapshots.request_snapshot("depth", tmp_path, clock=lambda: 1.0)
     service.tick()  # claimed and sent
     snapshots.request_snapshot("depth", tmp_path, clock=lambda: 2.0)  # arrives while in flight
-    frame = device.try_get()
+    frame, _ = device.try_get()
     service.on_frame(lambda stream: frame)
     assert snapshots.read_metadata("depth", tmp_path)["requested_at"] == 1.0
     clock.now = 2.0
@@ -193,6 +213,93 @@ def test_device_reply_timeout_reports_error_and_unblocks(tmp_path):
     clock.now = 3.0
     service.tick()
     assert device.requests == ["depth", "rect_left"]
+
+
+@pytest.mark.parametrize("stream", ["rect_left", "rect_right", "rgb"])
+def test_camera_jpeg_streams_are_written_as_the_camera_sent_them(tmp_path, stream):
+    clock, device = FakeClock(), FakeDevice(encoded=snapshots.CAMERA_JPEG_STREAMS)
+    service = make_service(tmp_path, clock, device)
+    requested_at = snapshots.request_snapshot(stream, tmp_path)
+    vio_tick(service, device)
+    assert device.raw == [False]
+    data, meta = snapshots.wait_for_snapshot(stream, requested_at, snapshot_dir=tmp_path, timeout=0)
+    assert data == camera_jpeg(FRAMES[stream]) and meta["files"] == [f"{stream}.jpg"]
+    assert (meta["format"], meta["encoded_on"], meta["bytes"], meta["link_bytes"]) == ("jpeg", "camera", len(data),
+                                                                                        len(data))
+    assert (meta["width"], meta["height"]) == (640, 400) and meta["fallback"] is None
+    assert not (tmp_path / f"{stream}.png").exists()
+    assert decode(data).shape == FRAMES[stream].shape
+    if stream != "rgb":  # close to the frame (quality 95), not bit-exact; the RGB test pattern defeats chroma subsampling
+        assert np.abs(decode(data).astype(int) - FRAMES[stream].astype(int)).mean() < 3
+    status = snapshots.read_encoding_status(tmp_path)["streams"][stream]
+    assert (status["codec"], status["quality"], status["encoded_on"], status["over_link"]) == (
+        "mjpeg", snapshots.JPEG_QUALITY, "camera", "jpeg")
+    assert status["last_bytes"] == len(data)
+
+
+def test_depth_is_always_raw_even_with_camera_jpeg(tmp_path):
+    clock, device = FakeClock(), FakeDevice(encoded=snapshots.CAMERA_JPEG_STREAMS)
+    service = make_service(tmp_path, clock, device)
+    requested_at = snapshots.request_snapshot("depth", tmp_path)
+    vio_tick(service, device)
+    assert device.raw == [True]
+    _, meta = snapshots.wait_for_snapshot("depth", requested_at, snapshot_dir=tmp_path, timeout=0)
+    assert (meta["format"], meta["encoded_on"]) == ("png", "pi") and meta["files"] == ["depth.png", "depth_raw.png"]
+    status = service.status()["streams"]["depth"]
+    assert (status["codec"], status["encoded_on"], status["measurement"], status["fallback"]) == (
+        "png", "pi", True, None)
+    assert "16-bit" in status["reason"]
+
+
+def test_a_silent_camera_encoder_falls_back_to_raw_frames_flagged(tmp_path):
+    clock, device = FakeClock(), FakeDevice(encoded=("rect_left", "rect_right"))
+    device.broken_encoder = True
+    service = make_service(tmp_path, clock, device)
+    first = snapshots.request_snapshot("rect_left", tmp_path)
+    service.tick()
+    clock.now = 2.5
+    service.tick()
+    with pytest.raises(snapshots.SnapshotUnavailable, match="no JPEG from the camera's encoder.*sent raw"):
+        snapshots.wait_for_snapshot("rect_left", first, snapshot_dir=tmp_path, timeout=0)
+    status = snapshots.read_encoding_status(tmp_path)["streams"]
+    assert status["rect_left"]["fallback"]["text"].startswith(snapshots.RAW_FALLBACK)
+    assert (status["rect_left"]["codec"], status["rect_left"]["encoded_on"]) == ("png", "pi")
+    assert status["rect_right"]["fallback"] is None and status["rect_right"]["encoded_on"] == "camera"
+
+    second = snapshots.request_snapshot("rect_left", tmp_path)
+    clock.now = 4.0
+    vio_tick(service, device)
+    assert device.raw == [False, True]
+    data, meta = snapshots.wait_for_snapshot("rect_left", second, snapshot_dir=tmp_path, timeout=0)
+    assert np.array_equal(decode(data), RECT) and meta["format"] == "png"
+    assert meta["fallback"]["reason"].startswith("no JPEG")
+
+
+def test_a_reply_of_the_other_kind_is_not_taken_for_the_request(tmp_path):
+    clock, device = FakeClock(), FakeDevice(encoded=("rect_left",))
+    service = make_service(tmp_path, clock, device)
+    snapshots.request_snapshot("rect_left", tmp_path)
+    service.tick()
+    device.queue.clear()
+    assert service.on_frame(lambda stream: RECT, encoded=False) is False  # a late raw reply
+    assert service.pending is not None
+    assert service.on_frame(lambda stream: camera_jpeg(RECT), encoded=True) is True
+
+
+def test_jpeg_size_reads_the_frame_header():
+    assert snapshots.jpeg_size(camera_jpeg(RECT)) == (640, 400)
+    assert snapshots.jpeg_size(camera_jpeg(RGB[:100, :30])) == (30, 100)
+    for bad in (b"", b"\x89PNG....", b"\xff\xd8\xff"):
+        with pytest.raises(ValueError):
+            snapshots.jpeg_size(bad)
+
+
+def test_an_empty_camera_jpeg_is_a_writer_error_not_a_snapshot(tmp_path):
+    messages = []
+    writer = snapshots.SnapshotWriter(tmp_path, log=messages.append)
+    writer.submit("rect_left", lambda: b"", {"requested_at": 1.0})
+    writer.close()
+    assert any("not a JPEG" in m for m in messages) and not (tmp_path / "rect_left.json").exists()
 
 
 def test_no_request_dir_and_garbage_files_are_harmless(tmp_path):
@@ -283,11 +390,12 @@ def client(monkeypatch, tmp_path):
 def fake_vio(tmp_path):
     """A VIO process stand-in: polls requests and serves them like pnp_vio.run() does."""
     snapshot_dir = tmp_path / "snapshots"
-    device = FakeDevice()
+    device = FakeDevice(encoded=("rect_left", "rect_right"))
     writer = snapshots.SnapshotWriter(snapshot_dir, log=lambda m: None)
     service = snapshots.SnapshotService(("rect_left", "rect_right", "depth"), device.send_request, writer,
                                         snapshot_dir, unavailable={"rgb": "this device has no CAM_A (RGB) camera"},
-                                        min_interval=0.0, poll_interval=0.01, log=lambda m: None)
+                                        min_interval=0.0, poll_interval=0.01, reply_timeout=0.3, log=lambda m: None,
+                                        encoded=device.encoded)
     stop = threading.Event()
 
     def loop():
@@ -303,19 +411,37 @@ def fake_vio(tmp_path):
     writer.close()
 
 
-def test_api_snapshot_returns_png(client, fake_vio):
+def test_api_snapshot_returns_the_camera_jpeg_and_depth_png(client, fake_vio):
     main, http = client
     response = http.get("/api/snapshot?stream=rect_left")
     assert response.status_code == 200
-    assert response.headers["content-type"] == "image/png"
+    assert response.headers["content-type"] == "image/jpeg"
+    assert response.headers["x-snapshot-encoded-on"] == "camera" and "x-snapshot-fallback" not in response.headers
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["x-snapshot-sequence"] == "42"
-    assert np.array_equal(decode(response.content), RECT)
+    assert response.content == camera_jpeg(RECT)  # the camera's bytes as they are
 
     depth = http.get("/api/snapshot?stream=depth")
+    assert depth.headers["content-type"] == "image/png" and depth.headers["x-snapshot-encoded-on"] == "pi"
     assert decode(depth.content).shape == (400, 640, 3)
     raw = http.get("/api/snapshot?stream=depth&raw=1")
     assert np.array_equal(decode(raw.content), DEPTH)
+    # The overlays redraw it as PNG
+    overlaid = http.get("/api/snapshot?stream=rect_left&crosshair=1&x=50&y=25&w=10&h=6")
+    assert overlaid.headers["content-type"] == "image/png"
+
+
+def test_api_snapshot_flags_the_raw_fallback(client, fake_vio):
+    main, http = client
+    fake_vio.broken_encoder = True
+    first = http.get("/api/snapshot?stream=rect_right")
+    assert first.status_code == 404 and "sent raw" in first.json()["detail"]
+    fake_vio.broken_encoder = False
+    second = http.get("/api/snapshot?stream=rect_right")
+    assert second.headers["content-type"] == "image/png" and second.headers["x-snapshot-encoded-on"] == "pi"
+    assert second.headers["x-snapshot-fallback"].startswith(snapshots.RAW_FALLBACK)
+    assert np.array_equal(decode(second.content), FRAMES["rect_right"])
+    assert fake_vio.raw[-2:] == [False, True]
 
 
 def test_api_snapshot_errors(client, fake_vio, monkeypatch):

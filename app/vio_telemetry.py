@@ -16,7 +16,9 @@ FAILURE_WINDOW_S of (time, reason) tuples, at most 300 s x 30 fps.
 
 The camera chip temperature is sampled on the publisher thread at most every TEMPERATURE_INTERVAL_S
 (an RPC to the device), never on the VIO loop. So is the camera link (link_stats.LinkMonitor, the XLink
-byte counters, about once a second whether or not anyone watches, so its 60-s peak is always complete).
+byte counters, about once a second whether or not anyone watches, so its 60-s peak is always complete), and
+the camera load (read_camera_load: Leon CSS/MSS CPU, DDR/CMX/heap memory; six RPCs) every
+CAMERA_LOAD_INTERVAL_S.
 
 main.py side: touch_lease(), read_status(), HistoryReader, downsample(). depthai-free so it can be unit tested.
 """
@@ -53,6 +55,36 @@ STATUS_INTERVAL_S = 0.5
 HISTORY_INTERVAL_S = 1.0
 LEASE_S = 10.0
 TEMPERATURE_INTERVAL_S = 5.0
+CAMERA_LOAD_INTERVAL_S = 5.0
+CAMERA_CPUS = (("leon_css", "getLeonCssCpuUsage"), ("leon_mss", "getLeonMssCpuUsage"))
+CAMERA_MEMORIES = (("ddr", "getDdrMemoryUsage"), ("cmx", "getCmxMemoryUsage"),
+                   ("leon_css_heap", "getLeonCssHeapUsage"), ("leon_mss_heap", "getLeonMssHeapUsage"))
+
+
+def read_camera_load(device):
+    """
+    The camera's own load (depthai DeviceBase RPCs): Leon CSS / MSS CPU (CpuUsage.average, 0-1, as %) and
+    DDR / CMX / Leon heap memory (MemoryInfo used / total, bytes). A getter that fails gives None and its error.
+    """
+    load, errors = {}, {}
+    for name, getter in CAMERA_CPUS:
+        try:
+            value = float(getattr(device, getter)().average)
+            load[f"{name}_cpu_percent"] = round(100.0 * value, 1) if math.isfinite(value) else None
+        except Exception as e:
+            load[f"{name}_cpu_percent"] = None
+            errors[name] = str(e)
+    for name, getter in CAMERA_MEMORIES:
+        try:
+            memory = getattr(device, getter)()
+            used, total = int(memory.used), int(memory.total)
+            load[name] = {"used": used, "total": total,
+                          "used_percent": round(100.0 * used / total, 1) if total > 0 else None}
+        except Exception as e:
+            load[name] = None
+            errors[name] = str(e)
+    load["errors"] = errors or None
+    return load
 
 
 def history_capacity(fps):
@@ -171,12 +203,15 @@ class Telemetry:
     """
     VIO process side. record_frame() per frame; start() runs the publisher thread, close() stops it.
     temperature() returns the chip temperature in °C (or raises); output_error() the MAVLink sender's
-    last error; pose_status() the 3D pose's attitude source (pose_stream.PoseStreamService.status). All are
-    called on the publisher thread only. link: a link_stats.LinkMonitor, sampled every link.interval_s.
+    last error; pose_status() the 3D pose's attitude source (pose_stream.PoseStreamService.status);
+    camera_load() the camera's CPU and memory (read_camera_load); depth_points_status() the depth transport's
+    counters (status "depth_points"). All are called on the publisher thread only. link: a
+    link_stats.LinkMonitor, sampled every link.interval_s.
     """
 
     def __init__(self, directory=DEFAULT_DIR, fps=10, min_inliers=15, mode="sending", temperature=None,
-                 output_error=None, pose_status=None, clock=time.time, log=print, link=None):
+                 output_error=None, pose_status=None, clock=time.time, log=print, link=None, camera_load=None,
+                 depth_points_status=None):
         self.directory = Path(directory)
         self.fps = fps
         self.min_inliers = min_inliers
@@ -185,6 +220,9 @@ class Telemetry:
         self.output_error = output_error
         self.pose_status = pose_status
         self.link = link
+        self.camera_load = camera_load
+        self.depth_points_status = depth_points_status
+        self.camera_load_value = None
         self.clock = clock
         self.log = log
         self.phase = "starting"
@@ -203,7 +241,7 @@ class Telemetry:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
-        self._last_temperature = self._last_link = float("-inf")
+        self._last_temperature = self._last_link = self._last_camera_load = float("-inf")
         self._last_status = self._last_history = float("-inf")
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
@@ -282,6 +320,9 @@ class Telemetry:
         if self.temperature is not None and now - self._last_temperature >= TEMPERATURE_INTERVAL_S:
             self._last_temperature = now
             self.sample_temperature(now)
+        if self.camera_load is not None and now - self._last_camera_load >= CAMERA_LOAD_INTERVAL_S:
+            self._last_camera_load = now
+            self.sample_camera_load(now)
         if now - self._last_status >= STATUS_INTERVAL_S and _lease_fresh(self.directory / STATUS_LEASE, now):
             self._last_status = now
             self.write_status(now)
@@ -298,6 +339,15 @@ class Telemetry:
             self.chip_temperature = None
         self.chip_temperature_at = self.clock() if now is None else now
         return self.chip_temperature
+
+    def sample_camera_load(self, now=None):
+        try:
+            value = dict(self.camera_load())
+        except Exception as e:
+            value = {"errors": {"camera_load": str(e)}}
+        value["unix_time"] = self.clock() if now is None else now
+        self.camera_load_value = value
+        return value
 
     def status(self, now=None):
         now = self.clock() if now is None else now
@@ -323,6 +373,10 @@ class Telemetry:
             link = self.link.status() if self.link is not None else None
         except Exception as e:
             link = {"available": False, "reason": f"link status failed: {e}"}
+        try:
+            depth_points = self.depth_points_status() if self.depth_points_status is not None else None
+        except Exception as e:
+            depth_points = {"error": str(e)}
         return {
             "pid": os.getpid(),
             "unix_time": now,
@@ -347,6 +401,8 @@ class Telemetry:
             "trajectory": {"x": position[0], "y": position[1], "yaw": position[2]},
             "pose": pose,
             "link": link,
+            "camera_load": self.camera_load_value,
+            "depth_points": depth_points,
             "history": {"rows": self.history.count, "capacity": self.history.capacity, "bytes": self.history.nbytes,
                         "seconds": HISTORY_SECONDS},
         }

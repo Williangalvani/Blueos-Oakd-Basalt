@@ -22,6 +22,7 @@ estimates follow the libnop encoding of the depthai v3.3.0 structs (a struct 2 B
 - IMUPacket (accelerometer, gyroscope, magnetic field, rotation vector; the last two empty here): about 156 B;
 - ImgFrame metadata (timestamps, Specs x2, CameraSettings, ImgTransformation with four 3x3 matrices and 14
   distortion coefficients): about 500 B; EncodedFrame metadata about 450 B.
+UP_STREAMS are what the host sends the camera (input queues), summed separately (streams_up_sum_mbps).
 Messages a non-blocking host queue drops before the VIO reads them crossed the link but are not counted;
 with the protocol traffic (RPC, logs, timesync) they make up the measured total minus the sum.
 """
@@ -48,18 +49,34 @@ IMU_PACKET_BYTES = 156
 IMU_DATA_OVERHEAD = 40
 MESSAGE_GROUP_OVERHEAD = 64
 LOG_MESSAGE_OVERHEAD = 64
+# SpatialLocations: the echoed config (Rect, thresholds, algorithm, step) about 45 B, three float depths, two
+# uint16, the pixel count and a Point3f
+SPATIAL_LOCATION_BYTES = 90
+SPATIAL_DATA_OVERHEAD = 48
+# SpatialLocationCalculatorConfigData sent up (rois "host")
+SPATIAL_CONFIG_ROI_BYTES = 45
+SPATIAL_CONFIG_OVERHEAD = 40
 
 # Host output queues in display order, with what they carry
 STREAMS = {
-    "depth": "stereo.depth via Sync (RAW16 depth the PnP reads)",
-    "features": "FeatureTracker tracked features via Sync (estimate per feature)",
-    "sync_group": "Sync MessageGroup header (estimate)",
+    "depth": "stereo.depth via Sync (RAW16 depth the PnP reads; depth_transport full_frame)",
+    "depth_points": "depth at the tracked features from the camera's SpatialLocationCalculator (points; estimate "
+                    "per ROI)",
+    "features": "FeatureTracker tracked features (estimate per feature)",
+    "sync_group": "Sync MessageGroup header (estimate; full_frame)",
     "imu": "IMU accelerometer + gyroscope (estimate per packet)",
-    "snapshot": "on-demand snapshots (only when requested)",
+    "depth_on_demand": "full depth frames in points mode, only while the depth probe or a watched host_jpeg stream "
+                       "needs them",
+    "snapshot": "on-demand snapshots (only when requested; images JPEG from the camera, depth raw)",
     "depth_stream": "live camera / depth stream JPEG (only while a client watches)",
     "depth_stream_status": "depth stream Script status reports",
+    "depth_points_status": "depth points Script status reports",
     "device_log": "camera log messages",
+    "depth_points_rois": "UP: ROI config per frame, built on the Pi (depth_points_rois host; estimate per ROI)",
+    "control": "UP: gate, snapshot request and tracker control messages (estimate)",
 }
+# Streams the host sends to the camera
+UP_STREAMS = frozenset({"depth_points_rois", "control"})
 
 PROTOCOLS = {
     "X_LINK_USB_VSC": "USB",
@@ -94,6 +111,14 @@ def features_bytes(count):
 
 def imu_bytes(packets):
     return IMU_DATA_OVERHEAD + int(packets) * IMU_PACKET_BYTES
+
+
+def spatial_data_bytes(rois):
+    return SPATIAL_DATA_OVERHEAD + int(rois) * SPATIAL_LOCATION_BYTES
+
+
+def spatial_config_bytes(rois):
+    return SPATIAL_CONFIG_OVERHEAD + int(rois) * SPATIAL_CONFIG_ROI_BYTES
 
 
 def log_bytes(payload):
@@ -272,7 +297,7 @@ class LinkMonitor:
 
     @staticmethod
     def _stream_rates(samples):
-        empty = {"streams": [], "streams_window_s": None, "streams_sum_mbps": None}
+        empty = {"streams": [], "streams_window_s": None, "streams_sum_mbps": None, "streams_up_sum_mbps": None}
         if len(samples) < 2:
             return empty
         latest = samples[-1]
@@ -286,8 +311,12 @@ class LinkMonitor:
             before = first.streams.get(name, (0, 0))
             messages, nbytes = messages - before[0], nbytes - before[1]
             streams.append({"name": name, "description": STREAMS.get(name, ""), "mbps": mbps(nbytes, span),
-                            "msgs_per_s": messages / span, "bytes_per_msg": nbytes / messages if messages else None})
-        return {"streams": streams, "streams_window_s": span, "streams_sum_mbps": sum(s["mbps"] for s in streams)}
+                            "msgs_per_s": messages / span, "bytes_per_msg": nbytes / messages if messages else None,
+                            "direction": "up" if name in UP_STREAMS else "down"})
+        down = [s["mbps"] for s in streams if s["direction"] == "down"]
+        up = [s["mbps"] for s in streams if s["direction"] == "up"]
+        return {"streams": streams, "streams_window_s": span, "streams_sum_mbps": sum(down),
+                "streams_up_sum_mbps": sum(up) if up else None}
 
     def summary(self):
         """The link part of the VIO's periodic log line."""

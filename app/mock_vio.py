@@ -30,9 +30,15 @@ Published through the real services, at the configured fps:
   mock_mode.attitude_fetch (an in-process mavlink2rest ATTITUDE with gaps), and its gyro deltas carry
   mock_mode.GYRO_BIAS so the fallback drifts;
 - snapshots.SnapshotService and depth_probe.DepthProbeService; camera.json;
-- link_stats.LinkMonitor (telemetry.link): the per-stream counts the real VIO makes (RAW16 depth, tracked
-  features, Sync headers, IMU at IMU_RATE_HZ, snapshots, the camera's JPEGs), and stand-in XLink counters
+- link_stats.LinkMonitor (telemetry.link): the per-stream counts the real VIO makes (full_frame: RAW16 depth,
+  tracked features, Sync headers; points: tracked features, the depth points, the ROI configs up, full depth
+  frames only on demand; both: IMU at IMU_RATE_HZ, snapshots, the camera's JPEGs), and stand-in XLink counters
   (MockLinkCounters: those bytes plus a little protocol traffic), all marked mock;
+- --depth-transport points (the default, as in pnp_vio.py): the real depth_points.DepthPointsReceiver and
+  FullDepthGate, against MockPointsCamera, which answers each request as the camera's Script and
+  SpatialLocationCalculator would (5x5 window, every 2nd pixel, thresholds exclusive, median) on the synthetic
+  depth of that frame; the depth probe and the host_jpeg stream get full depth frames only through the gate;
+- the camera's load (vio_telemetry.read_camera_load on MockCameraLoad: Leon CPU and memory, synthetic);
 - a JSONL data log under --log-dir.
 Nothing is sent anywhere. --algorithm basalt only idles, as Basalt publishes none of this.
 """
@@ -44,12 +50,16 @@ import random
 import signal
 import sys
 import time
+import warnings
 from collections import deque
+from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
 import autopilot_attitude
+import depth_points
 import depth_probe
 import depth_stream
 import feature_stream
@@ -89,12 +99,18 @@ def parse_args(argv=None):
     parser.add_argument("--recovery-frames", type=int, default=20)
     parser.add_argument("--max-reference-age", type=float, default=1.0)
     parser.add_argument("--snapshots", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--snapshot-encoding", choices=snapshots.ENCODINGS, default=snapshots.CAMERA_JPEG)
     parser.add_argument("--depth-stream", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--depth-stream-fps", type=float, default=5.0)
     parser.add_argument("--depth-stream-quality", type=int, default=70)
     parser.add_argument("--depth-stream-encoding", choices=depth_stream.VARIANTS, default=depth_stream.DEFAULT_VARIANT)
     parser.add_argument("--depth-stream-debug", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--pose-attitude-source", choices=pose_stream.ATTITUDE_MODES, default=pose_stream.AUTOPILOT)
+    parser.add_argument("--depth-transport", choices=depth_points.TRANSPORTS, default=depth_points.DEFAULT_TRANSPORT)
+    parser.add_argument("--depth-points-rois", choices=depth_points.ROI_SOURCES,
+                        default=depth_points.DEFAULT_ROI_SOURCE)
+    parser.add_argument("--min-depth", type=float, default=0.2)
+    parser.add_argument("--max-depth", type=float, default=15.0)
     parser.add_argument("--camera-angle", type=float, default=0.0)
     parser.add_argument("--depth-scale", type=float, default=1.0)
     parser.add_argument("--refractive-index", type=float, default=1.333)
@@ -246,10 +262,170 @@ class MockLinkCounters:
 
     def __call__(self):
         elapsed = self.clock() - self.started
-        counted = sum(nbytes for _, nbytes in self.streams.totals().values())
+        totals = self.streams.totals()
+        down = sum(nbytes for name, (_, nbytes) in totals.items() if name not in link_stats.UP_STREAMS)
+        up = sum(nbytes for name, (_, nbytes) in totals.items() if name in link_stats.UP_STREAMS)
         return type("ProfilingData", (), {
-            "numBytesRead": int(counted * (1.0 + MOCK_LINK_OVERHEAD) + MOCK_LINK_BACKGROUND_DOWN * elapsed),
-            "numBytesWritten": int(MOCK_LINK_BACKGROUND_UP * elapsed)})()
+            "numBytesRead": int(down * (1.0 + MOCK_LINK_OVERHEAD) + MOCK_LINK_BACKGROUND_DOWN * elapsed),
+            "numBytesWritten": int(up * (1.0 + MOCK_LINK_OVERHEAD) + MOCK_LINK_BACKGROUND_UP * elapsed)})()
+
+
+def mock_jpeg(image, quality):
+    """What the camera's MJPEG encoder would send for image (bytes)."""
+    import cv2
+    ok, jpeg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, int(quality)])
+    if not ok:
+        raise RuntimeError("cv2.imencode returned no image")
+    return jpeg.tobytes()
+
+
+class MockQueue:
+    """The host side of an XLink output queue (what depth_points.PointsMatcher uses); never blocks."""
+
+    def __init__(self):
+        self.items = deque()
+
+    def tryGetAll(self):
+        items, self.items = list(self.items), deque()
+        return items
+
+    def get(self, timeout=None):
+        return self.items.popleft() if self.items else None
+
+
+def slc_rows(depth_at, windows, thresholds, center_thresholds=depth_points.CENTER_THRESHOLDS):
+    """
+    What the SpatialLocationCalculator returns for these windows (x, y, w, h in depth pixels): per window the
+    echoed rect, the MEDIAN of every MEDIAN_STEP-th pixel in each direction strictly inside the thresholds, the
+    average of those and their count. The last EXTRA_ROIS windows use center_thresholds (as make_config does).
+    depth_at(u, v): uint16 depth (0 invalid) at integer pixel arrays.
+    """
+    windows = np.asarray(windows, dtype=np.int64).reshape(-1, 4)
+    n = len(windows)
+    if not n:
+        return np.zeros((0, 7))
+    step = depth_points.MEDIAN_STEP
+    steps = np.arange(0, int(max(windows[:, 2].max(), windows[:, 3].max())), step)
+    x, y, w, h = (windows[:, k][:, None, None] for k in range(4))
+    dx, dy = steps[None, :, None], steps[None, None, :]
+    inside = (dx < w) & (dy < h)
+    depth = depth_at(np.broadcast_to(x + dx, inside.shape), np.broadcast_to(y + dy, inside.shape)).astype(np.float64)
+    lo = np.full(n, float(thresholds[0]))
+    hi = np.full(n, float(thresholds[1]))
+    extra = min(depth_points.EXTRA_ROIS, n)
+    lo[n - extra:], hi[n - extra:] = center_thresholds
+    valid = inside & (depth > lo[:, None, None]) & (depth < hi[:, None, None])
+    count = valid.sum(axis=(1, 2))
+    masked = np.where(valid, depth, np.nan).reshape(n, -1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        median = np.nan_to_num(np.round(np.nanmedian(masked, axis=1)))
+        average = np.nan_to_num(np.nanmean(masked, axis=1))
+    return np.column_stack([windows.astype(np.float64), median, average, count])
+
+
+class MockPointsCamera:
+    """
+    Points mode's camera side in mock mode (depth_points.device_script + the SpatialLocationCalculator): it holds
+    the latest depth frame (its time, pan offset and turbidity) and answers a request for that frame's
+    sequence number with what the SLC computes on it (slc_rows), re-tagged with the frame's sequence number and
+    timestamp, into `queue`. rois "host": requests are the Pi's ROI configs (config()); "camera": the features
+    themselves (frame()). Its status reports (size, stats) go to on_status.
+    """
+
+    def __init__(self, scene, roi_source, image_size, thresholds, on_status, rng, link_streams):
+        self.scene = scene
+        self.roi_source = roi_source
+        self.image_size = tuple(image_size)
+        self.depth_size = tuple(image_size)
+        self.thresholds = thresholds
+        self.on_status = on_status
+        self.rng = rng
+        self.link_streams = link_streams
+        self.queue = MockQueue()
+        self.held = None
+        self.sent = self.misses = 0
+        self.busy = []
+
+    def status(self, kind, text):
+        report = f"{kind}\t0\t{self.sent}\t{self.misses}\t{text}".encode()
+        self.link_streams.add("depth_points_status", link_stats.buffer_bytes(len(report)))
+        self.on_status(report)
+
+    def start(self):
+        self.status("size", f"{self.depth_size[0]} {self.depth_size[1]}")
+
+    def frame(self, sequence, t, offset, turbid, uv):
+        self.held = (int(sequence), t, tuple(offset), turbid)
+        if self.roi_source == depth_points.ROIS_CAMERA:
+            self.answer(depth_points.all_windows(uv, self.image_size, self.depth_size), self.thresholds, sequence)
+
+    def config(self, request):
+        windows, thresholds, sequence = request
+        self.answer(windows, thresholds, sequence)
+
+    def answer(self, windows, thresholds, sequence):
+        if self.held is None or self.held[0] != int(sequence):
+            self.misses += 1
+            self.status("miss", f"request {sequence}, depth frame {self.held[0] if self.held else None}")
+            return
+        _, t, offset, turbid = self.held
+        rng = np.random.default_rng(int(t * 1000)) if turbid else None
+        start = time.perf_counter()
+        rows = slc_rows(lambda u, v: self.scene.depth_mm(u, v, t, offset, turbid, rng), windows, thresholds)
+        took = time.perf_counter() - start
+        locations = [SimpleNamespace(config=SimpleNamespace(roi=SimpleNamespace(x=r[0], y=r[1], width=r[2], height=r[3])),
+                                     depthMedian=r[4], depthAverage=r[5], depthAveragePixelCount=int(r[6]))
+                     for r in rows]
+        self.queue.items.append(SimpleNamespace(getSequenceNum=lambda s=int(sequence): s,
+                                                getTimestamp=lambda t=t: timedelta(seconds=t),
+                                                getSpatialLocations=lambda loc=locations: loc))
+        self.sent += 1
+        self.busy.append(took)
+        if self.sent % depth_points.STATS_EVERY == 0:
+            busy, self.busy = np.array(self.busy) * 1000.0, []
+            self.status("stats", f"0.1 0.2 {busy.mean():.1f} {busy.max():.1f} {self.depth_size[0]} "
+                                 f"{self.depth_size[1]}")
+
+
+class MockCameraLoad:
+    """Stands in for the camera's load RPCs (vio_telemetry.read_camera_load); its Leon CPU follows the work."""
+
+    def __init__(self, vio):
+        self.vio = vio
+
+    @staticmethod
+    def _cpu(value):
+        return SimpleNamespace(average=min(max(value + random.gauss(0.0, 0.01), 0.0), 1.0))
+
+    @staticmethod
+    def _memory(used, total):
+        return SimpleNamespace(used=int(used), total=int(total))
+
+    def getLeonCssCpuUsage(self):
+        vio = self.vio
+        value = 0.18 + (0.06 if vio.points_mode else 0.0)
+        if vio.points_mode and vio.args.depth_points_rois == depth_points.ROIS_CAMERA:
+            # The report's estimate: ~84 ms of Leon time per frame of 300 features
+            value += min(0.084 / 300 * vio.args.num_features * vio.args.fps, 0.75)
+        if vio.stream is not None and vio.stream.enabled and not vio.stream.on_host:
+            value += 0.08
+        return self._cpu(value)
+
+    def getLeonMssCpuUsage(self):
+        return self._cpu(0.31 + (0.02 if self.vio.points_mode else 0.0))
+
+    def getDdrMemoryUsage(self):
+        return self._memory(180e6, 343e6)
+
+    def getCmxMemoryUsage(self):
+        return self._memory(1.9e6, 2.5e6)
+
+    def getLeonCssHeapUsage(self):
+        return self._memory(44e6, 78e6)
+
+    def getLeonMssHeapUsage(self):
+        return self._memory(12e6, 46e6)
 
 
 class Features:
@@ -311,6 +487,9 @@ class FakeVio:
         self.link_stats = link_stats
         self.link = link_stats.LinkMonitor(clock=clock, source=MOCK_LINK_SOURCE, mock=True)
         self.imu_due = 0.0
+        self.points_mode = args.depth_transport == depth_points.POINTS
+        self.points = self.points_camera = self.gate = None
+        self.full_frames = 0
 
     # --- per-frame model ---
 
@@ -409,14 +588,71 @@ class FakeVio:
     def count_link_frame(self, features):
         """What one VIO frame takes from the host queues (pnp_vio's counts), and the IMU messages since the last."""
         streams = self.link.streams
-        streams.add("depth", link_stats.frame_bytes(self.width * self.height * 2))
         streams.add("features", link_stats.features_bytes(features))
-        streams.add("sync_group", link_stats.MESSAGE_GROUP_OVERHEAD)
+        if not self.points_mode:
+            streams.add("depth", link_stats.frame_bytes(self.width * self.height * 2))
+            streams.add("sync_group", link_stats.MESSAGE_GROUP_OVERHEAD)
         self.imu_due += IMU_RATE_HZ / max(self.args.fps, 1)
         messages = int(self.imu_due)
         if messages:
             self.imu_due -= messages
             streams.add("imu", messages * link_stats.imu_bytes(1), messages)
+
+    # --- depth transport ---
+
+    def start_points(self):
+        """points: the real DepthPointsReceiver (pnp_vio.PointsSource's settings) and FullDepthGate, on MockPointsCamera."""
+        args, streams = self.args, self.link.streams
+        thresholds = depth_points.thresholds_mm(args.min_depth, args.max_depth)
+        host = args.depth_points_rois == depth_points.ROIS_HOST
+
+        def send_config(request):
+            self.points_camera.config(request)
+
+        def counted(rows):
+            streams.add("depth_points", link_stats.spatial_data_bytes(0 if rows is None else len(rows)))
+
+        def send_gate_control(every):
+            streams.add("control", link_stats.BUFFER_OVERHEAD)
+
+        self.points_camera = MockPointsCamera(self.scene, args.depth_points_rois, (self.width, self.height),
+                                              thresholds, lambda data: self.points.on_status(data), self.rng, streams)
+        self.points = depth_points.DepthPointsReceiver(
+            self.points_camera.queue, (self.width, self.height), args.depth_points_rois,
+            wait_s=max(0.25, 3.0 / max(float(args.fps), 1.0)), send_config=send_config if host else None,
+            build_config=lambda windows, limits, sequence: (windows, limits, sequence), thresholds=thresholds,
+            frame_period_s=1.0 / max(args.fps, 1), log=print, on_message=counted)
+        self.gate = depth_points.FullDepthGate(send_gate_control, clock=self.clock, log=print)
+        self.points_camera.start()
+
+    def points_frame(self, t, frame, sequence):
+        """points: this frame's depth at its features (DepthPoints or None) and its validity in frame["valid"]."""
+        uv = frame["uv"]
+        self.points_camera.frame(sequence, t, self.offset, self.turbidity(t), uv)
+        requested = self.points.request(sequence, uv)
+        if requested and self.args.depth_points_rois == depth_points.ROIS_HOST:
+            self.link.streams.add("depth_points_rois",
+                                  link_stats.spatial_config_bytes(len(uv) + depth_points.EXTRA_ROIS))
+        points, problem = self.points.take(sequence, uv, t, requested=requested)
+        frame["valid"] = points.depth_mm > 0 if points is not None else np.zeros(len(uv), bool)
+        frame["depth_problem"] = problem
+        return points
+
+    def full_depth(self, t, sequence, needs):
+        """points: a full depth frame if the gate forwards this one (counted as depth_on_demand), else None."""
+        every = self.gate.update(needs)
+        if not every or sequence % every:
+            return None
+        nbytes = link_stats.frame_bytes(self.width * self.height * 2)
+        self.link.streams.add("depth_on_demand", nbytes)
+        self.gate.on_frame(nbytes)
+        return self.scene.depth_image(t, self.offset, self.turbidity(t))
+
+    def depth_transport_status(self):
+        if self.points is not None:
+            return {**self.points.status(), "full_depth": self.gate.status(), "mock": True}
+        return {"transport": depth_points.FULL_FRAME, "frames": self.full_frames, "feature_gaps": 0,
+                "feature_gap_frames": 0, "full_depth": None, "mock": True}
 
     # --- services ---
 
@@ -455,7 +691,8 @@ class FakeVio:
                 "gray_invalid_below": depth_stream.GRAY_INVALID_BELOW, "requested_variant": requested,
                 "variant": variant or depth_stream.HOST_JPEG, "variant_reason": reason, "size_problem": problem,
                 "source": depth_stream.source_for(variant or depth_stream.HOST_JPEG), "disparity_format": fmt,
-                "disparity_problem": disparity_problem, "mock": True}
+                "disparity_problem": disparity_problem, "mock": True,
+                "depth_frames": "on_demand" if self.points_mode else "every_frame"}
         if variant == depth_stream.DISPARITY:
             info["disparity_max"] = int(fmt["max_disparity"])
             info["disparity"] = depth_stream.disparity_scale(self.scene.fx, BASELINE_M, min_mm, max_mm,
@@ -466,7 +703,9 @@ class FakeVio:
         info = self.depth_stream_info()
         host = device_log = debug = None
         if info["variant"] == depth_stream.HOST_JPEG or info["requested_variant"] == depth_stream.AUTO:
-            host = depth_stream.HostJpegEncoder(*self.depth_range, self.args.depth_stream_quality, info["every"])
+            # points: the gate forwards every n-th frame already
+            host = depth_stream.HostJpegEncoder(*self.depth_range, self.args.depth_stream_quality,
+                                                1 if self.points_mode else info["every"])
         if info["variant"] != depth_stream.HOST_JPEG:
             names = ("Script(4)", "VideoEncoder(5)")
             if info["variant"] == depth_stream.MANIP:
@@ -520,21 +759,31 @@ class FakeVio:
                             log_only=args.log_only)
         self.telemetry = vio_telemetry.Telemetry(self.telemetry_dir, fps=args.fps, min_inliers=args.min_inliers,
                                                  mode="log-only" if args.log_only else "sending",
-                                                 temperature=self.temperature, log=print, link=self.link)
+                                                 temperature=self.temperature, log=print, link=self.link,
+                                                 camera_load=lambda: vio_telemetry.read_camera_load(MockCameraLoad(self)),
+                                                 depth_points_status=self.depth_transport_status)
         writer = stream = None
         try:
             self.telemetry.set_phase("opening_device")
             self.telemetry.start()
             stop.wait(STARTUP_PHASE_S)
             self.start_link()
+            if self.points_mode:
+                self.start_points()
+            self.data_log.event("depth_transport", transport=args.depth_transport,
+                                rois=args.depth_points_rois if self.points_mode else None, mock=True)
             self.telemetry.set_phase("configuring")
             writer = snapshots.SnapshotWriter(args.snapshot_dir, self.depth_range, log=print)
             pending = []
+            camera_jpeg = args.snapshot_encoding == snapshots.CAMERA_JPEG
             snapshot_service = snapshots.SnapshotService(
-                ("rect_left", "rect_right", "depth") if args.snapshots else (), pending.append, writer,
+                ("rect_left", "rect_right", "depth") if args.snapshots else (),
+                lambda stream, raw: pending.append(raw), writer,
                 args.snapshot_dir, unavailable={"rgb": "mock mode: the synthetic camera has no CAM_A (RGB)"}
                 if args.snapshots else {s: "snapshots are disabled (--no-snapshots)" for s in snapshots.STREAMS},
-                log=print, overlay=lambda: self.snapshot_overlay)
+                log=print, overlay=lambda: self.snapshot_overlay,
+                encoded=("rect_left", "rect_right") if camera_jpeg else (),
+                not_encoded={} if camera_jpeg else {s: "Snapshot Encoding is raw" for s in ("rect_left", "rect_right")})
             probe = depth_probe.DepthProbeService(args.snapshot_dir / "depth_probe", self.depth_range,
                                                   args.depth_scale, (self.width, self.height), log=print,
                                                   refractive_index=args.refractive_index)
@@ -583,6 +832,8 @@ class FakeVio:
             self.sequence += 1
             frame = self.step(t, interval)
             sequence = self.sequence
+            points = self.points_frame(t, frame, sequence) if self.points_mode else None
+            self.full_frames += not self.points_mode
             built = (frame["ids"], frame["uv"], frame["matched_index"], frame["inlier_index"], *self.previous,
                      sequence, (self.width, self.height), frame["ok"], frame["reason"])
             self.frames.append((t, tuple(self.offset), lambda values=built: snapshots.build_overlay(*values), sequence))
@@ -593,22 +844,41 @@ class FakeVio:
             snapshot_service.tick()
             turbid = self.turbidity(t)
             while pending:  # the "device" answers each request with the frame of its request time
-                pending.pop(0)
-                depth_shot = snapshot_service.pending is not None and snapshot_service.pending[0] == "depth"
-                self.link.streams.add("snapshot", link_stats.frame_bytes(self.width * self.height
-                                                                         * (2 if depth_shot else 1)))
-                shot_t, offset, self.snapshot_overlay, shot_sequence = self.frame_at(snapshot_service.pending[1])
-                snapshot_service.on_frame(lambda s, t=shot_t, o=offset: self.scene.frame(s, t, o, self.turbidity(t)),
-                                          shot_t, shot_sequence)
+                raw = pending.pop(0)
+                self.link.streams.add("control", link_stats.BUFFER_OVERHEAD)
+                stream_name, requested_at = snapshot_service.pending[0], snapshot_service.pending[1]
+                shot_t, offset, self.snapshot_overlay, shot_sequence = self.frame_at(requested_at)
+                image = self.scene.frame(stream_name, shot_t, offset, self.turbidity(shot_t))
+                if raw:
+                    nbytes = link_stats.frame_bytes(image.nbytes)
+                else:  # the camera's MJPEG encoder
+                    image = mock_jpeg(image, snapshots.JPEG_QUALITY)
+                    nbytes = link_stats.encoded_bytes(len(image))
+                self.link.streams.add("snapshot", nbytes)
+                snapshot_service.on_frame(lambda s, image=image: image, shot_t, shot_sequence, encoded=not raw,
+                                          nbytes=nbytes)
             probe.tick()
-            if probe.active is not None:
-                probe.on_depth(self.scene.depth_image(t, self.offset, turbid), t, sequence)
-            if stream is not None and stream.on_host:
-                if stream.enabled:
-                    self.last_depth = self.scene.depth_image(t, self.offset, turbid)
-                stream.tick(self.last_depth, sequence)
-            elif stream is not None:
-                stream.tick(self.last_depth)
+            if self.points_mode:
+                # Full depth frames only through the gate (the probe: every frame; host_jpeg: every n-th)
+                watched_host_jpeg = stream is not None and stream.on_host and stream.enabled
+                full = self.full_depth(t, sequence, {"depth_probe": 1 if probe.active is not None else 0,
+                                                     "host_jpeg": every if watched_host_jpeg else 0})
+                if probe.active is not None and full is not None:
+                    probe.on_depth(full, t, sequence)
+                center, sample = (points.center, depth_points.depth_sample(points)) if points else (None, None)
+                if stream is not None:
+                    stream.tick(full if stream.on_host else None, sequence if full is not None else None,
+                                center=center, sample=sample)
+            else:
+                if probe.active is not None:
+                    probe.on_depth(self.scene.depth_image(t, self.offset, turbid), t, sequence)
+                if stream is not None and stream.on_host:
+                    if stream.enabled:
+                        self.last_depth = self.scene.depth_image(t, self.offset, turbid)
+                    stream.tick(self.last_depth, sequence)
+                elif stream is not None:
+                    stream.tick(self.last_depth)
+            if stream is not None and not stream.on_host:
                 if stream.enabled:
                     self.stream_count += 1
                     if self.stream_count >= every:
@@ -628,7 +898,8 @@ class FakeVio:
                                valid_depth=valid_depth, matches=frame["matches"], inliers=frame["inliers"],
                                proc_ms=proc_ms, status="ok" if frame["ok"] else "rejected", reason=frame["reason"],
                                sent=sent, gap_frames=frame["gap_frames"], reference_reset=frame["reference_reset"],
-                               mock=True)
+                               depth_source="points" if self.points_mode else "frame",
+                               depth_problem=frame.get("depth_problem"), mock=True)
             self.telemetry.record_frame(t, frame["ok"], frame["reason"], len(frame["ids"]), valid_depth,
                                         frame["matches"], frame["inliers"], proc_ms, frame["dt"],
                                         frame["position_delta"], frame["yaw_delta"], frame["gap_frames"],

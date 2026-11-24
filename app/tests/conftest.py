@@ -34,6 +34,8 @@ def _isolate_main(monkeypatch, main):
     monkeypatch.setattr(poller, "touch", lambda start_thread=True: dvl_source.DvlPoller.touch(poller, False))
     monkeypatch.setattr(main, "dvl_poller", poller)
     monkeypatch.setattr(main, "history_reader", vio_telemetry.HistoryReader())
+    # A fresh viewer count per test, renewed by the requests themselves (no thread outliving the test)
+    monkeypatch.setattr(main, "viewer_registry", main.make_viewer_registry(thread=False, log=lambda m: None))
     with main.vehicle_state_lock:
         monkeypatch.setitem(main.vehicle_state, "armed", None)
         monkeypatch.setitem(main.vehicle_state, "checked_at", None)
