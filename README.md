@@ -534,7 +534,7 @@ Then use the upload option in BlueOS's extension manager (BlueOS versions with K
 
 The image is built in two stages so that the slow part only runs once:
 
-1. **Builder image** ([`dockerfile.builder`](dockerfile.builder)): compiles depthai-core (the `depthai-core` submodule, pinned in `.gitmodules`) with its Python bindings. Built under QEMU for arm64 this takes hours, mostly compiling vcpkg dependencies. The prebuilt `williangalvani/blueos-oakd-basalt-builder:arm64-rtabmap` is what the runtime image uses; it was built with the Basalt, RTAB-Map and PCL options that the dockerfile no longer enables (the runtime copies none of their libraries).
+1. **Builder image** ([`dockerfile.builder`](dockerfile.builder)): compiles depthai-core (the `depthai-core` submodule, declared in `.gitmodules`) with its Python bindings. The gitlink pins `4d4a8c1`, four local commits (metrics, Python bindings, a fix for building with OpenCV off) on top of luxonis `fa1ae86`. That commit is not on luxonis upstream, so `git submodule update` only works once it has been pushed somewhere the submodule URL can reach. Built under QEMU for arm64 this takes hours, mostly compiling vcpkg dependencies. The prebuilt `williangalvani/blueos-oakd-basalt-builder:arm64-rtabmap` is what the runtime image uses; it was built with the Basalt, RTAB-Map and PCL options that the dockerfile no longer enables (the runtime copies none of their libraries).
 
    ```bash
    git submodule update --init depthai-core
