@@ -39,6 +39,7 @@ from pathlib import Path
 
 import numpy as np
 
+import leases
 import snapshots
 
 FEATURES_FILE = "features.json"
@@ -97,13 +98,6 @@ def features_payload(uv, states, image_size, frame_size, sequence=None, ok=None,
             "counts": dict(zip(STATES, counts)), "points": points, "synced": False, "image_sequence": None}
 
 
-def _lease_fresh(path, now, lease_s):
-    try:
-        return now - path.stat().st_mtime <= lease_s
-    except OSError:
-        return False
-
-
 class FeatureStreamService:
     """
     VIO process side. tick(...) once per frame with the frame's features, references only: nothing is
@@ -141,7 +135,7 @@ class FeatureStreamService:
         now = self.clock()
         if now - self._last_poll >= self.poll_interval:
             self._last_poll = now
-            wanted = _lease_fresh(self.directory / LEASE_FILE, now, self.lease_s)
+            wanted = leases.fresh(self.directory / LEASE_FILE, now, self.lease_s)
             if wanted != self.wanted:
                 self.log(f"Feature stream {'started: a client is watching' if wanted else 'stopped: no client'}")
                 self.wanted = wanted
@@ -210,12 +204,7 @@ class FeatureStreamService:
 
 def touch_lease(directory):
     """Ask the VIO process to publish the features for LEASE_S."""
-    directory = Path(directory)
-    try:
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / LEASE_FILE).touch()
-    except OSError:
-        pass
+    leases.touch(directory, LEASE_FILE)
 
 
 class LatestFile:

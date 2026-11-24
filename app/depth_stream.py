@@ -99,6 +99,7 @@ from pathlib import Path
 
 import numpy as np
 
+import leases
 import snapshots
 
 FRAME_FILE = "depth_stream.jpg"
@@ -391,13 +392,6 @@ def center_depth(depth, patch=CENTER_PATCH):
     return {"x": x, "y": y, "pixel_mm": int(depth[y, x]), "patch": patch,
             "median_mm": float(np.median(valid)) if valid.size else None,
             "valid": int(valid.size), "pixels": int(window.size)}
-
-
-def _lease_fresh(path, now, lease_s):
-    try:
-        return now - path.stat().st_mtime <= lease_s
-    except OSError:
-        return False
 
 
 def status_report(kind, errors, sent, text=""):
@@ -742,7 +736,7 @@ class DepthStreamService:
         now = self.clock()
         if now - self._last_poll >= self.poll_interval:
             self._last_poll = now
-            wanted = _lease_fresh(self.directory / LEASE_FILE, now, self.lease_s)
+            wanted = leases.fresh(self.directory / LEASE_FILE, now, self.lease_s)
             if wanted != self.enabled or now - self._last_send >= self.resend_interval:
                 changed = wanted != self.enabled
                 if changed:
@@ -1003,12 +997,7 @@ class DepthStreamService:
 
 def touch_lease(directory):
     """Ask the VIO process to stream for LEASE_S."""
-    directory = Path(directory)
-    try:
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / LEASE_FILE).touch()
-    except OSError:
-        pass
+    leases.touch(directory, LEASE_FILE)
 
 
 def read_meta(directory):

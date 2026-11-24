@@ -154,8 +154,8 @@ def test_service_idle_cost_is_one_comparison_per_frame(tmp_path, monkeypatch):
     clock = Clock(time.time())
     svc = service(tmp_path, clock)
     stats = []
-    real_fresh = feature_stream._lease_fresh
-    monkeypatch.setattr(feature_stream, "_lease_fresh", lambda *a: stats.append(1) or real_fresh(*a))
+    real_fresh = feature_stream.leases.fresh
+    monkeypatch.setattr(feature_stream.leases, "fresh", lambda *a: stats.append(1) or real_fresh(*a))
     uv = np.zeros((300, 2))
     for _ in range(150):  # 10 s at 15 fps
         clock.t += 1 / 15

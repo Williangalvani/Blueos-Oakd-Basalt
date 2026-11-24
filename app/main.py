@@ -178,11 +178,6 @@ def saved_choice(config: dict, key: str) -> str:
     return value if value in field.choices else field.default
 
 
-def saved_depth_stream_encoding(config: dict) -> str:
-    value = config.get("depth_stream_encoding")
-    return value if value in depth_stream.VARIANTS else DEFAULT_CONFIG["depth_stream_encoding"]
-
-
 def build_vio_command(config: dict) -> list:
     """PnP VIO command line for a configuration"""
     cmd = [
@@ -202,7 +197,7 @@ def build_vio_command(config: dict) -> list:
         "--depth-stream" if config.get("depth_stream", True) else "--no-depth-stream",
         "--depth-stream-fps", str(saved_number(config, "depth_stream_fps")),
         "--depth-stream-quality", str(saved_number(config, "depth_stream_quality")),
-        "--depth-stream-encoding", saved_depth_stream_encoding(config),
+        "--depth-stream-encoding", saved_choice(config, "depth_stream_encoding"),
         "--depth-stream-debug" if config.get("depth_stream_debug") else "--no-depth-stream-debug",
         "--depth-transport", saved_choice(config, "depth_transport"),
         "--telemetry-dir", str(telemetry_dir()),
@@ -449,7 +444,7 @@ def depth_stream_status(config: dict, process_status: dict, now: float) -> dict:
                  or (process_status.get("pid") is not None and meta.get("pid") != process_status.get("pid")))
     return {"errors": 0, "last_error": None, "encoder_stalled": False, "variant": None, "encoded_on": None,
             "fallback": None, "device_log": None, **meta,
-            "configured_encoding": saved_depth_stream_encoding(config),
+            "configured_encoding": saved_choice(config, "depth_stream_encoding"),
             "debug_configured": bool(config.get("depth_stream_debug")),
             "enabled": bool(config.get("depth_stream", True)),
             "streaming": bool(meta.get("streaming")) and not stale, "stale": stale,

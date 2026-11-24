@@ -35,6 +35,7 @@ from pathlib import Path
 
 import numpy as np
 
+import leases
 import snapshots
 
 # RAM-backed and shared by the processes of the container; main.py passes it to pnp_vio.py
@@ -202,13 +203,6 @@ def _finite(value):
     return value if math.isfinite(value) else None
 
 
-def _lease_fresh(path, now, lease_s=LEASE_S):
-    try:
-        return now - path.stat().st_mtime <= lease_s
-    except OSError:
-        return False
-
-
 class Telemetry:
     """
     VIO process side. record_frame() per frame; start() runs the publisher thread, close() stops it.
@@ -335,10 +329,10 @@ class Telemetry:
         if self.camera_load is not None and now - self._last_camera_load >= CAMERA_LOAD_INTERVAL_S:
             self._last_camera_load = now
             self.sample_camera_load(now)
-        if now - self._last_status >= STATUS_INTERVAL_S and _lease_fresh(self.directory / STATUS_LEASE, now):
+        if now - self._last_status >= STATUS_INTERVAL_S and leases.fresh(self.directory / STATUS_LEASE, now, LEASE_S):
             self._last_status = now
             self.write_status(now)
-        if now - self._last_history >= HISTORY_INTERVAL_S and _lease_fresh(self.directory / HISTORY_LEASE, now):
+        if now - self._last_history >= HISTORY_INTERVAL_S and leases.fresh(self.directory / HISTORY_LEASE, now, LEASE_S):
             self._last_history = now
             self.write_history()
 
@@ -473,12 +467,7 @@ def recent_summary(rows, now, window_s=RECENT_WINDOW_S, fps_window_s=FPS_WINDOW_
 
 def touch_lease(name, directory=DEFAULT_DIR):
     """Ask the VIO process to keep publishing `name` (STATUS_LEASE or HISTORY_LEASE) for LEASE_S."""
-    directory = Path(directory)
-    try:
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / name).touch()
-    except OSError:
-        pass
+    leases.touch(directory, name)
 
 
 def read_status(directory=DEFAULT_DIR):

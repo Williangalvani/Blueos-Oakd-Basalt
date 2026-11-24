@@ -53,6 +53,7 @@ from pathlib import Path
 
 import numpy as np
 
+import leases
 import snapshots
 
 POSE_FILE = "pose.json"
@@ -201,13 +202,6 @@ class PoseIntegrator:
                 "q": quaternion(self.rotation)}
 
 
-def _lease_fresh(path, now, lease_s):
-    try:
-        return now - path.stat().st_mtime <= lease_s
-    except OSError:
-        return False
-
-
 def _rounded(pose):
     return {key: ([round(c, 6) for c in value] if key == "q" else round(value, 4)) for key, value in pose.items()}
 
@@ -349,7 +343,7 @@ class PoseStreamService:
         now = self.clock() if now is None else now
         if now - self._last_poll >= self.poll_interval:
             self._last_poll = now
-            wanted = _lease_fresh(self.directory / LEASE_FILE, now, self.lease_s)
+            wanted = leases.fresh(self.directory / LEASE_FILE, now, self.lease_s)
             if wanted != self.wanted:
                 self.log(f"Pose stream {'started: a viewer is open' if wanted else 'stopped: no viewer'}")
                 self.wanted = wanted
@@ -383,9 +377,4 @@ class PoseStreamService:
 
 def touch_lease(directory):
     """Ask the VIO process to publish the pose for LEASE_S."""
-    directory = Path(directory)
-    try:
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / LEASE_FILE).touch()
-    except OSError:
-        pass
+    leases.touch(directory, LEASE_FILE)
