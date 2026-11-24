@@ -26,6 +26,7 @@ import depth_probe
 import depth_stream
 import dvl_source
 import feature_stream
+import pose_stream
 import mock_mode
 import snapshots
 import system_stats
@@ -133,6 +134,11 @@ def telemetry_dir() -> Path:
     return Path(TELEMETRY_DIR) if TELEMETRY_DIR is not None else vio_telemetry.DEFAULT_DIR
 
 
+def saved_depth_stream_encoding(config: dict) -> str:
+    value = config.get("depth_stream_encoding")
+    return value if value in depth_stream.VARIANTS else DEFAULT_CONFIG["depth_stream_encoding"]
+
+
 def build_vio_command(config: dict) -> list:
     """VIO command line for a configuration"""
     common_args = [
@@ -155,6 +161,8 @@ def build_vio_command(config: dict) -> list:
             "--depth-stream" if config.get("depth_stream", True) else "--no-depth-stream",
             "--depth-stream-fps", str(saved_number(config, "depth_stream_fps")),
             "--depth-stream-quality", str(saved_number(config, "depth_stream_quality")),
+            "--depth-stream-encoding", saved_depth_stream_encoding(config),
+            "--depth-stream-debug" if config.get("depth_stream_debug") else "--no-depth-stream-debug",
             "--telemetry-dir", str(telemetry_dir()),
             "--intrinsics-from", config.get("intrinsics_from") or "rectified",
             "--depth-scale", str(float(config.get("depth_scale", 1.0))),
@@ -324,6 +332,12 @@ def widget_depth():
     return HTMLResponse(content=render_widget(), headers={"Cache-Control": "no-cache"})
 
 
+@app.get(cockpit_widget.POSE_WIDGET_PATH, response_class=HTMLResponse)
+def widget_pose():
+    """The 3D pose Cockpit widget page (static/pose3d.js on the vendored three.js). Always 200, like /widget/depth."""
+    return HTMLResponse(content=(STATIC_DIR / "pose_widget.html").read_text(), headers={"Cache-Control": "no-cache"})
+
+
 @app.get("/register_service")
 def register_service():
     """BlueOS service metadata: name, relative-path support and the Cockpit extras (cockpit_widget.py)"""
@@ -399,12 +413,17 @@ def depth_stream_status(config: dict, process_status: dict, now: float) -> dict:
     """
     The depth stream setting and what the VIO process last published about it (stale if from another run).
     errors counts the camera Script's failed frames; last_error is the latest one (text, unix_time, fatal).
-    encoder_stalled: the Script sends frames but the camera's encoder returns no JPEG (also in last_error).
+    encoder_stalled: frames go to the encoder but no JPEG comes back (also in last_error). variant is the
+    encoding running (encoded_on "camera" or "pi"; fallback says why auto moved to the Pi); device_log the
+    camera's recent log lines (depth_stream_debug raises its level while streaming).
     """
     meta = depth_stream.read_meta(telemetry_dir()) or {}
     stale = bool(not meta or not process_status.get("running")
                  or (process_status.get("pid") is not None and meta.get("pid") != process_status.get("pid")))
-    return {"errors": 0, "last_error": None, "encoder_stalled": False, **meta,
+    return {"errors": 0, "last_error": None, "encoder_stalled": False, "variant": None, "encoded_on": None,
+            "fallback": None, "device_log": None, **meta,
+            "configured_encoding": saved_depth_stream_encoding(config),
+            "debug_configured": bool(config.get("depth_stream_debug")),
             "enabled": bool(config.get("depth_stream", True)) and config.get("algorithm") == "pnp",
             "streaming": bool(meta.get("streaming")) and not stale, "stale": stale,
             "age_s": now - float(meta["unix_time"]) if meta.get("unix_time") else None}
@@ -673,6 +692,73 @@ async def stream_features(events: int = Query(0, ge=0, le=100000)):
     feature_stream.touch_lease(directory)
     return StreamingResponse(feature_events(directory, events), media_type="text/event-stream",
                              headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+
+async def pose_events(directory: Path, limit: int):
+    """
+    Server-sent events: "trail" when the VIO's trail file is new for this connection (once, and again after a
+    VIO restart), each new pose.json as "pose", and the widget status once a second.
+    """
+    poses = feature_stream.LatestFile(directory / pose_stream.POSE_FILE)
+    trails = feature_stream.LatestFile(directory / pose_stream.TRAIL_FILE)
+    sent, leased, status_at, trail_epoch = 0, float("-inf"), float("-inf"), None
+    yield b"retry: 3000\n\n"
+    while True:
+        now = time.monotonic()
+        if now - leased >= DEPTH_STREAM_LEASE_REFRESH_S:
+            pose_stream.touch_lease(directory)
+            vio_telemetry.touch_lease(vio_telemetry.STATUS_LEASE, directory)
+            leased = now
+        events = []
+        if now - status_at >= WIDGET_STATUS_INTERVAL_S:
+            status_at = now
+            events.append(feature_stream.sse_event("status", json.dumps(widget_status_now())))
+        trail = trails.read_new()
+        if trail is not None:
+            try:
+                epoch = json.loads(trail).get("epoch")
+            except ValueError:
+                epoch = None
+            if epoch is not None and epoch != trail_epoch:
+                trail_epoch = epoch
+                events.append(feature_stream.sse_event("trail", trail))
+        pose = poses.read_new()
+        if pose is not None:
+            events.append(feature_stream.sse_event("pose", pose))
+        for event in events:
+            yield event
+            sent += 1
+            if limit and sent >= limit:
+                return
+        await asyncio.sleep(DEPTH_STREAM_POLL_S)
+
+
+@app.get("/api/stream/pose", include_in_schema=False)
+async def stream_pose(events: int = Query(0, ge=0, le=100000)):
+    """
+    text/event-stream for the 3D pose viewer (main page panel and /widget/pose). "pose": the VIO's integrated
+    pose, at most pose_stream.RATE_HZ (10) per second: x, y, z (m) and roll, pitch, yaw (rad, ZYX) plus q
+    [w, x, y, z] in the "start-FRD" frame (the body frame at VIO start: x forward, y right, z down).
+    "trail": the recent path, [t, x, y, z] points. "status": the widget status line once a second. Always
+    200; the VIO process only publishes while a client is connected. events > 0 stops after that many.
+    """
+    directory = telemetry_dir()
+    pose_stream.touch_lease(directory)
+    return StreamingResponse(pose_events(directory, events), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+
+@app.get("/api/pose", include_in_schema=False)
+def get_pose():
+    """The latest pose (as in /api/stream/pose); 404 until the VIO process has published it."""
+    require_pnp_running("the pose")
+    directory = telemetry_dir()
+    pose_stream.touch_lease(directory)
+    data = feature_stream.LatestFile(directory / pose_stream.POSE_FILE).read_new()
+    if data is None:
+        raise HTTPException(status_code=404, detail="no pose published yet: the VIO process publishes it while "
+                                                    "asked, from its next frame on; retry")
+    return Response(content=data, media_type="application/json", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/features", include_in_schema=False)

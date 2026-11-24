@@ -15,11 +15,18 @@ the next reference), matched, rejected (most features on a moving blob) or inlie
 every FAILURE_PERIOD_S after the start the water turns turbid: depth drops out and the frames fail, which
 also exercises the tracking recovery count.
 
+Motion: mock_mode.motion, a closed lawnmower survey with depth steps and 90-degree yaw turns, plus a small
+roll and pitch oscillation (mock_mode.attitude). The texture pans with the x-y trajectory, folded back
+at its edges.
+
 Published through the real services, at the configured fps:
 - vio_telemetry.Telemetry: status.json, history.npy (lease-gated), the chip temperature;
 - depth_stream.DepthStreamService: depth_stream.jpg (8-bit depth as the camera's Script encodes it, JPEG at
-  --depth-stream-quality) every round(fps / depth-stream-fps)-th frame, only while the lease is held;
+  --depth-stream-quality) every round(fps / depth-stream-fps)-th frame, only while the lease is held. The
+  camera variants are emulated here; host_jpeg runs the real depth_stream.HostJpegEncoder. With
+  --depth-stream-debug a stand-in device takes the log level and logs mock encoder lines;
 - feature_stream.FeatureStreamService: features.json while its lease is held;
+- pose_stream.PoseStreamService: pose.json and pose_trail.json while its lease is held;
 - snapshots.SnapshotService and depth_probe.DepthProbeService; camera.json;
 - a JSONL data log under --log-dir.
 Nothing is sent anywhere. --algorithm basalt only idles, as Basalt publishes none of this.
@@ -41,6 +48,7 @@ import depth_probe
 import depth_stream
 import feature_stream
 import mock_mode
+import pose_stream
 import snapshots
 import vio_log
 import vio_telemetry
@@ -70,6 +78,9 @@ def parse_args(argv=None):
     parser.add_argument("--depth-stream", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--depth-stream-fps", type=float, default=5.0)
     parser.add_argument("--depth-stream-quality", type=int, default=70)
+    parser.add_argument("--depth-stream-encoding", choices=depth_stream.VARIANTS, default=depth_stream.DEFAULT_VARIANT)
+    parser.add_argument("--depth-stream-debug", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--camera-angle", type=float, default=0.0)
     parser.add_argument("--depth-scale", type=float, default=1.0)
     parser.add_argument("--refractive-index", type=float, default=1.333)
     parser.add_argument("--log-only", action="store_true")
@@ -172,6 +183,46 @@ class Scene:
         return cv2.remap(self.texture, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
 
 
+def body_rotation_delta(t0, t1, yaw_delta):
+    """
+    Body FRD rotation vector from t0 to t1 of the mock attitude Rz(yaw) Ry(pitch) Rx(roll): the survey's yaw
+    turn (yaw_delta) with mock_mode.attitude's roll and pitch at both ends. t0, t1 in s since the VIO start,
+    so the vehicle starts level and the start-FRD frame is too.
+    """
+    from pnp_odometry import matrix_to_rotvec
+
+    def world(roll, pitch, yaw):
+        return (pose_stream.rotvec_to_matrix([0.0, 0.0, yaw]) @ pose_stream.rotvec_to_matrix([0.0, pitch, 0.0])
+                @ pose_stream.rotvec_to_matrix([roll, 0.0, 0.0]))
+
+    (roll0, pitch0), (roll1, pitch1) = mock_mode.attitude(t0), mock_mode.attitude(t1)
+    return [float(v) for v in matrix_to_rotvec(world(roll0, pitch0, 0.0).T @ world(roll1, pitch1, yaw_delta))]
+
+
+def fold(value, half):
+    """value folded into [-half, half] like a triangle wave: continuous, so the view never jumps."""
+    phase = (value + half) % (4.0 * half)
+    return (phase if phase <= 2.0 * half else 4.0 * half - phase) - half
+
+
+class MockLogDevice:
+    """Stands in for the camera's log level in mock mode (DeviceLogDebug talks to it)."""
+
+    def __init__(self, device_log):
+        self.device_log = device_log
+        self.level = "WARN"
+
+    def getLogLevel(self):
+        return self.level
+
+    def setLogLevel(self, level):
+        self.level = level
+        self.say(f"log level {level} (mock: no camera)")
+
+    def say(self, text, node="VideoEncoder(5)", level="DEBUG"):
+        self.device_log.on_message(type("LogMessage", (), {"nodeIdName": node, "level": level, "payload": text}))
+
+
 class Features:
     """Tracked features on the view: ids kept while visible, replaced when lost (like the LK tracker)."""
 
@@ -221,6 +272,7 @@ class FakeVio:
         self.sequence = 0
         self.last_depth = None
         self.stream = None
+        self.log_device = None
         self.stream_count = 0
         self.stream_busy = []
         self.stream_sent = 0
@@ -275,9 +327,10 @@ class FakeVio:
         return valid, matched_index, inlier_index, ok, reason, matches, inliers
 
     def step(self, t, dt):
-        vx, vy, vz, yaw_rate = mock_mode.motion(t)
+        vx, vy, vz, _ = mock_mode.motion(t)
         x, y = self.telemetry.trajectory.x, self.telemetry.trajectory.y
-        target = self.scene.clamp_offset(self.home[0] + y * self.ppm, self.home[1] - x * self.ppm)
+        target = self.scene.clamp_offset(self.home[0] + fold(y * self.ppm, self.width - 1),
+                                         self.home[1] - fold(x * self.ppm, self.height - 1))
         shift = np.array(target) - self.offset
         self.offset = np.array(target)
         self.previous = (self.features.ids, self.features.uv)
@@ -286,11 +339,15 @@ class FakeVio:
         ids, uv = self.features.ids, self.features.uv
 
         gap_frames, position_delta, yaw_delta, delta_t, reference_reset = 0, None, None, None, False
+        rotation_delta = None
         if ok:
             delta_t = t - self.last_ok_t if self.last_ok_t is not None else dt
             gap_frames = self.failed_run
             position_delta = [v * delta_t + self.rng.normal(0, 0.002) for v in (vx, vy, vz)]
-            yaw_delta = yaw_rate * delta_t
+            # The true turn since the reference, as the PnP measures it across a bridged gap too
+            yaw_delta = mock_mode.heading(t) - mock_mode.heading(t - delta_t)
+            yaw_delta = (yaw_delta + math.pi) % (2.0 * math.pi) - math.pi
+            rotation_delta = body_rotation_delta(t - delta_t - self.started, t - self.started, yaw_delta)
             self.failed_run = 0
             self.last_ok_t = t
         elif reason != "no_reference":
@@ -307,8 +364,8 @@ class FakeVio:
             self.reference_t = self.last_ok_t = t
         return {"ids": ids, "uv": uv, "valid": valid, "matched_index": matched_index, "inlier_index": inlier_index,
                 "ok": ok, "reason": reason, "matches": matches, "inliers": inliers, "gap_frames": gap_frames,
-                "position_delta": position_delta, "yaw_delta": yaw_delta, "dt": delta_t,
-                "reference_reset": reference_reset}
+                "position_delta": position_delta, "yaw_delta": yaw_delta, "rotation_delta": rotation_delta,
+                "dt": delta_t, "reference_reset": reference_reset}
 
     # --- services ---
 
@@ -334,12 +391,28 @@ class FakeVio:
     def depth_stream_info(self):
         every = depth_stream.stream_divisor(self.args.fps, self.args.depth_stream_fps)
         min_mm, max_mm = self.depth_range
+        requested = self.args.depth_stream_encoding
         return {"encoding": "gray8-depth-linear", "codec": "mjpeg", "fps_target": self.args.fps / every,
                 "every": every, "camera_fps": self.args.fps, "quality": self.args.depth_stream_quality,
                 "image_size": [self.width, self.height], "depth_range_mm": [min_mm, max_mm],
                 "quantization_mm": 1 << depth_stream.depth_shift(max_mm), "gray_far": depth_stream.GRAY_FAR,
                 "gray_near": depth_stream.GRAY_NEAR, "gray_invalid_below": depth_stream.GRAY_INVALID_BELOW,
-                "mock": True}
+                "requested_variant": requested,
+                "variant": depth_stream.device_variant(requested) or depth_stream.HOST_JPEG,
+                "size_problem": depth_stream.size_problem(self.width, self.height), "mock": True}
+
+    def make_depth_stream(self):
+        info = self.depth_stream_info()
+        host = device_log = debug = None
+        if info["variant"] == depth_stream.HOST_JPEG:
+            host = depth_stream.HostJpegEncoder(*self.depth_range, self.args.depth_stream_quality, info["every"])
+        else:
+            device_log = depth_stream.DeviceLog(("Script(4)", "VideoEncoder(5)", "ImageManip(6)"))
+            if self.args.depth_stream_debug:
+                self.log_device = MockLogDevice(device_log)
+                debug = depth_stream.DeviceLogDebug(self.log_device, "DEBUG", log=print)
+        return depth_stream.DepthStreamService(self.telemetry_dir, lambda on: None, info, log=print,
+                                               host_encoder=host, device_log=device_log, debug=debug)
 
     def encode_depth(self, t):
         """What the camera's Script + VideoEncoder produce, then the device's timing report every STATS_EVERY."""
@@ -351,8 +424,11 @@ class FakeVio:
         self.last_depth = depth
         if not ok:
             return None
-        self.stream_busy.append(time.perf_counter() - start)
+        took = time.perf_counter() - start
+        self.stream_busy.append(took)
         self.stream_sent += 1
+        if self.log_device is not None and self.log_device.level == "DEBUG":
+            self.log_device.say(f"VideoEncoder took '{1000 * took:.1f}' ms. (mock)")
         if self.stream_sent % STATS_EVERY == 0:
             busy, self.stream_busy = self.stream_busy, []
             self.stream.on_device_status(
@@ -387,10 +463,10 @@ class FakeVio:
             from pnp_odometry import Intrinsics
             probe.set_intrinsics(Intrinsics(*self.scene.intrinsics), "rectified")
             if args.depth_stream:
-                self.stream = stream = depth_stream.DepthStreamService(self.telemetry_dir, lambda on: None,
-                                                                       self.depth_stream_info(), log=print)
+                self.stream = stream = self.make_depth_stream()
             features_out = feature_stream.FeatureStreamService(self.telemetry_dir, (self.width, self.height),
                                                                log=print)
+            self.pose_out = pose_stream.PoseStreamService(self.telemetry_dir, args.camera_angle, log=print)
             snapshots.write_camera_status(self.camera_status(), args.snapshot_dir)
             stop.wait(STARTUP_PHASE_S)
             self.telemetry.set_phase("running")
@@ -436,7 +512,11 @@ class FakeVio:
             probe.tick()
             if probe.active is not None:
                 probe.on_depth(self.scene.depth_image(t, self.offset, turbid), t, sequence)
-            if stream is not None:
+            if stream is not None and stream.on_host:
+                if stream.enabled:
+                    self.last_depth = self.scene.depth_image(t, self.offset, turbid)
+                stream.tick(self.last_depth, sequence)
+            elif stream is not None:
                 stream.tick(self.last_depth)
                 if stream.enabled:
                     self.stream_count += 1
@@ -461,6 +541,7 @@ class FakeVio:
                                         frame["matches"], frame["inliers"], proc_ms, frame["dt"],
                                         frame["position_delta"], frame["yaw_delta"], frame["gap_frames"],
                                         frame["reference_reset"], sent)
+            self.pose_out.record(t, frame["ok"], frame["position_delta"], frame["rotation_delta"])
             next_time += interval
             now = self.clock()
             if next_time < now - 1.0:

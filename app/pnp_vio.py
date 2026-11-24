@@ -26,13 +26,15 @@ from loguru import logger
 import depth_probe
 import depth_stream
 import feature_stream
+import pose_stream
 import snapshots
 import vio_telemetry
 from autopilot_params import AutopilotParams
-from device_open import DEFAULT_TIMEOUT, DeviceOpenTimeout, open_oak_device
+from device_open import DEFAULT_TIMEOUT, DeviceOpenTimeout, DeviceRestartWatch, open_oak_device
 from mavlink_sender import MavlinkSender
 from pnp_odometry import (Intrinsics, PnPOdometry, PnPParams, camera_to_body_frd, camera_to_body_rotation,
-                          integrate_gyro, intrinsics_from_frame, lever_arm_correction, refracted_intrinsics)
+                          integrate_gyro, intrinsics_from_frame, lever_arm_correction, matrix_to_rotvec,
+                          refracted_intrinsics)
 from rectified_intrinsics import StereoCalibration, as_list, choose_intrinsics, rectified_for_settings
 from stereo_config import (DEFAULT_LEVER_ARM_M, DEFAULT_REFRACTIVE_INDEX, INTRINSICS_SOURCES, add_stereo_arguments,
                            apply_stereo_config, effective_stereo_config, parse_depth_scale, parse_intrinsics_override,
@@ -143,6 +145,14 @@ def parse_args(argv=None):
                         help='Depth stream rate; the camera sends every round(fps / this)-th depth frame')
     parser.add_argument('--depth-stream-quality', type=_argument_type(parse_stream_quality), default=70,
                         help='Depth stream JPEG quality, 1-100')
+    parser.add_argument('--depth-stream-encoding', choices=depth_stream.VARIANTS, default=depth_stream.DEFAULT_VARIANT,
+                        help='Where and how the depth stream is encoded (see depth_stream.py): manip (ImageManip '
+                             'converts to NV12 for the camera encoder), nv12 or yuv400p (the Script builds the '
+                             'encoder frame), host_jpeg (the Pi encodes), auto (manip, then host_jpeg if the '
+                             'camera encoder outputs nothing)')
+    parser.add_argument('--depth-stream-debug', action=argparse.BooleanOptionalAction, default=False,
+                        help='While the depth stream runs, raise the camera log level to DEBUG; the stream nodes\' '
+                             'log lines appear in /api/status depth_stream.device_log')
 
     parser.add_argument('--vehicle-ip', default='127.0.0.1')
     parser.add_argument('--quality-rate', type=float, default=1.0)
@@ -398,7 +408,10 @@ class PipelineHandles:
     depth_stream_control_queue: Optional[object] = None
     depth_stream_queue: Optional[object] = None
     depth_stream_status_queue: Optional[object] = None
+    # Empty: no depth stream. info["variant"] says where it is encoded (host_jpeg: no camera nodes)
     depth_stream_info: dict = field(default_factory=dict)
+    # "Type(id)" names of the stream's camera nodes, as the device log names them
+    depth_stream_nodes: tuple = ()
 
 
 def build_snapshot_gate(p, device, stereo):
@@ -428,41 +441,76 @@ def build_snapshot_gate(p, device, stereo):
     return request_queue, snapshot_queue, tuple(sources), unavailable
 
 
+def node_log_name(node):
+    """How the device log names a node (LogMessage.nodeIdName): "Type(id)"."""
+    try:
+        return f"{node.getName()}({node.id})"
+    except Exception:
+        return None
+
+
 def build_depth_stream(p, stereo, args, stereo_settings):
     """
     Script node gate + 8-bit conversion of stereo.depth (depth_stream.device_script) feeding an MJPEG
-    VideoEncoder. The Script waits on its control input until the host enables it, then forwards every
-    n-th frame; the encoder and host queues are non-blocking, so a slow consumer only drops stream frames.
-    The Script's 'status' output carries its errors and timing (depth_stream.parse_device_status).
+    VideoEncoder, directly (nv12, yuv400p) or through an ImageManip that converts the Script's GRAY8 frame
+    to NV12 (manip, and auto at the start). The Script waits on its control input until the host enables
+    it, then forwards every n-th frame; the encoder and host queues are non-blocking, so a slow consumer
+    only drops stream frames. The Script's 'status' output carries its errors and timing
+    (depth_stream.parse_device_status). host_jpeg adds nothing on the camera (the queues are None).
+
+    Returns (control queue, JPEG queue, status queue, info, node log names).
     """
     every = depth_stream.stream_divisor(args.fps, args.depth_stream_fps)
     fps = args.fps / every
     min_mm, max_mm = stereo_settings["stereo_depth_min_mm"], stereo_settings["stereo_depth_max_mm"]
+    requested = args.depth_stream_encoding
+    variant = depth_stream.device_variant(requested)
+    problem = depth_stream.size_problem(args.width, args.height)
+    if problem and requested == depth_stream.AUTO:
+        variant = None
+    shift = depth_stream.depth_shift(max_mm)
+    info = {"encoding": "gray8-depth-linear", "codec": "mjpeg", "fps_target": fps, "every": every,
+            "camera_fps": args.fps, "quality": args.depth_stream_quality, "image_size": [args.width, args.height],
+            "depth_range_mm": [min_mm, max_mm], "quantization_mm": 1 << shift,
+            "gray_far": depth_stream.GRAY_FAR, "gray_near": depth_stream.GRAY_NEAR,
+            "gray_invalid_below": depth_stream.GRAY_INVALID_BELOW, "requested_variant": requested,
+            "variant": variant or depth_stream.HOST_JPEG, "size_problem": problem}
+    if variant is None:
+        return None, None, None, info, ()
+
     script = p.create(dai.node.Script)
     stereo.depth.link(script.inputs["depth"])
     script.inputs["depth"].setBlocking(False)
     script.inputs["depth"].setMaxSize(1)
     script.inputs["control"].setBlocking(False)
     script.inputs["control"].setMaxSize(4)
-    script.setScript(depth_stream.device_script(every, min_mm, max_mm))
+    script.setScript(depth_stream.device_script(every, min_mm, max_mm,
+                                                frame_type=depth_stream.SCRIPT_FRAME_TYPES[variant]))
 
     encoder = p.create(dai.node.VideoEncoder)
     encoder.setDefaultProfilePreset(fps, dai.VideoEncoderProperties.Profile.MJPEG)
     encoder.setQuality(args.depth_stream_quality)
     encoder.input.setBlocking(False)
     encoder.input.setMaxSize(1)
-    script.outputs["gray"].link(encoder.input)
+    nodes = [script, encoder]
+    if variant == depth_stream.MANIP:
+        manip = p.create(dai.node.ImageManip)
+        manip.initialConfig.setFrameType(dai.ImgFrame.Type.NV12)
+        manip.setMaxOutputFrameSize(depth_stream.manip_output_size(args.width, args.height))
+        manip.setNumFramesPool(depth_stream.MANIP_FRAMES_POOL)
+        manip.inputImage.setBlocking(False)
+        manip.inputImage.setMaxSize(1)
+        script.outputs["gray"].link(manip.inputImage)
+        manip.out.link(encoder.input)
+        nodes.append(manip)
+    else:
+        script.outputs["gray"].link(encoder.input)
 
     control_queue = script.inputs["control"].createInputQueue(maxSize=4, blocking=False)
     frame_queue = encoder.out.createOutputQueue(maxSize=2, blocking=False)
     status_queue = script.outputs["status"].createOutputQueue(maxSize=8, blocking=False)
-    shift = depth_stream.depth_shift(max_mm)
-    info = {"encoding": "gray8-depth-linear", "codec": "mjpeg", "fps_target": fps, "every": every,
-            "camera_fps": args.fps, "quality": args.depth_stream_quality, "image_size": [args.width, args.height],
-            "depth_range_mm": [min_mm, max_mm], "quantization_mm": 1 << shift,
-            "gray_far": depth_stream.GRAY_FAR, "gray_near": depth_stream.GRAY_NEAR,
-            "gray_invalid_below": depth_stream.GRAY_INVALID_BELOW}
-    return control_queue, frame_queue, status_queue, info
+    names = tuple(name for name in map(node_log_name, nodes) if name)
+    return control_queue, frame_queue, status_queue, info, names
 
 
 def build_pipeline(p, device, args, stereo_settings):
@@ -504,10 +552,10 @@ def build_pipeline(p, device, args, stereo_settings):
         handles.snapshot_unavailable = {s: "snapshots are disabled (--no-snapshots)" for s in snapshots.STREAMS}
     if args.depth_stream:
         (handles.depth_stream_control_queue, handles.depth_stream_queue, handles.depth_stream_status_queue,
-         handles.depth_stream_info) = build_depth_stream(p, stereo, args, stereo_settings)
+         handles.depth_stream_info, handles.depth_stream_nodes) = build_depth_stream(p, stereo, args, stereo_settings)
     # One extra frame per stereo output pool for the frame each gate queue holds, plus the one the
     # depth stream Script is converting
-    extra = (1 if args.snapshots else 0) + (2 if args.depth_stream else 0)
+    extra = (1 if args.snapshots else 0) + (2 if handles.depth_stream_control_queue is not None else 0)
     if extra:
         stereo.setNumFramesPool(STEREO_FRAMES_POOL + extra)
     return handles
@@ -612,6 +660,11 @@ def run(args, log_only, data_log, stereo_settings):
 
 
 def run_pipeline(args, log_only, data_log, stereo_settings, telemetry):
+    """
+    Opens the camera and runs sessions (run_session) on it. When the camera restarted under a session
+    (depthai's XLink reconnect), the pipeline is torn down and the camera reopened, in this process: the
+    MAVLink output, the data log, the telemetry and the integrated pose carry on.
+    """
     def log_warning(message):
         logger.warning(message)
         data_log.event("warning", message=message)
@@ -631,24 +684,54 @@ def run_pipeline(args, log_only, data_log, stereo_settings, telemetry):
         depth_correction=args.depth_scale,
         refractive_index=args.refractive_index,
     )
-    quality_interval = 1.0 / args.quality_rate if args.quality_rate > 0 else float('inf')
 
     def log_device_open(message):
         logger.info(message)
         data_log.event("device_open", message=message)
 
+    pose_out = pose_stream.PoseStreamService(telemetry.directory, args.camera_angle, log=logger.info)
+    reconnects = 0
     try:
-        device = open_oak_device(args.device_timeout, log=log_device_open)
-    except DeviceOpenTimeout as e:
-        logger.error(f"❌ {e}")
-        data_log.event("error", error=str(e))
+        while True:
+            try:
+                device = open_oak_device(args.device_timeout, log=log_device_open)
+            except DeviceOpenTimeout as e:
+                logger.error(f"❌ {e}")
+                data_log.event("error", error=str(e))
+                sys.exit(2)
+            telemetry.temperature = device.getChipTemperature
+            telemetry.set_phase("configuring")
+            reason = run_session(device, args, log_only, data_log, stereo_settings, telemetry, mavlink, params,
+                                 pose_out, log_warning)
+            if reason is None:
+                return
+            telemetry.temperature = None
+            reconnects += 1
+            logger.warning(f"🔌 {reason}: restarting the pipeline (reconnect #{reconnects}) so snapshots, the depth "
+                           f"stream and the feature tracker settings reach the camera again")
+            data_log.event("reconnect", count=reconnects, reason=reason)
+            telemetry.set_phase("opening_device", reconnects=reconnects,
+                                last_reconnect={"unix_time": time.time(), "reason": reason})
+    finally:
         if mavlink:
             mavlink.close()
-        sys.exit(2)
-    telemetry.temperature = device.getChipTemperature
-    telemetry.set_phase("configuring")
 
-    writer = stream = None
+
+def run_session(device, args, log_only, data_log, stereo_settings, telemetry, mavlink, params, pose_out,
+                log_warning):
+    """
+    One pipeline on the open device until it stops (returns None) or the camera restarts under it
+    (DeviceRestartWatch; returns the reason after closing the device). A restarted camera's frames never
+    reach the PnP: the session ends at the first one, and the next session starts from a new reference.
+    """
+    quality_interval = 1.0 / args.quality_rate if args.quality_rate > 0 else float('inf')
+    restart = DeviceRestartWatch(log=logger.warning)
+    try:
+        device.setMaxReconnectionAttempts(1, restart.on_reconnection)
+    except Exception as e:
+        logger.warning(f"No depthai reconnection callback ({e}); a camera restart is noticed from its frames only")
+
+    writer = stream = log_callback = None
     try:
         with dai.Pipeline(device) as p:
             handles = build_pipeline(p, device, args, stereo_settings)
@@ -709,12 +792,32 @@ def run_pipeline(args, log_only, data_log, stereo_settings, telemetry):
                 control.setSequenceNum(1 if enabled else 0)
                 handles.depth_stream_control_queue.send(control)
 
-            if handles.depth_stream_control_queue is not None:
-                stream = depth_stream.DepthStreamService(telemetry.directory, send_depth_stream_control,
-                                                         handles.depth_stream_info, log=logger.info)
-                logger.info(f"Depth stream: on demand, {handles.depth_stream_info['fps_target']:.1f} fps MJPEG "
-                            f"quality {args.depth_stream_quality}, encoded on the camera")
-            data_log.event("depth_stream", enabled=stream is not None, **handles.depth_stream_info)
+            info = handles.depth_stream_info
+            if info:
+                on_camera = handles.depth_stream_control_queue is not None
+                host = device_log = debug = None
+                if not on_camera or info.get("requested_variant") == depth_stream.AUTO:
+                    host = depth_stream.HostJpegEncoder(*info["depth_range_mm"], args.depth_stream_quality,
+                                                        info.get("every", 1))
+                if on_camera:
+                    device_log = depth_stream.DeviceLog(handles.depth_stream_nodes)
+                    try:
+                        log_callback = device.addLogCallback(device_log.on_message)
+                    except Exception as e:
+                        logger.warning(f"Depth stream: no camera log callback ({e})")
+                        device_log = None
+                    if args.depth_stream_debug:
+                        debug = depth_stream.DeviceLogDebug(device, dai.LogLevel.DEBUG, log=logger.info)
+                stream = depth_stream.DepthStreamService(telemetry.directory, send_depth_stream_control, info,
+                                                         log=logger.info, host_encoder=host, device_log=device_log,
+                                                         debug=debug)
+                where = "on the camera" if on_camera else "on the Pi"
+                logger.info(f"Depth stream: on demand, {info['fps_target']:.1f} fps MJPEG quality "
+                            f"{args.depth_stream_quality}, {info.get('variant')} (encoded {where}; requested "
+                            f"{info.get('requested_variant')}){', camera debug log while streaming' if debug else ''}")
+                if info.get("size_problem"):
+                    log_warning(f"Depth stream: {info['size_problem']}")
+            data_log.event("depth_stream", enabled=stream is not None, debug=args.depth_stream_debug, **info)
             features_out = feature_stream.FeatureStreamService(telemetry.directory, (args.width, args.height),
                                                                log=logger.info)
 
@@ -726,16 +829,21 @@ def run_pipeline(args, log_only, data_log, stereo_settings, telemetry):
             else:
                 print("📡 Sending VIO data via MAVLink...")
 
-            while p.isRunning():
+            while p.isRunning() and not restart.triggered:
                 group = handles.sync_queue.get()
+                if restart.triggered:
+                    break
                 start = time.perf_counter()
+                features_msg = group["features"]
+                depth_msg = group["depth"]
+                t = timestamp_seconds(depth_msg, exposure_middle=True)
+                if restart.on_frame(depth_msg.getSequenceNum(), t):
+                    break
                 reinit.step()
 
                 for imu_data in handles.imu_queue.tryGetAll():
                     gyro.add(imu_data)
 
-                features_msg = group["features"]
-                depth_msg = group["depth"]
                 if features_msg.getSequenceNum() != depth_msg.getSequenceNum():
                     logger.warning(f"Sequence mismatch: features {features_msg.getSequenceNum()} "
                                    f"depth {depth_msg.getSequenceNum()}")
@@ -764,7 +872,6 @@ def run_pipeline(args, log_only, data_log, stereo_settings, telemetry):
                     odometry = PnPOdometry(intrinsics, params, image_size=(args.width, args.height))
                     probe.set_intrinsics(intrinsics, choice.source)
 
-                t = timestamp_seconds(depth_msg, exposure_middle=True)
                 tracked = features_msg.trackedFeatures
                 ids = np.fromiter((f.id for f in tracked), dtype=np.int64, count=len(tracked))
                 uv = np.array([(f.position.x, f.position.y) for f in tracked], dtype=np.float64).reshape(-1, 2)
@@ -786,7 +893,7 @@ def run_pipeline(args, log_only, data_log, stereo_settings, telemetry):
                 features_out.tick(uv, depth.shape, depth_msg.getSequenceNum(), pose.ok, pose.reason,
                                   frame.depth_valid, frame.matched_index, pose.inlier_index)
 
-                angle_delta = position_delta = time_delta_us = yaw_delta = None
+                angle_delta = position_delta = time_delta_us = yaw_delta = rotation_delta = None
                 sent = False
                 if pose.ok:
                     # Exactly what goes (or would go) into VISION_POSITION_DELTA
@@ -794,6 +901,8 @@ def run_pipeline(args, log_only, data_log, stereo_settings, telemetry):
                     position_delta = camera_to_body_frd(pose.position_delta, args.camera_angle)
                     time_delta_us = frame.dt * 1e6
                     yaw_delta = body_yaw(R_prior, args.camera_angle) if R_prior is not None else angle_delta[2]
+                    rotation_delta = (matrix_to_rotvec(camera_to_body_rotation(R_prior, args.camera_angle))
+                                      if R_prior is not None else angle_delta)
                     if mavlink:
                         sent = mavlink.send_vision_position_delta(
                             angle_delta=angle_delta,
@@ -829,8 +938,8 @@ def run_pipeline(args, log_only, data_log, stereo_settings, telemetry):
                 probe.tick()
                 probe.on_depth(depth, t, depth_msg.getSequenceNum())
                 if stream is not None:
-                    stream.tick(depth)
-                    encoded = handles.depth_stream_queue.tryGetAll()
+                    stream.tick(depth, depth_msg.getSequenceNum())
+                    encoded = handles.depth_stream_queue.tryGetAll() if handles.depth_stream_queue is not None else ()
                     if encoded:
                         stream.on_frame(encoded[-1].getData(), encoded[-1].getSequenceNum())
                     if handles.depth_stream_status_queue is not None:
@@ -863,9 +972,11 @@ def run_pipeline(args, log_only, data_log, stereo_settings, telemetry):
                     reference_reset=frame.reference_reset,
                     **lever,
                 )
-                telemetry.record_frame(time.time(), pose.ok, pose.reason, frame.features, frame.valid_depth,
+                now_s = time.time()
+                telemetry.record_frame(now_s, pose.ok, pose.reason, frame.features, frame.valid_depth,
                                        pose.matches, pose.inliers, proc_ms, frame.dt, position_delta, yaw_delta,
                                        frame.gap_frames, frame.reference_reset, sent)
+                pose_out.record(now_s, pose.ok, position_delta, rotation_delta)
 
                 now = time.monotonic()
                 if now_tracking is not None and now_tracking != tracking:
@@ -896,10 +1007,20 @@ def run_pipeline(args, log_only, data_log, stereo_settings, telemetry):
     finally:
         if stream is not None:
             stream.close()
+        if log_callback is not None:
+            try:
+                device.removeLogCallback(log_callback)
+            except Exception:
+                pass
         if writer is not None:
             writer.close()
-        if mavlink:
-            mavlink.close()
+    if not restart.triggered:
+        return None
+    try:
+        device.close()  # leaving the pipeline closed it already; this only makes sure
+    except Exception as e:
+        logger.warning(f"Closing the camera after its restart: {e}")
+    return restart.reason
 
 
 if __name__ == "__main__":

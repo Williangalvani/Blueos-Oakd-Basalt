@@ -376,7 +376,9 @@ def test_status_depth_stream_without_vio(client, tmp_path):
     main, http = client
     status = http.get("/api/status").json()["depth_stream"]
     assert status == {"enabled": False, "streaming": False, "stale": True, "age_s": None, "errors": 0,
-                      "last_error": None, "encoder_stalled": False}
+                      "last_error": None, "encoder_stalled": False, "variant": None, "encoded_on": None,
+                      "fallback": None, "device_log": None, "configured_encoding": "auto",
+                      "debug_configured": False}
     save_config(tmp_path, algorithm="pnp")
     assert http.get("/api/status").json()["depth_stream"]["enabled"] is True
 
@@ -414,6 +416,31 @@ def test_depth_stream_settings_reach_the_vio_command(client):
     assert command[command.index("--depth-stream-quality") + 1] == "70"
     response = http.post("/api/config", json={**pnp, "depth_stream_fps": 0.1})
     assert response.status_code == 422 and response.json()["detail"][0]["field"] == "depth_stream_fps"
+
+
+def test_depth_stream_encoding_and_debug_reach_the_vio_command(client, tmp_path):
+    import depth_stream
+    main, http = client
+    assert config_schema.DEPTH_STREAM_ENCODINGS == depth_stream.VARIANTS
+    pnp = {**main.DEFAULT_CONFIG, "algorithm": "pnp"}
+    assert (pnp["depth_stream_encoding"], pnp["depth_stream_debug"]) == ("auto", False)
+    command = main.build_vio_command(pnp)
+    assert command[command.index("--depth-stream-encoding") + 1] == "auto" and "--no-depth-stream-debug" in command
+    for variant in depth_stream.VARIANTS:
+        command = main.build_vio_command({**pnp, "depth_stream_encoding": variant, "depth_stream_debug": True})
+        assert command[command.index("--depth-stream-encoding") + 1] == variant and "--depth-stream-debug" in command
+    # A hand-edited config.json falls back to the default
+    command = main.build_vio_command({**pnp, "depth_stream_encoding": "h264"})
+    assert command[command.index("--depth-stream-encoding") + 1] == "auto"
+    response = http.post("/api/config", json={**pnp, "depth_stream_encoding": "h264"})
+    assert response.status_code == 422 and response.json()["detail"][0]["field"] == "depth_stream_encoding"
+    response = http.post("/api/config", json={**pnp, "depth_stream_encoding": "host_jpeg", "depth_stream_debug": True})
+    assert response.status_code == 200
+    status = http.get("/api/status").json()["depth_stream"]
+    assert status["configured_encoding"] == "host_jpeg" and status["debug_configured"] is True
+    fields = {f["name"]: f for f in http.get("/api/config/schema").json()["fields"]}
+    assert fields["depth_stream_encoding"]["choices"] == list(depth_stream.VARIANTS)
+    assert fields["depth_stream_debug"]["type"] == "bool"
 
 
 # --- snapshot feature overlay ---------------------------------------------------------------------

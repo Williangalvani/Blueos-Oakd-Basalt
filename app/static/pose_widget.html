@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OAK-D VIO 3D pose</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b1622; color: #dbe7f3;
+               font: 12px system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #pose-root { position: absolute; inset: 0; }
+  #pose-root > p { margin: 0; position: absolute; top: 50%; width: 100%; text-align: center; }
+</style>
+</head>
+<body>
+<div id="pose-root"><p>loading the 3D viewer…</p></div>
+<script type="module">
+// OAK-D VIO 3D pose widget (Cockpit external widget, also usable on its own): static/pose3d.js on the
+// stream api/stream/pose. URLs are relative to the extension's base, so the page works on port 8095 and
+// behind BlueOS's /extensionv2/<name>/ proxy.
+const BASE = location.pathname.replace(/widget\/pose\/?$/, '');
+const root = document.getElementById('pose-root');
+import(BASE + 'static/pose3d.js')
+  .then(viewer => viewer.mountPoseViewer(root, { base: BASE, fill: true }))
+  .catch(error => { root.firstElementChild.textContent = 'The 3D viewer did not load: ' + error; });
+</script>
+</body>
+</html>

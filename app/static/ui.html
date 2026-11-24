@@ -97,7 +97,7 @@
 </section>
 
 <section class="c12" id="panel-depth-stream">
-  <h2>Live depth <span class="muted">(stereo depth encoded on the camera as MJPEG, only sent while streaming)</span></h2>
+  <h2>Live depth <span class="muted">(stereo depth as MJPEG, encoded on the camera, or on the Pi as a fallback; only sent while streaming)</span></h2>
   <div class="controls">
     <label class="inline"><input type="checkbox" id="depth-stream-on"> stream</label>
     <label class="inline"><input type="checkbox" id="depth-stream-color" checked> colorize (near red, far blue, no depth black)</label>
@@ -123,9 +123,12 @@
         <span>rate</span><span id="ds-rate">–</span>
         <span>bandwidth</span><span id="ds-kbps">–</span>
         <span>JPEG</span><span id="ds-jpeg">–</span>
+        <span>encoding</span><span id="ds-encoding">–</span>
         <span>camera conversion</span><span id="ds-cost">–</span>
         <span>camera errors</span><span id="ds-errors">–</span>
       </div>
+      <details id="ds-log-box" hidden><summary class="muted" id="ds-log-summary">camera log</summary>
+        <pre id="ds-log" class="probe"></pre></details>
       <div class="hint">The camera turns the VIO's depth (after the stereo filters and the min/max depth thresholds) into
         8-bit gray, linear in depth, and encodes it; the Pi only forwards the JPEGs. Raw = device depth in air, before
         the refractive index and depth scale. The crosshair marks the centre pixel.</div>
@@ -163,6 +166,16 @@
     </div>
   </div>
   <div class="muted">Dial: forward = up, arrow = current vx/vy with a 2.5 s fading trail, dot = vehicle nose; bar = vz (down +). Same layout as the Water Linked DVL A50 "Horizontal / Vertical velocity" widgets.</div>
+</section>
+
+<section class="c12" id="panel-pose">
+  <h2>3D pose <span class="muted">(integrated VIO position and attitude, drifts; drag to orbit, wheel to zoom, right-drag to pan)</span></h2>
+  <div id="pose-root"><div class="muted">loading the 3D viewer…</div></div>
+  <div class="hint">Frame: the body frame at VIO start (x forward, y right, z down; NED with north at the initial
+    heading if the vehicle started level). Red/green/blue = x/y/z, white = camera frustum, orange = trail, dashed
+    blue = depth below or above the start (grid = start depth, 1 m cells). Positions and roll/pitch/yaw are chained
+    from the VIO's deltas, so they drift. <a id="pose-widget-link" href="widget/pose" target="_blank" rel="noopener">3D
+    pose widget</a>: the same view for Cockpit ("OAK-D VIO 3D pose") or a browser tab.</div>
 </section>
 
 <section class="c6" id="panel-vxvy">
@@ -247,5 +260,18 @@
 
 <div id="toast" class="toast"></div>
 <!--UI_JS-->
+<script type="module">
+// The 3D pose panel loads three.js (vendored, about 0.7 MB) only when it scrolls into view
+const poseRoot = document.getElementById('pose-root');
+const poseBase = new URL('.', document.baseURI).href;
+const poseWatch = new IntersectionObserver(entries => {
+  if (!entries.some(entry => entry.isIntersecting)) return;
+  poseWatch.disconnect();
+  import(new URL('static/pose3d.js', poseBase).href)
+    .then(viewer => viewer.mountPoseViewer(poseRoot, { base: poseBase }))
+    .catch(error => { poseRoot.textContent = 'The 3D viewer did not load: ' + error; });
+});
+poseWatch.observe(poseRoot);
+</script>
 </body>
 </html>

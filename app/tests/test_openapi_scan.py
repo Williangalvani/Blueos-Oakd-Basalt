@@ -28,6 +28,7 @@ from fake_mavlink2rest import FakeVehicle  # noqa: E402
 SAFE_GETS = {
     "/": "the web page",
     "/widget/depth": "the Cockpit widget page (the streams are opened by its script, not by this GET)",
+    "/widget/pose": "the 3D pose Cockpit widget page (its script opens /api/stream/pose, not this GET)",
     "/register_service": "BlueOS service metadata",
     "/cockpit_extras.json": "Cockpit extras manifest",
     "/api/config": "the saved configuration",

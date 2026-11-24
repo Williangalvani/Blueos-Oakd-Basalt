@@ -72,13 +72,53 @@ def block_network():
     urllib.request.urlopen = urlopen
 
 
+def _survey_block(first, second, vz):
+    """Two lanes of a lawnmower survey: lane, two `first` turns around a step, lane back, two `second` turns."""
+    turn = math.pi / 2 / TURN_S
+    return [(LANE_S, LANE_SPEED, 0.0, 0.0), (TURN_S, TURN_SPEED, 0.0, first * turn), (STEP_S, STEP_SPEED, vz, 0.0),
+            (TURN_S, TURN_SPEED, 0.0, first * turn), (LANE_S, LANE_SPEED, 0.0, 0.0),
+            (TURN_S, TURN_SPEED, 0.0, second * turn), (STEP_S, STEP_SPEED, vz, 0.0),
+            (TURN_S, TURN_SPEED, 0.0, second * turn)]
+
+
+# The mock vehicle surveys a lawnmower pattern: 24 s lanes at 0.35 m/s (about 8.4 m), 90-degree turns, and a
+# 1.5 m step between lanes that also changes the depth by STEP_DEPTH_M. The first block steps right and
+# down, the second (mirrored) left and up, so the path closes after SURVEY_PERIOD_S.
+LANE_S, TURN_S, STEP_S = 24.0, 6.0, 5.0
+LANE_SPEED, TURN_SPEED, STEP_SPEED = 0.35, 0.15, 0.3
+STEP_DEPTH_M = 0.4
+SURVEY = (_survey_block(1, -1, STEP_DEPTH_M / STEP_S) + _survey_block(-1, 1, -STEP_DEPTH_M / STEP_S))
+SURVEY_PERIOD_S = sum(segment[0] for segment in SURVEY)
+# Small roll and pitch oscillation (amplitude rad, period s)
+ROLL_WOBBLE = (math.radians(2.0), 7.0)
+PITCH_WOBBLE = (math.radians(1.5), 11.0)
+
+
 def motion(t):
     """The mock vehicle's motion at wall time t: body FRD velocity (m/s) and yaw rate (rad/s)."""
+    phase = t % SURVEY_PERIOD_S
+    for duration, forward, down, yaw_rate in SURVEY:
+        if phase < duration:
+            return forward, 0.0, down, yaw_rate
+        phase -= duration
+    return SURVEY[-1][1], 0.0, SURVEY[-1][2], SURVEY[-1][3]
+
+
+def heading(t):
+    """The mock vehicle's yaw (rad) at wall time t: motion's yaw rate integrated, 0 at the start of each survey."""
+    phase, yaw = t % SURVEY_PERIOD_S, 0.0
+    for duration, _, _, yaw_rate in SURVEY:
+        if phase < duration:
+            return yaw + yaw_rate * phase
+        yaw += yaw_rate * duration
+        phase -= duration
+    return yaw
+
+
+def attitude(t):
+    """Roll and pitch (rad) of the mock vehicle's small oscillation (as angles, so they stay bounded)."""
     tau = 2.0 * math.pi
-    return (0.12 * math.sin(tau * t / 37.0) + 0.04 * math.sin(tau * t / 11.0),
-            0.08 * math.sin(tau * t / 23.0 + 1.0),
-            0.02 * math.sin(tau * t / 17.0),
-            0.05 * math.sin(tau * t / 29.0))
+    return tuple(amplitude * math.sin(tau * t / period) for amplitude, period in (ROLL_WOBBLE, PITCH_WOBBLE))
 
 
 class MockAutopilot:

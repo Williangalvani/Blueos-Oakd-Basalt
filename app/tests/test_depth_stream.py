@@ -212,11 +212,11 @@ def test_the_fake_encoder_drops_gray8_like_the_camera():
     assert len(encoder.encoded) == 1 and len(encoder.warnings) == 1
 
 
-def run_script(code, depth_items, control_items, after=None, clock=None):
+def run_script(code, depth_items, control_items, after=None, clock=None, gray=None):
     node = type("Node", (), {})()
     control = control_items if isinstance(control_items, FakeInput) else FakeInput(control_items)
     node.inputs = {"depth": FakeInput(depth_items, after), "control": control}
-    node.outputs = {"gray": FakeVideoEncoder(), "status": FakeOutput()}
+    node.outputs = {"gray": gray or FakeVideoEncoder(), "status": FakeOutput()}
     node.warnings = []
     node.warn = node.warnings.append
     if clock is not None:
@@ -444,6 +444,99 @@ def test_script_reports_its_cost():
     assert stats[0]["convert_ms_max"] >= stats[0]["convert_ms_mean"] >= 0.0
 
 
+class FakeImageManip(FakeOutput):
+    """
+    The manip variant's ImageManip (depthai v3, frame type NV12) between the Script and the encoder: it takes
+    the Script's GRAY8 frame (stride 0 counts as the width) and sends an NV12 frame of the same size, from
+    its own pool of manip_output_size buffers, with the gray plane as Y and neutral chroma.
+    """
+
+    def __init__(self, encoder):
+        super().__init__()
+        self.encoder = encoder
+
+    def send(self, frame):
+        super().send(frame)
+        width, height = frame.calls["setWidth"], frame.calls["setHeight"]
+        assert frame.calls["setType"] in (ImgFrame.Type.GRAY8, ImgFrame.Type.YUV400p, ImgFrame.Type.NV12)
+        out = ImgFrame(depth_stream.manip_output_size(width, height))
+        out.setData(bytes(frame.calls["setData"])[:width * height] + b"\x80" * (width * height // 2))
+        out.setType(ImgFrame.Type.NV12)
+        out.setWidth(width)
+        out.setHeight(height)
+        self.encoder.send(out)
+
+
+def test_manip_output_size_matches_depthai():
+    # 640x400 NV12: Y 640 x 416 rows, UV 640 x 208 rows, each plane rounded up to 4096 bytes
+    assert depth_stream.manip_output_size(640, 400) == 401408
+    assert depth_stream.manip_output_size(640, 400) >= 640 * 400 * 3 // 2
+
+
+def test_size_problem():
+    assert depth_stream.size_problem(640, 400) is None and depth_stream.size_problem(1280, 800) is None
+    assert "multiple of 32" in depth_stream.size_problem(600, 400)
+    assert depth_stream.size_problem(640, 401) is not None
+
+
+def test_device_variant():
+    assert depth_stream.device_variant("auto") == "manip"
+    assert [depth_stream.device_variant(v) for v in ("manip", "nv12", "yuv400p")] == ["manip", "nv12", "yuv400p"]
+    assert depth_stream.device_variant("host_jpeg") is None and depth_stream.device_variant("bogus") is None
+
+
+@pytest.mark.parametrize("variant", ["manip", "nv12", "yuv400p"])
+def test_each_camera_variant_reaches_the_encoder(variant):
+    """Strict fakes: the device message API, the encoder's frame types and plane sizes, ImageManip for manip."""
+    frame_type = depth_stream.SCRIPT_FRAME_TYPES[variant]
+    frames = [DepthFrame(depth_image(n, 40, 64), n) for n in range(6)]
+    encoder = FakeVideoEncoder()
+    gray = FakeImageManip(encoder) if variant == "manip" else encoder
+    node = run_script(depth_stream.device_script(2, 300, 4000, frame_type=frame_type), frames, [Control(True)],
+                      gray=gray)
+    assert [f.calls["setSequenceNum"] for f in gray.sent] == [0, 2, 4]
+    assert all(f.calls["setType"] == getattr(ImgFrame.Type, frame_type) for f in gray.sent)
+    assert len(encoder.encoded) == 3 and encoder.warnings == []
+    for out, sent in zip(encoder.encoded, gray.sent):
+        data = bytes(out.calls["setData"])
+        y = np.frombuffer(data[:64 * 40], np.uint8).reshape(40, 64)
+        np.testing.assert_array_equal(y, depth_stream.gray_reference(frames[sent.calls["setSequenceNum"]].depth,
+                                                                     300, 4000))
+        if out.calls["setType"] == ImgFrame.Type.NV12:
+            assert len(data) == 64 * 40 * 3 // 2 and set(data[64 * 40:]) == {128}
+        else:
+            assert len(data) == 64 * 40
+    assert node.warnings == [] and errors_reported(node) == []
+
+
+def test_nv12_frames_are_sized_for_both_planes():
+    node = run_script(depth_stream.device_script(1, 300, 4000, frame_type="NV12"),
+                      [DepthFrame(depth_image(0, 400, 640), 0)], [Control(True)])
+    (out,) = node.outputs["gray"].encoded
+    assert out.size == len(out.calls["setData"]) == 640 * 400 * 3 // 2
+
+
+@pytest.mark.parametrize("variant, size", [("manip", "width * height"), ("yuv400p", "width * height"),
+                                           ("nv12", "size + size // 2")])
+def test_each_variant_script_uses_only_the_on_device_message_api(variant, size):
+    import ast
+    frame_type = depth_stream.SCRIPT_FRAME_TYPES[variant]
+    code = depth_stream.device_script(3, 300, 4000, frame_type=frame_type)
+    json.dumps(code)
+    constructors, methods = script_calls(code)
+    (img_frame,) = constructors["ImgFrame"]
+    assert not img_frame.keywords and ast.unparse(img_frame.args[0]) == size
+    on_frames = {method for name, method in methods if name in ("out", "frame", "src")}
+    assert on_frames <= depth_stream.DEVICE_IMGFRAME_API
+    types = {node.attr for node in ast.walk(ast.parse(code)) if isinstance(node, ast.Attribute)
+             and ast.unparse(node.value) == "ImgFrame.Type"}
+    assert types == {frame_type}
+    # Only the ImageManip variant may send a type the encoder does not take itself
+    assert (frame_type in depth_stream.DEVICE_ENCODER_INPUT_TYPES) == (variant != "manip")
+    with pytest.raises(ValueError):
+        depth_stream.device_script(3, 300, 4000, frame_type="RAW8")
+
+
 def test_script_conversion_cost_on_this_host():
     """Documents the per-frame work (it is far slower on the camera's CPU; the Script logs that)."""
     namespace = {}
@@ -549,7 +642,8 @@ def test_service_publishes_the_device_errors(tmp_path):
     service.on_device_status(f"error\t57\t0\t{text}".encode())
     meta = depth_stream.read_meta(tmp_path)  # written right away, not only once a second while streaming
     assert meta["errors"] == 57
-    assert meta["last_error"] == {"text": text, "unix_time": 1001.0, "fatal": False, "errors": 57, "frames_sent": 0}
+    assert meta["last_error"] == {"text": text, "unix_time": 1001.0, "fatal": False, "errors": 57, "frames_sent": 0,
+                                  "variant": None}
     assert len(logs) == 1 and text in logs[0]  # the same error is logged once
 
     service.on_device_status(b"stats\t57\t150\t41.5 60.2 640 400")
@@ -688,3 +782,289 @@ def test_multipart_part():
     part = depth_stream.multipart_part(b"\xff\xd8abc")
     assert part == b"--depthframe\r\nContent-Type: image/jpeg\r\nContent-Length: 5\r\n\r\n\xff\xd8abc\r\n"
     json.dumps(depth_stream.device_script(3, 300, 4000))
+
+
+# --- host_jpeg: encoded on the Pi -----------------------------------------------------------------
+
+def test_host_encoder_matches_the_camera_scale():
+    import cv2
+    clock = Clock(100.0)
+    encoder = depth_stream.HostJpegEncoder(300, 4000, 95, every=2, threaded=False, clock=clock)
+    depth = depth_image(1, 40, 64)
+    assert not encoder.submit(depth, 0)  # not enabled
+    encoder.set_enabled(True)
+    taken = []
+    for n in range(5):
+        clock.t += 1.0
+        taken.append(encoder.submit(depth, n))
+    assert taken == [True, False, True, False, True]  # every 2nd, the first one at once
+    results = encoder.drain()
+    assert [sequence for _, sequence in results] == [0, 2, 4] and encoder.drain() == []
+    gray = cv2.imdecode(np.frombuffer(results[0][0], np.uint8), cv2.IMREAD_GRAYSCALE)
+    reference = depth_stream.gray_reference(depth, 300, 4000).astype(int)
+    assert gray.shape == (40, 64) and np.abs(gray.astype(int) - reference).mean() < 4
+    reports = [depth_stream.parse_device_status(r) for r in encoder.reports()]
+    assert [r["kind"] for r in reports] == ["sent"] * 3 and [r["sent"] for r in reports] == [1, 2, 3]
+    assert encoder.stats()["frames"] == 3 and encoder.stats()["cpu_budget_percent"] == 25.0
+    encoder.close()
+    assert not encoder.enabled
+
+
+def test_host_encoder_keeps_to_its_cpu_budget():
+    clock, cpu = Clock(100.0), [0.0]
+
+    def encode(depth):
+        cpu[0] += 0.1  # 0.1 s of CPU per frame
+        return b"\xff\xd8x"
+
+    encoder = depth_stream.HostJpegEncoder(300, 4000, 70, cpu_budget=0.25, threaded=False, clock=clock,
+                                           cpu_clock=lambda: cpu[0], encode=encode, stats_every=2)
+    encoder.set_enabled(True)
+    taken = []
+    for n in range(9):  # a frame every 0.25 s
+        taken.append(encoder.submit(np.zeros((4, 32), np.uint16), n))
+        clock.t += 0.25
+    # After a 0.1 s encode the next one waits 0.3 s: every other frame, 20 % of a core
+    assert taken == [True, False] * 4 + [True]
+    stats = encoder.stats()
+    assert stats["skipped_cpu"] == 4 and stats["frames"] == 5 and stats["offered"] == 9
+    assert stats["cpu_percent"] <= 25.0
+    reports = [depth_stream.parse_device_status(r) for r in encoder.reports()]
+    assert {r["kind"] for r in reports} == {"sent", "stats"}
+    assert [r["size"] for r in reports if r["kind"] == "stats"] == [[32, 4], [32, 4]]
+
+
+def test_host_encoder_reports_its_errors():
+    def encode(depth):
+        raise RuntimeError("no memory")
+
+    encoder = depth_stream.HostJpegEncoder(300, 4000, 70, threaded=False, clock=Clock(1.0), encode=encode)
+    encoder.set_enabled(True)
+    assert encoder.submit(np.zeros((4, 32), np.uint16), 0)
+    assert encoder.drain() == []
+    kinds = [depth_stream.parse_device_status(r) for r in encoder.reports()]
+    assert kinds[-1] == {"kind": "error", "errors": 1, "sent": 1, "text": "encode: RuntimeError: no memory"}
+
+
+def test_host_encoder_thread_skips_frames_while_busy():
+    import threading
+    release, started = threading.Event(), threading.Event()
+
+    def encode(depth):
+        started.set()
+        release.wait(5)
+        return b"\xff\xd8x"
+
+    encoder = depth_stream.HostJpegEncoder(300, 4000, 70, clock=Clock(1.0), encode=encode)
+    try:
+        encoder.set_enabled(True)
+        assert encoder.submit(np.zeros((4, 32), np.uint16), 0)
+        assert started.wait(5)
+        assert not encoder.submit(np.zeros((4, 32), np.uint16), 1)
+        assert encoder.stats()["skipped_busy"] == 1
+        release.set()
+        deadline = time.time() + 5
+        results = []
+        while not results and time.time() < deadline:
+            results = encoder.drain()
+            time.sleep(0.01)
+        assert results == [(b"\xff\xd8x", 0)]
+    finally:
+        release.set()
+        encoder.close()
+
+
+def host_service(tmp_path, clock, logs, encode=None, info=None, **kwargs):
+    host = depth_stream.HostJpegEncoder(300, 4000, 70, threaded=False, clock=clock,
+                                        encode=encode or (lambda depth: b"\xff\xd8host"))
+    controls = []
+    info = info or {"fps_target": 5.0, "variant": "host_jpeg", "requested_variant": "host_jpeg"}
+    service = depth_stream.DepthStreamService(tmp_path, controls.append, info, clock=clock, log=logs.append,
+                                              host_encoder=host, **kwargs)
+    return service, host, controls
+
+
+def test_host_jpeg_service_streams_from_the_pi(tmp_path):
+    clock, logs = Clock(1000.0), []
+    service, host, controls = host_service(tmp_path, clock, logs)
+    assert service.on_host and service.meta()["encoded_on"] == "pi"
+    depth = np.full((40, 64), 1500, np.uint16)
+    service.tick(depth, 0)
+    assert not service.enabled and not host.enabled
+    depth_stream.touch_lease(tmp_path)
+    os.utime(tmp_path / depth_stream.LEASE_FILE, (clock.t, clock.t))
+    for n in range(1, 6):
+        clock.t += 0.6
+        service.tick(depth, n)
+    assert service.enabled and host.enabled and controls == []  # the camera's control is not used
+    assert (tmp_path / depth_stream.FRAME_FILE).read_bytes() == b"\xff\xd8host"
+    meta = depth_stream.read_meta(tmp_path)
+    assert meta["variant"] == "host_jpeg" and meta["encoded_on"] == "pi" and meta["frames_total"] == 5
+    assert meta["host_encoder"]["frames"] == 5 and meta["encoder_stalled"] is False
+    assert service.on_frame(b"\xff\xd8camera", 9) is False  # nothing from the camera in this variant
+    service.close()
+    assert not host.enabled
+
+
+def test_host_jpeg_flags_a_stuck_pi_encoder(tmp_path):
+    clock, logs = Clock(1000.0), []
+    service, host, _ = host_service(tmp_path, clock, logs)
+    host.threaded, host._job = True, ("stuck", None)  # the worker took a frame and never finished it
+    host._thread = object()
+    depth_stream.touch_lease(tmp_path)
+    for n in range(25):
+        os.utime(tmp_path / depth_stream.LEASE_FILE, (clock.t, clock.t))
+        service.tick(np.zeros((4, 32), np.uint16), n)
+        clock.t += 0.2
+    meta = depth_stream.read_meta(tmp_path)
+    assert meta["encoder_stalled"] is True and meta["last_error"]["variant"] == "host_jpeg"
+    assert "the Pi" in meta["last_error"]["text"] and meta["host_encoder"]["skipped_busy"] >= 20
+
+
+def test_auto_falls_back_to_the_pi_when_the_camera_encoder_stalls(tmp_path):
+    clock, logs = Clock(1000.0), []
+    debug_device = FakeLogDevice()
+    debug = depth_stream.DeviceLogDebug(debug_device, "DEBUG", log=logs.append)
+    service, host, controls = host_service(
+        tmp_path, clock, logs, info={"fps_target": 5.0, "variant": "manip", "requested_variant": "auto"},
+        debug=debug)
+    assert not service.on_host and service.meta()["encoded_on"] == "camera"
+    depth_stream.touch_lease(tmp_path)
+    os.utime(tmp_path / depth_stream.LEASE_FILE, (clock.t, clock.t))
+    service.tick()
+    assert controls == [True] and debug_device.level == "DEBUG" and not host.enabled
+    for sent in (5, 10, 15, 20, 25):  # the camera Script sends, the encoder returns nothing
+        clock.t += 1.0
+        service.on_device_status(f"sent\t0\t{sent}\t".encode())
+    meta = depth_stream.read_meta(tmp_path)
+    assert controls == [True, False] and debug_device.level == "WARN"  # camera off, debug level restored
+    assert meta["variant"] == "host_jpeg" and meta["requested_variant"] == "auto" and meta["encoded_on"] == "pi"
+    assert meta["fallback"]["from"] == "manip" and meta["fallback"]["to"] == "host_jpeg"
+    assert depth_stream.ENCODER_STALL_TEXT in meta["fallback"]["reason"]
+    assert meta["encoder_stalled"] is False and meta["last_error"]["variant"] == "manip"
+    assert any("falling back from manip" in line for line in logs)
+    assert host.enabled
+    # From now on the frames come from the Pi; late camera frames and reports are ignored
+    assert service.on_frame(b"\xff\xd8camera", 1) is False
+    service.on_device_status(b"error\t3\t30\tlate")
+    os.utime(tmp_path / depth_stream.LEASE_FILE, (clock.t, clock.t))
+    clock.t += 0.6
+    service.tick(np.full((40, 64), 1500, np.uint16), 7)
+    assert (tmp_path / depth_stream.FRAME_FILE).read_bytes() == b"\xff\xd8host"
+    assert service.meta()["errors"] == 0 and service.meta()["last_frame"]["sequence"] == 7
+
+
+def test_a_fixed_camera_variant_does_not_fall_back(tmp_path):
+    clock, logs = Clock(1000.0), []
+    service = depth_stream.DepthStreamService(tmp_path, lambda on: None,
+                                              {"fps_target": 5.0, "variant": "nv12", "requested_variant": "nv12"},
+                                              clock=clock, log=logs.append)
+    depth_stream.touch_lease(tmp_path)
+    os.utime(tmp_path / depth_stream.LEASE_FILE, (clock.t, clock.t))
+    service.tick()
+    for sent in (5, 10, 15, 20, 25):
+        clock.t += 1.0
+        service.on_device_status(f"sent\t0\t{sent}\t".encode())
+    meta = service.meta()
+    assert meta["encoder_stalled"] is True and meta["variant"] == "nv12" and meta["fallback"] is None
+    assert "variant nv12" in meta["last_error"]["text"] and meta["last_error"]["stall"] is True
+
+
+# --- depth_stream_debug: the camera's log ---------------------------------------------------------
+
+class FakeLogDevice:
+    def __init__(self, level="WARN", fail=False):
+        self.level, self.fail, self.calls = level, fail, []
+
+    def getLogLevel(self):
+        return self.level
+
+    def setLogLevel(self, level):
+        self.calls.append(level)
+        if self.fail:
+            raise RuntimeError("device gone")
+        self.level = level
+
+
+class LogMessage:
+    def __init__(self, node, payload, level="DEBUG"):
+        self.nodeIdName, self.payload, self.level = node, payload, level
+
+
+def test_device_log_keeps_the_stream_nodes_lines_bounded():
+    clock = Clock(5.0)
+    log = depth_stream.DeviceLog(("Script(12)",), clock=clock, max_lines=3, other_lines=2)
+    log.on_message(LogMessage("VideoEncoder(13)", "VideoEncoder took '4' ms."))
+    log.on_message(LogMessage("Script(12)", "depth stream: convert + send mean 40 ms"))
+    log.on_message(LogMessage("StereoDepth(3)", "unrelated"))
+    log.on_message(LogMessage("ImageManip(14)", "x" * 1000, "WARN"))
+    log.on_message(LogMessage("Script(2)", "the snapshot gate"))
+    log.on_message(LogMessage("Camera(0)", "third other"))
+    snap = log.snapshot()
+    assert snap["total"] == 6
+    assert [line["node"] for line in snap["stream"]] == ["VideoEncoder(13)", "Script(12)", "ImageManip(14)"]
+    assert len(snap["stream"][-1]["text"]) == depth_stream.DEVICE_LOG_MAX_CHARS
+    assert snap["stream"][0] == {"unix_time": 5.0, "node": "VideoEncoder(13)", "level": "DEBUG",
+                                 "text": "VideoEncoder took '4' ms."}
+    assert [line["node"] for line in snap["other"]] == ["Script(2)", "Camera(0)"]  # bounded: the newest two
+    log.on_message(LogMessage("VideoEncoder(13)", "more"))
+    assert [line["text"] for line in log.snapshot()["stream"]][-1] == "more" and len(log.snapshot()["stream"]) == 3
+    json.dumps(log.snapshot())
+
+
+def test_device_log_never_raises_into_depthai():
+    class Broken:
+        @property
+        def payload(self):
+            raise RuntimeError("bad message")
+
+    log = depth_stream.DeviceLog()
+    log.on_message(Broken())
+    assert log.snapshot() == {"stream": [], "other": [], "total": 0}
+    log.on_message(None)
+    assert log.snapshot()["total"] == 1 and log.snapshot()["stream"] == []
+
+
+def test_device_log_debug_raises_and_restores_the_level():
+    device, logs = FakeLogDevice("WARN"), []
+    debug = depth_stream.DeviceLogDebug(device, "DEBUG", log=logs.append)
+    debug.start()
+    debug.start()
+    assert device.calls == ["DEBUG"] and debug.state() == {"active": True, "level": "DEBUG",
+                                                           "restore_level": "WARN", "error": None}
+    debug.stop()
+    debug.stop()
+    assert device.calls == ["DEBUG", "WARN"] and device.level == "WARN" and not debug.active
+    assert logs == ["Depth stream debug: device log level WARN -> DEBUG",
+                    "Depth stream debug: device log level back to WARN"]
+
+    broken = depth_stream.DeviceLogDebug(FakeLogDevice(fail=True), "DEBUG", log=logs.append)
+    broken.start()
+    assert not broken.active and "device gone" in broken.state()["error"]
+
+
+def test_service_raises_the_log_level_only_while_streaming(tmp_path):
+    clock, logs = Clock(1000.0), []
+    device = FakeLogDevice("INFO")
+    device_log = depth_stream.DeviceLog(("Script(12)",), clock=clock)
+    service = depth_stream.DepthStreamService(
+        tmp_path, lambda on: None, {"variant": "manip", "requested_variant": "manip"}, clock=clock,
+        log=logs.append, device_log=device_log, debug=depth_stream.DeviceLogDebug(device, "DEBUG", log=logs.append))
+    service.tick()
+    assert device.calls == []
+    depth_stream.touch_lease(tmp_path)
+    os.utime(tmp_path / depth_stream.LEASE_FILE, (clock.t, clock.t))
+    clock.t += 0.6
+    service.tick()
+    assert device.level == "DEBUG"
+    device_log.on_message(LogMessage("VideoEncoder(13)", "VideoEncoder took '4' ms."))
+    clock.t += 1.1
+    service.tick()
+    meta = depth_stream.read_meta(tmp_path)
+    assert meta["debug"] is True and meta["debug_state"]["active"] is True
+    assert meta["device_log"]["stream"][0]["text"] == "VideoEncoder took '4' ms."
+    clock.t += depth_stream.LEASE_S + 1
+    service.tick()
+    assert device.level == "INFO" and depth_stream.read_meta(tmp_path)["debug_state"]["active"] is False
+    service.close()
+    assert device.calls == ["DEBUG", "INFO"]

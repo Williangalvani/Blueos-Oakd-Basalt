@@ -116,6 +116,8 @@ The page is one self-contained file (`app/static/ui.html`, `ui.css` and `ui.js`,
 | Live depth stream | on | PnP only: allow the page's [live depth stream](#live-depth-stream), MJPEG encoded on the camera. Nothing is sent until a client watches (`--depth-stream`). |
 | Depth stream fps | 5 | PnP only: target rate of the depth stream (0.5–15; every n-th camera frame, `--depth-stream-fps`). |
 | Depth stream JPEG quality | 70 | PnP only: the camera's MJPEG quality (10–100, `--depth-stream-quality`). |
+| Depth Stream Encoding | auto | PnP only: how the depth frame reaches a JPEG encoder (`depth_stream_encoding`, `--depth-stream-encoding`): `auto`, `manip`, `nv12`, `yuv400p` or `host_jpeg`. See [Encoding variants](#encoding-variants). |
+| Depth Stream Debug | off | PnP only: while the depth stream runs, raise the camera's log level to DEBUG and show the encoder's log lines in the *Live depth* panel (`depth_stream_debug`, `--depth-stream-debug`). See [Debug mode](#debug-mode-depth_stream_debug). |
 | PnP Intrinsics Source | rectified | PnP only: where the rectified-left camera matrix comes from (`--intrinsics-from`). See [Camera matrix](#camera-matrix-pnp). |
 | PnP Intrinsics Override | empty | PnP only: `fx,fy,cx,cy` in pixels on the width × height grid (`--intrinsics-override`). Wins over the source. Empty = off. |
 | PnP Depth Scale | 1.0 | PnP only: extra trim on the camera depth before back-projection, on top of the refractive index (`--depth-scale`, 0.2–5). Translation scales with it. Use it for a residual measured with the [depth probe](#depth-probe-pnp). |
@@ -218,13 +220,16 @@ The page is backed by a small HTTP API:
 | GET | `/api/snapshot?stream=<stream>` | PnP only: PNG of one current camera frame; `stream` is `rect_left`, `rect_right`, `depth` or `rgb`. `&crosshair=1&x=&y=&w=&h=` draws the depth probe's ROI; `&overlay=1` (rect_left) draws the tracked features. See [Snapshots](#snapshots-pnp). |
 | POST | `/api/depth_probe?x=&y=&w=&h=&frames=` | PnP only: depth statistics in an ROI over the next frames. See [Depth probe](#depth-probe-pnp). |
 | POST | `/api/focal_check?tolerance=` | PnP only: checks fx against the focal length the device depth implies. See [Focal check](#focal-check-pnp). |
-| GET | `/api/stream/depth` | PnP only: live depth as `multipart/x-mixed-replace` MJPEG (grayscale, encoded on the camera); 503 when PnP is stopped or the stream is off. `?frames=N` ends after N frames. See [Live depth stream](#live-depth-stream). |
+| GET | `/api/stream/depth` | PnP only: live depth as `multipart/x-mixed-replace` MJPEG (grayscale, encoded on the camera, or on the Pi with `host_jpeg`); 503 when PnP is stopped or the stream is off. `?frames=N` ends after N frames. See [Live depth stream](#live-depth-stream). |
+| GET | `/api/stream/pose` | Server-sent events for the [3D pose viewer](#3d-pose-viewer): `pose` (at most 10 per second), `trail` (once per connection, and again after a VIO restart) and `status` (once a second). Always 200. `?events=N` ends after N events. |
+| GET | `/api/pose` | PnP only: the latest `pose` object once; 404 until the VIO process has published one (it starts on request) |
 | GET | `/api/stream/features` | Server-sent events for the [Cockpit widget](#cockpit-widget): `features` (the PnP tracker's features, about 5 per second) and `status` (once a second; `problem` says why there is nothing to show). Always 200. `?events=N` ends after N events. |
 | GET | `/api/features` | PnP only: the latest `features` object once; 404 until the VIO process has published one (it starts on request) |
 | GET | `/widget/depth` | The [Cockpit widget](#cockpit-widget) page |
-| GET | `/register_service`, `/cockpit_extras.json` | BlueOS service metadata and the Cockpit extras that declare the widget |
+| GET | `/widget/pose` | The [3D pose viewer](#3d-pose-viewer) as a Cockpit widget page |
+| GET | `/register_service`, `/cockpit_extras.json` | BlueOS service metadata and the Cockpit extras that declare the two widgets |
 
-`/openapi.json` (and `/docs`) lists only the GET routes that answer at once with a bounded body and start nothing: `/`, `/widget/depth`, `/register_service`, `/cockpit_extras.json`, `/api/config`, `/api/config/schema`, `/api/status`, `/api/logs` and `/api/logs/{name}`. BlueOS's helper GETs every path listed there every few seconds and reads each body to its end, so the streams (`/api/stream/*`) and the routes that wait for the camera or start work (`/api/snapshot`, `/api/history`, `/api/features`) are left out of the schema, and everything that runs something on the camera or the autopilot is a POST. `app/tests/test_openapi_scan.py` runs that scan against the app and fails on any other GET in the schema.
+`/openapi.json` (and `/docs`) lists only the GET routes that answer at once with a bounded body and start nothing: `/`, `/widget/depth`, `/widget/pose`, `/register_service`, `/cockpit_extras.json`, `/api/config`, `/api/config/schema`, `/api/status`, `/api/logs` and `/api/logs/{name}`. BlueOS's helper GETs every path listed there every few seconds and reads each body to its end, so the streams (`/api/stream/*`) and the routes that wait for the camera or start work (`/api/snapshot`, `/api/history`, `/api/features`) are left out of the schema, and everything that runs something on the camera or the autopilot is a POST. `app/tests/test_openapi_scan.py` runs that scan against the app and fails on any other GET in the schema.
 
 ### Snapshots (PnP)
 
@@ -323,17 +328,50 @@ The VIO process publishes its live status through files, like snapshots ([`app/v
 
 The *Live depth* panel shows the camera's stereo depth at about 5 fps while its *stream* box is ticked. The *colorize* box colours it in the browser (near is red, far is blue, invalid is black). The panel also shows a legend for *Stereo Depth Min/Max*, the depth at the image centre (the median of the centre 5×5 pixels and the centre pixel), the frame rate and the bandwidth. It is the `<img>` of `GET /api/stream/depth` (MJPEG), so it also opens in a browser tab or in VLC.
 
-The depth is made 8-bit and JPEG-encoded on the camera; the Pi only forwards the bytes ([`app/depth_stream.py`](app/depth_stream.py)):
+The depth is made 8-bit and JPEG-encoded on the camera, and the Pi only forwards the bytes; `host_jpeg` (below) encodes on the Pi instead ([`app/depth_stream.py`](app/depth_stream.py)):
 
-- On the camera, a `Script` node takes `StereoDepth.depth` (RAW16 mm, aligned to rectified left, 640×400) in a size-1 non-blocking queue. It forwards every n-th frame (n = fps / stream fps; 3 at 15 fps) as an 8-bit gray frame, converted with two 256-byte lookup tables on the high and low bytes (`bytes.translate`, 50 rows at a time). A `VideoEncoder` in MJPEG mode (quality 70) encodes it; its input is non-blocking with size 1, so a busy encoder drops stream frames, never VIO frames.
+- On the camera, a `Script` node takes `StereoDepth.depth` (RAW16 mm, aligned to rectified left, 640×400) in a size-1 non-blocking queue. It forwards every n-th frame (n = fps / stream fps; 3 at 15 fps) as an 8-bit gray frame, converted with two 256-byte lookup tables on the high and low bytes (`bytes.translate`, 50 rows at a time). A `VideoEncoder` in MJPEG mode (quality 70) encodes it, directly or after an `ImageManip` depending on the [variant](#encoding-variants); its input is non-blocking with size 1, so a busy encoder drops stream frames, never VIO frames.
 - The gray scale is linear in depth: 255 at *Stereo Depth Min*, 16 at *Stereo Depth Max*, 0 for invalid or out-of-range pixels, in 2^k mm steps (16 mm for a 4 m max). The browser treats gray < 8 as invalid, which absorbs JPEG ringing. `/api/status` → `depth_stream` gives the scale (`depth_range_mm`, `gray_near`, `gray_far`, `quantization_mm`), `fps`, `kbps` and `center`.
 - With nobody watching, the Script blocks on its control input, so it converts, encodes and sends nothing. Each `/api/stream/depth` client touches `depth_stream.lease` in the telemetry directory every second. The VIO loop checks the lease every 0.5 s and sends the Script on/off. The stream stops about 4 s after the last client leaves.
 - The VIO loop takes the newest encoded frame (`tryGetAll`, non-blocking) and writes it atomically to `/dev/shm/oakd-vio-telemetry/depth_stream.jpg`. `main.py` polls the file every 50 ms and sends each new one as a multipart part. The centre depth goes to `depth_stream.json` once a second while streaming.
-- The Script uses only the camera's own Script API, which is smaller than the host's `dai.ImgFrame`: `ImgFrame(width * height)` (the size in bytes; `ImgFrame()` does not exist there), `setData`, `setType(YUV400p)`, `setWidth`, `setHeight`, `setTimestamp` and `setSequenceNum`. There is no `setStride` (the stride of a single 8-bit plane is the width), `setMetadata` or `setTimestampDevice`. The list was checked against the RVC2 firmware that depthai 3.3.0 ships, and a test runs the Script against fakes that accept only that API.
-- The frame type is `YUV400p`, not `GRAY8`. They hold the same bytes, but the camera's `VideoEncoder` only takes `NV12` or `YUV400p`. It drops anything else with a device log warning per frame ("Arrived frame type (30) is not either NV12 or YUV400p (8-bit Gray)"; 30 is `GRAY8`) and outputs nothing. The test fakes drop it the same way.
+- The Script uses only the camera's own Script API, which is smaller than the host's `dai.ImgFrame`: `ImgFrame(size)` (the size in bytes; `ImgFrame()` does not exist there), `setData`, `setType`, `setWidth`, `setHeight`, `setTimestamp` and `setSequenceNum`. There is no `setStride`, `setMetadata` or `setTimestampDevice`. The list was checked against the RVC2 firmware that depthai 3.3.0 ships, and the tests run the Script of every variant against fakes that accept only that API.
+- The camera's `VideoEncoder` only takes `NV12` or `YUV400p`. It drops anything else with a device log warning per frame ("Arrived frame type (30) is not either NV12 or YUV400p (8-bit Gray)"; 30 is `GRAY8`) and outputs nothing. The test fakes drop it the same way.
 - Errors: the Script counts each frame that fails, and sends the count and the latest error on its `status` output: the first one at once, then at most one a second. It also logs the 1st and every 100th with `node.warn`. A metadata failure still sends the frame. `/api/status` → `depth_stream` has `errors`, `last_error` (`text`, `unix_time`, `fatal` if the Script stopped) and `device_stats` (the camera's convert + send time, every 150 frames). The panel shows them as *camera conversion* and *camera errors*, and the widget's status line shows the error count.
-- Encoder check: while streaming, the Script also reports how many frames it has sent, about once a second. If that count keeps rising for more than 3 s after its first report since the last JPEG, and no JPEG comes back, `depth_stream.encoder_stalled` is `true`. `last_error` then reads "camera converts frames but the encoder outputs nothing: …", and the VIO log has it once. A gap in the reports longer than 2.5 s or 2.5 frame intervals restarts the 3 s, so a pause in depth frames is not mistaken for it. The next JPEG, or the end of the stream, clears the flag. The panel shows it under *camera errors*, and the widget shows "depth: camera encoder outputs nothing".
+- Encoder check: while streaming, the Script also reports how many frames it has sent, about once a second. If that count keeps rising for more than 3 s after its first report since the last JPEG, and no JPEG comes back, `depth_stream.encoder_stalled` is `true`. `last_error` then reads "camera converts frames but the encoder outputs nothing: …" with the variant, and the VIO log has it once. A gap in the reports longer than 2.5 s or 2.5 frame intervals restarts the 3 s, so a pause in depth frames is not mistaken for it. The next JPEG, or the end of the stream, clears the flag. `host_jpeg` sends the same reports (frames offered to the Pi's encoder), so the check works for every variant. The panel shows it under *camera errors* as "encoder outputs nothing: …"; after it clears, the row keeps "none now · last: …" with the age, so a stall that ended with the stream is still visible. The widget shows "depth: camera encoder outputs nothing".
 - Cost: on the Pi, one file write per streamed frame and a 5×5 median once a second. A sparse depth frame from the stage-1 snapshots (`snap4`, 13 % valid) is 26 KB as a quality-70 JPEG (OpenCV's encoder), so about 130 KB/s (1 Mbit/s) on the link at 5 fps. The Script logs its own conversion time on the camera every 150 frames ("depth stream: … ms") and reports it in `device_stats`; it has not been measured on hardware yet. If it competes with the VIO, lower *Depth stream fps* or turn *Live depth stream* off, which removes the Script and encoder from the pipeline.
+
+#### Encoding variants
+
+On an OAK-D-W (test11) the Script sent `YUV400p` frames, 640×400 at 5 fps, with no errors, and the encoder returned nothing: `/api/stream/depth` answered 200 with no bytes and `encoder_stalled` came up after 3.6 s, with no VideoEncoder lines in the log at the default level. *Depth Stream Encoding* chooses how the frame reaches an encoder, so each candidate can be tried on the camera without a rebuild. All variants use the same gray scale, so the page and the widget don't change.
+
+| Variant | Pipeline | Encoded on |
+|---|---|---|
+| `auto` (default) | `manip`, switching to `host_jpeg` for the rest of the run the first time the encoder stalls (logged once; `fallback` in `/api/status`) | camera, then Pi |
+| `manip` | Script → `GRAY8` frame → `ImageManip` (converts to `NV12`) → `VideoEncoder`. The encoder gets a frame from ImageManip's own pool: explicit stride and plane offsets, aligned buffer (640×400 NV12: 401408 bytes, pool of 3) | camera |
+| `nv12` | Script → `NV12` frame (the gray plane and a 128 chroma plane, w×h×3/2 bytes) → `VideoEncoder` | camera |
+| `yuv400p` | Script → `YUV400p` frame (w×h bytes) → `VideoEncoder`: the test11 pipeline | camera |
+| `host_jpeg` | nothing extra on the camera: the VIO process converts the depth frame it already has with the same tables and JPEG-encodes it with OpenCV on a worker thread | Pi |
+
+`auto` starts with `manip` because it differs from test11 in the most ways the firmware cares about: the frame comes from a firmware-allocated pool, has a stride and plane offsets, and is `NV12`, which needs no extra gray chroma buffer. A Script frame has none of that: the Script API has no `setStride`, and depthai v3 leaves the stride at 0 unless it is set. If the width is not a multiple of 32, `auto` goes to `host_jpeg` from the start.
+
+The `VideoEncoder` (MJPEG) requirements, from the strings and asserts of the encoder plugin in the RVC2 firmware that depthai 3.3.0 ships (a406121b) and from the depthai-core source:
+
+- type `NV12` or `YUV400p` ("Arrived frame type ({}) is not either NV12 or YUV400p (8-bit Gray)");
+- width a multiple of 32 and height a multiple of 2 ("Width must be multiple of 32, height multiple of 2 for MJPEG encoder profile"), at most 16384×8192;
+- every frame the size of the first ("Arrived frame ({}, {}) does not match the encoder size");
+- `YUV400p` needs an extra gray chroma buffer the encoder reserves ("Encoder couldn't reserve extra space for gray chroma buffer"); `NV12` does not;
+- source, timestamp and sequence metadata present (asserts on all three), so the Script copies the depth frame's timestamp and sequence number;
+- a 64-byte aligned buffer base and size (asserts). Pool buffers are aligned; a Script's `ImgFrame(size)` buffer is not guaranteed to be;
+- only one of its `bitstream` and `out` outputs linked (we link `out`);
+- at the DEBUG log level it logs "VideoEncoder took '{}' ms." for each frame.
+
+`host_jpeg` is the last resort: it uses Pi CPU, and the panel says "encoded on the Pi". The encoder thread is capped at 25 % of one core on average: after an encode that took c seconds of thread CPU, the next one waits c × 3, and frames arriving earlier, or while one is being encoded, are skipped. `/api/status` → `depth_stream.host_encoder` has `cpu_percent` (last 5 s), `cpu_budget_percent`, `frames`, `offered`, `taken`, `skipped_cpu`, `skipped_busy` and `errors`. A 640×400 frame took a few ms on the x86 desktop; the Pi cost is not measured yet.
+
+`/api/status` → `depth_stream` reports `variant` (running), `requested_variant`, `configured_encoding` (the saved setting), `encoded_on` (`camera` or `pi`), `fallback` (`from`, `to`, `reason`, `unix_time`) and `size_problem`. The *Live depth* panel shows them on its *encoding* row.
+
+#### Debug mode (`depth_stream_debug`)
+
+The VIO process always registers a device log callback and keeps the camera's log lines: the last 30 from the stream's nodes (its Script, `VideoEncoder` and `ImageManip`) and the last 10 others, each cut at 300 characters. They are in `/api/status` → `depth_stream.device_log` (`stream`, `other`, `total`) and in the panel's *camera log* box. With *Depth Stream Debug* on, the device log level is raised to DEBUG while a camera variant streams and restored to the previous level when the stream stops or falls back to the Pi (`debug_state`: `active`, `level`, `restore_level`, `error`). At DEBUG the encoder logs "VideoEncoder took '…' ms." per frame, which shows whether frames reach it at all. Other nodes log more at DEBUG too, so leave it off in normal use.
 
 ### Cockpit widget
 
@@ -355,6 +393,23 @@ The extension offers a Cockpit widget, *OAK-D VIO depth*. It shows the live dept
   - With nobody watching, the VIO loop does one clock comparison per frame and one stat every 0.5 s.
   - The page closes both streams while it is hidden.
 - **Options** (in the iframe URL): `?colorize=0` shows gray depth, `?features=0` hides the features, `?status=0` hides the status line.
+
+### 3D pose viewer
+
+The *3D pose* panel on the main page, and the second Cockpit widget *OAK-D VIO 3D pose* (`widget/pose`, declared in `/cockpit_extras.json` with relative URLs and `useExtensionPathAsBaseUrl`, like the depth widget), show the PnP VIO's integrated pose in 3D:
+
+- the vehicle's position and orientation as body axes, a small hull and the camera frustum (70°×45°, pitched down by *Camera Angle*);
+- the trail, a 1 m grid at the start depth, the start axes, and a dashed line from the vehicle up or down to the grid that shows the depth change;
+- x, y, z (m) and roll, pitch, yaw (°) as numbers;
+- orbit controls (drag to rotate, right-drag or two fingers to pan, wheel to zoom), *Reset view* (frames the vehicle and its trail), *Clear trail* (this browser only, kept per VIO run) and *Follow* (keeps the vehicle in the middle).
+
+**Frame `start-FRD`:** the vehicle body frame at VIO start: x forward, y right, z down, in metres. If the vehicle started level, this is NED with north turned to the initial heading. There is no absolute heading or gravity reference, so the attitude is relative to the start as well. roll, pitch and yaw are ZYX (aerospace) Euler angles; `q` is the same rotation as a quaternion `[w, x, y, z]`. In the browser the frame is drawn y-up: FRD (x, y, z) is three.js (y, −z, −x).
+
+**Integration** ([`app/pose_stream.py`](app/pose_stream.py)): each accepted frame chains the deltas sent in `VISION_POSITION_DELTA`, in body FRD: R ← R·exp(rotation delta) (the gyro prior when there is one, else the PnP rotation), then p ← p + R·position delta. The 2D trajectory panel is the yaw-only version of the same chain. Like any dead reckoning it drifts, and the motion and rotation during a [reference reset or recovery](#failed-frames-pnp) are not in it, so roll and pitch also drift after tracking losses.
+
+**Feed:** like the feature stream. While a viewer is connected, `GET /api/stream/pose` touches `pose.lease`; the VIO loop then writes `pose.json` (about 300 bytes) at most 10 times a second and `pose_trail.json` (`[t, x, y, z]` points 5 cm or 2 s apart, at most 1500, thinned to every other point when full) at most once a second, and every 2 s anyway. The server sends the trail once per connection and then each pose; the viewer extends the trail from the poses. With nobody watching, the VIO loop does the integration (a few 3×3 products per frame) and one stat every 0.5 s. Both streaming routes are left out of the OpenAPI schema. The page opens the stream only while the panel is on screen and the tab is visible.
+
+**three.js:** r156 (npm `three` 0.156.1), MIT license, vendored in [`app/static/vendor/three/`](app/static/vendor/three/) with its `LICENSE` and a `README` that gives the sha256 of the unchanged `three.module.min.js` and the one change to `OrbitControls.js` (its import of `'three'` points to the local file, so no import map is needed). Nothing is loaded from a CDN. The main page loads the viewer module only when the panel scrolls into view.
 
 ### DVL overlay
 
@@ -387,7 +442,7 @@ python app/tools/ui_screenshots.py --url http://127.0.0.1:8099/ --out /tmp/ui
 
 ### Mock mode (no OAK-D, no autopilot)
 
-`OAKD_MOCK=1` runs the extension's own server on a PC (x86 is fine), with the configuration page and the Cockpit widget (`/widget/depth`, `/cockpit_extras.json`, `/register_service`) fully working. Unlike the demo server, it is the normal startup: `main.py` launches [`app/mock_vio.py`](app/mock_vio.py) through the same supervisor, instead of `pnp_vio.py`. The fake VIO publishes through the real telemetry, depth-stream, feature-stream, snapshot and depth-probe services, so every server path runs as with a camera. depthai is never imported.
+`OAKD_MOCK=1` runs the extension's own server on a PC (x86 is fine), with the configuration page and the Cockpit widgets (`/widget/depth`, `/widget/pose`, `/cockpit_extras.json`, `/register_service`) fully working. Unlike the demo server, it is the normal startup: `main.py` launches [`app/mock_vio.py`](app/mock_vio.py) through the same supervisor, instead of `pnp_vio.py`. The fake VIO publishes through the real telemetry, depth-stream, feature-stream, snapshot and depth-probe services, so every server path runs as with a camera. depthai is never imported.
 
 ```bash
 python3 -m venv .venv
@@ -395,7 +450,7 @@ python3 -m venv .venv
 cd app
 OAKD_MOCK=1 ../.venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8095
 # or: ../.venv/bin/python main.py --mock --host 127.0.0.1 --port 8095
-# open http://127.0.0.1:8095/ and http://127.0.0.1:8095/widget/depth
+# open http://127.0.0.1:8095/, http://127.0.0.1:8095/widget/depth and http://127.0.0.1:8095/widget/pose
 ```
 
 - **Data:** config, snapshots, telemetry and logs live in `OAKD_MOCK_DIR` (default `/tmp/oakd-vio-mock-<uid>`). On first start the configuration is PnP, 640 x 400 at 10 fps; settings, Start/Stop/Reset and log-only work as usual.
@@ -405,7 +460,9 @@ OAKD_MOCK=1 ../.venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8095
   - a right image warped by the matching disparity.
 - **Features:** tracked features in every state. Most of those on a moving blob are rejected.
 - **Failures:** a turbid spell of 2.5 s every 50 s (counted from the start), where depth drops out and frames fail.
-- **Live data:** telemetry at the configured fps, chip temperature, and the depth MJPEG at `depth_stream_fps`, only while a client holds the lease. The host CPU is the real one.
+- **Motion:** a lawnmower survey that closes every 164 s: four 24 s lanes at 0.35 m/s (about 8.4 m), joined by 90° turns around a short step between lanes. Each step also changes the depth by 0.4 m: two steps down, then two back up. A slow roll and pitch wobble (±2°, ±1.5°) runs on top. The deltas go through the same 3D pose path as on the camera, so the [3D pose viewer](#3d-pose-viewer) draws the survey; the turbid spells (reference resets) make it drift a little, as on the camera.
+- **Live data:** telemetry at the configured fps, chip temperature, the depth MJPEG at `depth_stream_fps` and the pose, each only while a client holds its lease. The host CPU is the real one.
+- **Depth stream encoding:** the camera variants are emulated (`variant`, `encoded_on`, the frame size check, a device log with "VideoEncoder took … ms. (mock)" lines while *Depth Stream Debug* is on); `host_jpeg` uses the real `HostJpegEncoder`, CPU cap included.
 - **Snapshots:** each snapshot shows the scene at its request time. The depth probe and the focal check therefore give real results on the synthetic frames. RGB is "not available".
 - **Autopilot:** simulated and read-only (`mock_mode.MockAutopilot`). The HEARTBEAT is always disarmed, and `POST /api/autopilot/params/read` returns fixed values (some differ from the suggestions). `POST /api/autopilot/params` always answers 403 and writes nothing.
 - **DVL:** the overlay is fed by an in-process fake mavlink2rest.
@@ -460,6 +517,17 @@ After *PnP Recovery After* (`--recovery-frames`, default 20) consecutive failed 
 2. re-initialises the camera's `FeatureTracker` through its `inputConfig` queue, without restarting the pipeline: it sends a config with the feature maintainer off, then the normal config one frame later, to make the tracker detect features from scratch.
 
 If tracking still fails, the wait before the next recovery doubles each time (20, 40, 80, ... frames, up to 16×). A successful frame resets the counter and the wait. Each recovery logs a warning and writes a `recovery` event with `count`, `failed_frames`, `reason`, `features`, `valid_depth`, `matches` and `next_after`. The 10 s summary counts recoveries, and the per-frame `new_features` and `tracked_features` show whether the tracker is re-detecting or stuck on old ids.
+
+## Camera link drops (PnP)
+
+On test11 the XLink connection dropped and depthai reconnected by itself ("Reconnection successful"). VIO frames came back, but snapshots answered 404 until VIO was stopped and started. Host → camera queues can stay stuck after depthai's reconnect: in depthai-core v3.3.0, after a failed write `XLinkOutHost` waits for the new connection without checking whether it already arrived, so a reconnect that happened first leaves it waiting for good. That breaks snapshot requests, the depth stream's on/off control and the feature tracker settings.
+
+The VIO process now restarts its own pipeline when the camera restarts under it (`DeviceRestartWatch` in [`app/device_open.py`](app/device_open.py)):
+
+- Signals: depthai's reconnection callback (`setMaxReconnectionAttempts(1, callback)`, the default of one attempt) reporting `RECONNECTED`, or a frame whose sequence number drops by more than 30, or whose device clock goes back more than 2 s.
+- The first frame of the restarted camera is not used. The pipeline is left (which closes the device and wakes depthai's stuck threads), the camera is reopened with the usual wait and backoff, and a new pipeline starts with a fresh PnP reference. The data log, the MAVLink output, the telemetry and the [3D pose](#3d-pose-viewer) carry on in the same process.
+- The data log gets a `reconnect` event (`count`, `reason`), the VIO log a warning, and `/api/status` → `telemetry` has `reconnects` and `last_reconnect` (`unix_time`, `reason`). A snapshot requested during the drop answers with "the device did not return a frame"; the next one is served by the new pipeline. A streaming depth client is switched on again on the new pipeline by its lease.
+- If depthai's reconnect fails, its queues raise and the process exits; the supervisor restarts it as before.
 
 ## Installing
 
@@ -528,6 +596,8 @@ The image is built in two stages so that the slow part only runs once:
 | `app/cockpit_widget.py` | BlueOS service metadata, the Cockpit extras JSON and the widget's status line |
 | `app/depth_stream.py` | Live depth stream: on-camera 8-bit conversion Script, VIO-side service, `main.py` reader |
 | `app/feature_stream.py` | Tracked features for the widget: VIO-side lease-gated publisher, `main.py` reader and SSE framing |
+| `app/pose_stream.py` | 3D pose for the pose viewer: integrator, VIO-side lease-gated publisher, `main.py` reader |
+| `app/static/pose3d.js`, `pose_widget.html`, `pose_icon.svg`, `vendor/three/` | The 3D pose viewer (main-page panel and Cockpit widget page) and the vendored three.js r156 |
 | `app/config_schema.py` | Every setting: schema, defaults, server-side validation, form fields |
 | `app/vio_telemetry.py` | PnP live status and plot history: ring buffer and publisher (VIO process), readers (`main.py`) |
 | `app/dvl_source.py` | Optional DVL velocity overlay read from mavlink2rest |
@@ -556,4 +626,6 @@ The image is built in two stages so that the slow part only runs once:
 - `VISION_POSITION_DELTA` reports a fixed confidence of 100% and no rotation delta.
 - At startup the VIO process waits up to 30 s (`--device-timeout`) for the OAK-D to be discoverable and to open, retrying with backoff, and then exits with code 2. A PoE OAK-D can take many seconds to come back after the previous pipeline closed; opening it too early has been seen to segfault inside depthai.
 - If the VIO process exits without being stopped from the page (error, crash or segfault), `main.py` restarts it after 2 s, doubling up to 30 s; the delay resets after a run of 60 s. `/api/status` reports `restart_count`, `last_exit_code` (negative for a signal, e.g. -11 for SIGSEGV) and `restart_in`.
+- Depth stream: on test11 the camera's `VideoEncoder` returned nothing for `YUV400p` frames from the Script. `manip`, `nv12` and the device log at DEBUG are untested on hardware; `auto` falls back to encoding on the Pi (`host_jpeg`, capped at 25 % of a core, Pi cost not measured).
+- 3D pose: dead reckoning from the deltas, relative to the start (no absolute heading or gravity); position and attitude drift, and motion during reference resets and recoveries is missing.
 - Web UI: the plots lag by up to about a second (history is published once a second); the plots and the trajectory start over when VIO restarts; the DVL overlay has no history from before the page was opened. Live telemetry, the feature overlay and the chip temperature are PnP only. The web UI was developed against the demo server only; on a vehicle the DVL discovery, `getChipTemperature()` and the Pi CPU cost of the publisher are unverified.

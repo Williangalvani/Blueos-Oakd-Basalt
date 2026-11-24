@@ -62,15 +62,17 @@ def test_extras_json_matches_the_cockpit_schema(client):
     assert extras == cockpit_widget.cockpit_extras()
     check_fields(extras, EXTRAS_FIELDS)
     assert extras["targetSystem"] == "Cockpit" and re.fullmatch(r"\d+\.\d+\.\d+", extras["targetCockpitApiVersion"])
-    (widget,) = extras["widgets"]
-    check_fields(widget, WIDGET_FIELDS)
-    # .refine(): either iconUrl or iframeIcon
-    assert "iconUrl" in widget or "iframeIcon" in widget
-    assert widget["name"] == "OAK-D VIO depth"
-    # Relative to the extension: Cockpit prefixes /extensionv2/<name>, so both must start with "/"
-    assert widget["useExtensionPathAsBaseUrl"] is True
-    assert widget["iframeUrl"] == "/widget/depth" and widget["iconUrl"].startswith("/")
-    assert widget["contentZoom"] == 1 and widget["scaleContentWithWidget"] is True
+    depth, pose = extras["widgets"]
+    for widget in (depth, pose):
+        check_fields(widget, WIDGET_FIELDS)
+        # .refine(): either iconUrl or iframeIcon
+        assert "iconUrl" in widget or "iframeIcon" in widget
+        # Relative to the extension: Cockpit prefixes /extensionv2/<name>, so both must start with "/"
+        assert widget["useExtensionPathAsBaseUrl"] is True and widget["iconUrl"].startswith("/")
+        assert widget["contentZoom"] == 1 and widget["scaleContentWithWidget"] is True
+    assert depth["name"] == "OAK-D VIO depth" and depth["iframeUrl"] == "/widget/depth"
+    assert pose["name"] == "OAK-D VIO 3D pose" and pose["iframeUrl"] == "/widget/pose"
+    assert pose["iconUrl"] == "/static/pose_icon.svg" and len({depth["name"], pose["name"]}) == 2
     assert extras["actions"] == []
 
 
@@ -129,16 +131,29 @@ def test_cockpit_discovery_through_the_blueos_proxy(client):
 
     extras = through_proxy(extras_url).json()
     extension_path = urlparse(base_url).path
-    (widget,) = extras["widgets"]
-    source = extension_path + widget["iframeUrl"] if widget["useExtensionPathAsBaseUrl"] else widget["iframeUrl"]
-    icon = base_url + widget["iconUrl"]
-    iframe = f"http://{vehicle}{source}"  # useVehicleAddressAsBase
-    assert iframe == "http://192.168.2.2/extensionv2/oakdvio/widget/depth"
-    assert icon == "http://192.168.2.2/extensionv2/oakdvio/static/widget_icon.svg"
-    page = through_proxy(iframe)
-    assert page.status_code == 200 and "text/html" in page.headers["content-type"]
-    svg = through_proxy(icon)
-    assert svg.status_code == 200 and "svg" in svg.headers["content-type"] and "<svg" in svg.text
+    expected = {"/widget/depth": "/static/widget_icon.svg", "/widget/pose": "/static/pose_icon.svg"}
+    for widget in extras["widgets"]:
+        source = extension_path + widget["iframeUrl"] if widget["useExtensionPathAsBaseUrl"] else widget["iframeUrl"]
+        icon = base_url + widget["iconUrl"]
+        iframe = f"http://{vehicle}{source}"  # useVehicleAddressAsBase
+        assert iframe == "http://192.168.2.2/extensionv2/oakdvio" + widget["iframeUrl"]
+        assert icon == "http://192.168.2.2/extensionv2/oakdvio" + expected[widget["iframeUrl"]]
+        page = through_proxy(iframe)
+        assert page.status_code == 200 and "text/html" in page.headers["content-type"]
+        svg = through_proxy(icon)
+        assert svg.status_code == 200 and "svg" in svg.headers["content-type"] and "<svg" in svg.text
+    assert set(expected) == {widget["iframeUrl"] for widget in extras["widgets"]}
+
+    # The pose widget's module and its vendored three.js, resolved the way the page's script resolves them
+    page = through_proxy(f"http://{vehicle}/extensionv2/{name}/widget/pose").text
+    base = re.search(r"location\.pathname\.replace\((/.+?/), ''\)", page).group(1)
+    assert base == r"/widget\/pose\/?$/"
+    page_base = f"http://{vehicle}/extensionv2/{name}/"
+    module = through_proxy(page_base + "static/pose3d.js")
+    assert module.status_code == 200 and "javascript" in module.headers["content-type"]
+    for path in re.findall(r"from '\./(vendor/three/[\w.]+)'", module.text):
+        vendored = through_proxy(page_base + "static/" + path)
+        assert vendored.status_code == 200 and "javascript" in vendored.headers["content-type"], path
 
 
 # --- widget page ----------------------------------------------------------------------------------

@@ -1,0 +1,9 @@
+three.js r156 (npm three 0.156.1), MIT License (LICENSE in this directory), Copyright 2010-2023 three.js authors.
+
+three.module.min.js  build/three.module.min.js, unchanged
+                     sha256 cfdc51fe615e6991313a1ad45a67a12504ad288aa124669f2268361062530585
+OrbitControls.js     examples/jsm/controls/OrbitControls.js with one change: the import specifier 'three' is
+                     './three.module.min.js', so it loads without an import map (upstream
+                     sha256 857061a12a014e5f6447582a4d2eb6d45547e2684bb5f170ca426e532bfe5b90)
+
+Served from the extension itself (no CDN) for the 3D pose viewer (static/pose3d.js).

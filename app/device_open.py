@@ -3,15 +3,20 @@ Wait for the OAK-D to become available, then open it, retrying with exponential 
 
 A PoE OAK-D that was just released by a previous pipeline can take many seconds to be
 discoverable again, and opening it too early has been seen to segfault inside depthai.
-The backoff logic is depthai-free so it can be unit tested with fake callables.
+The backoff logic and DeviceRestartWatch are depthai-free so they can be unit tested with fakes.
 """
 
+import threading
 import time
 
 DEFAULT_TIMEOUT = 30.0
 INITIAL_DELAY = 0.5
 MAX_DELAY = 5.0
 SETTLE_DELAY = 1.0
+# DeviceRestartWatch: a frame this many sequence numbers, or this many seconds of device clock, behind the
+# previous one means the camera started over
+SEQUENCE_RESTART_MARGIN = 30
+CLOCK_RESTART_S = 2.0
 
 
 class DeviceOpenTimeout(RuntimeError):
@@ -62,6 +67,51 @@ def wait_and_open(discover, open_device, timeout=DEFAULT_TIMEOUT, initial_delay=
         log(f"⏳ Retrying in {wait:.1f}s ({remaining:.1f}s left)")
         sleep(wait)
         delay = min(delay * 2, max_delay)
+
+
+class DeviceRestartWatch:
+    """
+    Notices the OAK restarting under a running pipeline. On an XLink error depthai reconnects by itself
+    (it reboots the device with the same pipeline and logs "Reconnection successful"): frames come back,
+    but host -> device queues (snapshot requests, depth stream control, feature tracker config) can stay
+    stuck, as depthai's XLinkOutHost only waits for the new connection after one of its writes failed. The
+    caller restarts the pipeline when this triggers.
+
+    Signals: depthai's reconnection callback (on_reconnection, called on its monitor thread) reporting
+    RECONNECTED, or on_frame seeing the frame sequence number or the device clock start over.
+    """
+
+    def __init__(self, log=print, sequence_margin=SEQUENCE_RESTART_MARGIN, clock_margin_s=CLOCK_RESTART_S):
+        self.log = log
+        self.sequence_margin = sequence_margin
+        self.clock_margin_s = clock_margin_s
+        self._event = threading.Event()
+        self.reason = None
+        self._last = None
+
+    @property
+    def triggered(self):
+        return self._event.is_set()
+
+    def trigger(self, reason):
+        if not self._event.is_set():
+            self.reason = reason
+            self._event.set()
+
+    def on_reconnection(self, status):
+        name = str(getattr(status, "name", status)).rsplit(".", 1)[-1]
+        self.log(f"depthai reconnection: {name}")
+        if name == "RECONNECTED":
+            self.trigger("depthai reconnected to the camera after a link error")
+
+    def on_frame(self, sequence, device_time_s):
+        """True if the camera restarted (this frame is from the new session)."""
+        last, self._last = self._last, (sequence, device_time_s)
+        if last is not None and (sequence + self.sequence_margin < last[0]
+                                 or device_time_s + self.clock_margin_s < last[1]):
+            self.trigger(f"the camera restarted: frame sequence {last[0]} -> {sequence}, "
+                         f"device clock {last[1]:.1f} -> {device_time_s:.1f} s")
+        return self.triggered
 
 
 def open_oak_device(timeout=DEFAULT_TIMEOUT, log=print):

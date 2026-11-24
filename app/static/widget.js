@@ -261,9 +261,13 @@ function renderStatus(s) {
     parts.push(error);
   }
   if (!s.problem && d.encoder_stalled) {
-    const stalled = span('depth: camera encoder outputs nothing', 'bad');
+    const stalled = span('depth: ' + (d.encoded_on === 'pi' ? 'Pi' : 'camera') + ' encoder outputs nothing', 'bad');
     if (d.last_error) stalled.title = d.last_error.text;
     parts.push(stalled);
+  } else if (!s.problem && d.streaming && d.encoded_on === 'pi') {
+    const pi = span('depth: encoded on the Pi', 'muted');
+    if (d.fallback) pi.title = 'fell back from ' + d.fallback.from + ': ' + d.fallback.reason;
+    parts.push(pi);
   }
   line.replaceChildren(...parts);
 

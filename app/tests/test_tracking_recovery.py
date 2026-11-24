@@ -418,10 +418,13 @@ def test_parse_args_depth_stream(pnp_vio, capsys):
     assert (args.depth_stream, args.depth_stream_fps, args.depth_stream_quality) == (False, 2.5, 40)
     for bad in (["--depth-stream-fps", "0"], ["--depth-stream-fps", "61"], ["--depth-stream-fps", "nan"],
                 ["--depth-stream-quality", "0"], ["--depth-stream-quality", "101"],
-                ["--depth-stream-quality", "x"]):
+                ["--depth-stream-quality", "x"], ["--depth-stream-encoding", "h264"]):
         with pytest.raises(SystemExit):
             pnp_vio.parse_args(bad)
     assert "depth stream fps" in capsys.readouterr().err
+    assert (args.depth_stream_encoding, args.depth_stream_debug) == ("auto", False)
+    args = pnp_vio.parse_args(["--depth-stream-encoding", "host_jpeg", "--depth-stream-debug"])
+    assert (args.depth_stream_encoding, args.depth_stream_debug) == ("host_jpeg", True)
 
 
 def fake_dai_pipeline():
@@ -458,17 +461,24 @@ def test_build_pipeline_encodes_the_depth_stream_on_the_camera(pnp_vio):
     (stereo,) = nodes_of(created, dai.node.StereoDepth)
     snapshot_script, stream_script = nodes_of(created, dai.node.Script)
     (encoder,) = nodes_of(created, dai.node.VideoEncoder)
+    (manip,) = nodes_of(created, dai.node.ImageManip)
 
-    # stereo.depth -> Script (8-bit conversion) -> MJPEG encoder, all inputs non-blocking and small
+    # stereo.depth -> Script (8-bit GRAY8) -> ImageManip (NV12) -> MJPEG encoder, all inputs non-blocking and small
     depth_in = stream_script.inputs["depth"]
     assert mock.call(depth_in) in stereo.depth.link.call_args_list
     depth_in.setBlocking.assert_called_with(False)
     depth_in.setMaxSize.assert_called_with(1)
     stream_script.inputs["control"].setBlocking.assert_called_with(False)
-    stream_script.outputs["gray"].link.assert_called_once_with(encoder.input)
+    stream_script.outputs["gray"].link.assert_called_once_with(manip.inputImage)
+    manip.out.link.assert_called_once_with(encoder.input)
+    manip.initialConfig.setFrameType.assert_called_once_with(dai.ImgFrame.Type.NV12)
+    manip.setMaxOutputFrameSize.assert_called_once_with(401408)
+    manip.setNumFramesPool.assert_called_once_with(3)
+    manip.inputImage.setBlocking.assert_called_with(False)
+    manip.inputImage.setMaxSize.assert_called_with(1)
     code = stream_script.setScript.call_args[0][0]
     compile(code, "depth_stream_script", "exec")
-    assert "every = 3" in code
+    assert "every = 3" in code and "ImgFrame.Type.GRAY8" in code
     encoder.setDefaultProfilePreset.assert_called_once_with(5.0, dai.VideoEncoderProperties.Profile.MJPEG)
     encoder.setQuality.assert_called_once_with(70)
     encoder.input.setBlocking.assert_called_with(False)
@@ -484,9 +494,44 @@ def test_build_pipeline_encodes_the_depth_stream_on_the_camera(pnp_vio):
     assert info["fps_target"] == 5.0 and info["every"] == 3 and info["quality"] == 70
     assert info["depth_range_mm"][1] == 4000 and info["quantization_mm"] == 16
     assert info["image_size"] == [640, 400]
+    assert info["requested_variant"] == "auto" and info["variant"] == "manip" and info["size_problem"] is None
+    assert len(handles.depth_stream_nodes) == 3  # the device log names of the Script, encoder and ImageManip
     # One more stereo frame per gate queue (snapshots) and two for the stream Script
     stereo.setNumFramesPool.assert_called_once_with(pnp_vio.STEREO_FRAMES_POOL + 3)
     assert snapshot_script is not stream_script
+
+
+@pytest.mark.parametrize("variant, frame_type", [("nv12", "NV12"), ("yuv400p", "YUV400p")])
+def test_build_pipeline_feeds_the_encoder_from_the_script(pnp_vio, variant, frame_type):
+    dai = pnp_vio.dai
+    handles, created = build_fake_pipeline(pnp_vio, ["--depth-stream-encoding", variant])
+    _, stream_script = nodes_of(created, dai.node.Script)
+    (encoder,) = nodes_of(created, dai.node.VideoEncoder)
+    assert nodes_of(created, dai.node.ImageManip) == []
+    stream_script.outputs["gray"].link.assert_called_once_with(encoder.input)
+    code = stream_script.setScript.call_args[0][0]
+    assert f"ImgFrame.Type.{frame_type})" in code
+    assert handles.depth_stream_info["variant"] == variant == handles.depth_stream_info["requested_variant"]
+    assert handles.depth_stream_queue is encoder.out.createOutputQueue.return_value
+
+
+def test_build_pipeline_host_jpeg_adds_nothing_on_the_camera(pnp_vio):
+    dai = pnp_vio.dai
+    handles, created = build_fake_pipeline(pnp_vio, ["--depth-stream-encoding", "host_jpeg"])
+    assert len(nodes_of(created, dai.node.Script)) == 1  # the snapshot gate only
+    assert nodes_of(created, dai.node.VideoEncoder) == [] and nodes_of(created, dai.node.ImageManip) == []
+    assert handles.depth_stream_control_queue is None and handles.depth_stream_queue is None
+    assert handles.depth_stream_info["variant"] == "host_jpeg" and handles.depth_stream_nodes == ()
+    (stereo,) = nodes_of(created, dai.node.StereoDepth)
+    stereo.setNumFramesPool.assert_called_once_with(pnp_vio.STEREO_FRAMES_POOL + 1)
+
+
+def test_build_pipeline_auto_goes_to_the_pi_for_a_size_the_encoder_rejects(pnp_vio):
+    dai = pnp_vio.dai
+    handles, created = build_fake_pipeline(pnp_vio, ["--width", "600", "--height", "400"])
+    assert nodes_of(created, dai.node.VideoEncoder) == []
+    info = handles.depth_stream_info
+    assert info["variant"] == "host_jpeg" and "32" in info["size_problem"]
 
 
 def test_build_pipeline_without_the_depth_stream(pnp_vio):
@@ -577,6 +622,112 @@ def test_run_publishes_the_tracked_features_while_leased(pnp_vio, monkeypatch, t
 def test_run_without_a_feature_watcher_writes_nothing(pnp_vio, monkeypatch, tmp_path):
     run_fake(pnp_vio, monkeypatch, tmp_path, scenario(n_good=4, n_lost=0, n_back=0), [])
     assert not (tmp_path / "snapshots" / "telemetry" / feature_stream.FEATURES_FILE).exists()
+
+
+def session_handles(module, groups, snapshot_reply=True):
+    """One pipeline's queues. snapshot_reply=False: the host -> device queue is stuck, as after an XLink reconnect."""
+    snapshot_queue, request_queue = FakeQueue(), FakeQueue()
+    if snapshot_reply:
+        request_queue.send = lambda msg: (request_queue.sent.append(msg), snapshot_queue.items.append(
+            FakeMsg(99, 1.5, frame=DEPTH)))
+    return module.PipelineHandles(
+        sync_queue=FakeQueue(groups), imu_queue=FakeQueue(), feature_config_queue=FakeQueue(),
+        stereo_effective={"decimation": 1}, snapshot_request_queue=request_queue, snapshot_queue=snapshot_queue,
+        snapshot_streams=("rect_left", "rect_right", "depth"), snapshot_unavailable={"rgb": "no CAM_A"},
+        depth_stream_control_queue=FakeQueue(), depth_stream_queue=FakeQueue(), depth_stream_status_queue=FakeQueue(),
+        depth_stream_info={"fps_target": 5.0, "depth_range_mm": [300, 4000], "variant": "nv12",
+                           "requested_variant": "nv12"})
+
+
+def run_sessions(module, monkeypatch, tmp_path, sessions, between=None, devices=None):
+    """main() over several pipelines: each open_oak_device returns a new device, build_pipeline its handles."""
+    devices = [] if devices is None else devices
+    telemetries = []
+
+    def open_device(timeout, log):
+        if devices and between is not None:
+            between(len(devices))
+        devices.append(mock.MagicMock(name=f"device{len(devices)}"))
+        return devices[-1]
+
+    real = module.vio_telemetry.Telemetry
+
+    class Recorded(real):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            telemetries.append(self)
+
+    monkeypatch.setattr(module.vio_telemetry, "Telemetry", Recorded)
+    monkeypatch.setattr(module, "open_oak_device", open_device)
+    monkeypatch.setattr(module, "build_pipeline", lambda p, device, args, settings: sessions[len(devices) - 1])
+    monkeypatch.setattr(module.dai, "Pipeline", lambda device: FakePipeline(sessions[len(devices) - 1].sync_queue))
+    monkeypatch.setattr(module.dai, "FeatureTrackerConfig", lambda: mock.MagicMock())
+    monkeypatch.setattr(module.dai, "Buffer", lambda: mock.MagicMock())
+    module.main(["--log-only", "--gyro-gate", "0", "--snapshot-dir", str(tmp_path / "snapshots")])
+    (log_file,) = (tmp_path / "logs").iterdir()
+    return [json.loads(line) for line in log_file.read_text().splitlines()], devices, telemetries[0]
+
+
+def test_run_restarts_the_pipeline_when_the_camera_restarts(pnp_vio, monkeypatch, tmp_path):
+    """
+    test11: after an XLink drop depthai reconnected by itself, VIO frames came back, but the snapshot
+    request queue was stuck (404 until a VIO stop/start). Now the first frame of the restarted camera ends
+    the session; the camera is reopened with a new pipeline whose queues work.
+    """
+    telemetry_dir = tmp_path / "snapshots" / "telemetry"
+    depth_stream.touch_lease(telemetry_dir)
+
+    def renumbered(groups, first_sequence, first_t):
+        return [{key: FakeMsg(first_sequence + n, first_t + 0.1 * n, frame=msg.frame, features=msg.trackedFeatures)
+                 for key, msg in group.items()} for n, group in enumerate(groups)]
+
+    first = renumbered(scenario(n_good=6, n_lost=0, n_back=0), 500, 60.0)  # running for a minute
+    restarted = renumbered(scenario(n_good=5, n_lost=0, n_back=0), 0, 0.2)
+    stuck = session_handles(pnp_vio, first + restarted[:1], snapshot_reply=False)
+    fresh = session_handles(pnp_vio, restarted[1:])
+
+    def between(opened):
+        snapshots.request_snapshot("depth", tmp_path / "snapshots")
+        depth_stream.touch_lease(telemetry_dir)
+
+    lines, devices, telemetry = run_sessions(pnp_vio, monkeypatch, tmp_path, [stuck, fresh], between)
+    steps = [line for line in lines if line["type"] == "step"]
+    # Session 1: 6 frames; the restarted camera's first frame is dropped; session 2: 4 frames from a new reference
+    assert [s["sequence"] for s in steps] == [500, 501, 502, 503, 504, 505, 1, 2, 3, 4]
+    assert [s["reason"] for s in steps].count("no_reference") == 2
+    (reconnect,) = [line for line in lines if line.get("event") == "reconnect"]
+    assert reconnect["count"] == 1 and "the camera restarted: frame sequence 505 -> 0" in reconnect["reason"]
+    assert len(devices) == 2 and devices[0].close.called and not devices[1].close.called
+    # Every session registers for depthai's reconnection callback
+    assert all(d.setMaxReconnectionAttempts.call_args[0][0] == 1 for d in devices)
+    # The new pipeline's queues: the snapshot is served, the depth stream switched on again
+    assert [m.setSequenceNum.call_args[0][0] for m in fresh.snapshot_request_queue.sent] == [
+        snapshots.STREAMS.index("depth")]
+    assert snapshots.read_metadata("depth", tmp_path / "snapshots")["sequence"] == 99
+    assert [m.setSequenceNum.call_args[0][0] for m in fresh.depth_stream_control_queue.sent] == [1]
+    assert [m.setSequenceNum.call_args[0][0] for m in stuck.depth_stream_control_queue.sent] == [1]
+    assert telemetry.extra["reconnects"] == 1 and "restarted" in telemetry.extra["last_reconnect"]["reason"]
+    assert sum(1 for line in lines if line.get("event") == "depth_stream") == 2
+
+
+def test_run_restarts_the_pipeline_on_depthais_reconnected_callback(pnp_vio, monkeypatch, tmp_path):
+    first = session_handles(pnp_vio, scenario(n_good=8, n_lost=0, n_back=0))
+    second = session_handles(pnp_vio, scenario(n_good=3, n_lost=0, n_back=0))
+    devices = []
+    real_get = first.sync_queue.get
+
+    def get():  # depthai's monitor thread reports RECONNECTED while the host waits for frame 4
+        if len(first.sync_queue.items) == 4:
+            devices[0].setMaxReconnectionAttempts.call_args[0][1](SimpleNamespace(name="RECONNECTED"))
+        return real_get()
+
+    first.sync_queue.get = get
+    lines, _, _ = run_sessions(pnp_vio, monkeypatch, tmp_path, [first, second], devices=devices)
+    steps = [line for line in lines if line["type"] == "step"]
+    # Frame 4 arrived after the reconnect: not used; the next session starts over on the new pipeline
+    assert [s["sequence"] for s in steps] == [0, 1, 2, 3, 0, 1, 2]
+    (reconnect,) = [line for line in lines if line.get("event") == "reconnect"]
+    assert "depthai reconnected" in reconnect["reason"] and len(devices) == 2
 
 
 def test_run_with_the_depth_stream_disabled_logs_it(pnp_vio, monkeypatch, tmp_path):

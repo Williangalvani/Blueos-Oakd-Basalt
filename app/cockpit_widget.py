@@ -1,5 +1,6 @@
 """
-BlueOS service metadata and the Cockpit external widget (live depth + tracked features).
+BlueOS service metadata and the Cockpit external widgets: live depth + tracked features (/widget/depth) and
+the 3D pose viewer (/widget/pose).
 
 Discovery:
 1. BlueOS's helper scans the listening ports and reads GET /register_service (service_metadata()). Its
@@ -23,6 +24,9 @@ EXTRAS_PATH = "/cockpit_extras.json"
 WIDGET_PATH = "/widget/depth"
 WIDGET_ICON_PATH = "/static/widget_icon.svg"
 WIDGET_NAME = "OAK-D VIO depth"
+POSE_WIDGET_PATH = "/widget/pose"
+POSE_WIDGET_ICON_PATH = "/static/pose_icon.svg"
+POSE_WIDGET_NAME = "OAK-D VIO 3D pose"
 COCKPIT_API_VERSION = "1.0.0"
 
 
@@ -42,21 +46,26 @@ def service_metadata():
     }
 
 
+def _widget(name, path, icon):
+    return {
+        "name": name,
+        "iframeUrl": path,
+        "iconUrl": icon,
+        "version": VERSION,
+        "useExtensionPathAsBaseUrl": True,
+        # The page fills its iframe and scales its own drawing; Cockpit's zoom only affects the text
+        "contentZoom": 1,
+        "scaleContentWithWidget": True,
+    }
+
+
 def cockpit_extras():
-    """GET /cockpit_extras.json: Cockpit's ExtrasJsonSchema with one ExternalWidgetSetupInfo."""
+    """GET /cockpit_extras.json: Cockpit's ExtrasJsonSchema with two ExternalWidgetSetupInfo (depth, 3D pose)."""
     return {
         "targetSystem": "Cockpit",
         "targetCockpitApiVersion": COCKPIT_API_VERSION,
-        "widgets": [{
-            "name": WIDGET_NAME,
-            "iframeUrl": WIDGET_PATH,
-            "iconUrl": WIDGET_ICON_PATH,
-            "version": VERSION,
-            "useExtensionPathAsBaseUrl": True,
-            # The page fills its iframe and scales its own drawing; Cockpit's zoom only affects the text
-            "contentZoom": 1,
-            "scaleContentWithWidget": True,
-        }],
+        "widgets": [_widget(WIDGET_NAME, WIDGET_PATH, WIDGET_ICON_PATH),
+                    _widget(POSE_WIDGET_NAME, POSE_WIDGET_PATH, POSE_WIDGET_ICON_PATH)],
         "actions": [],
     }
 
@@ -102,5 +111,5 @@ def widget_status(problem, telemetry, depth, log_only, now, mock=False):
         "mock": bool(mock),
         "depth": {key: depth.get(key) for key in (
             "enabled", "streaming", "fps", "fps_target", "image_size", "depth_range_mm", "gray_far", "gray_near",
-            "gray_invalid_below", "errors", "last_error", "encoder_stalled")},
+            "gray_invalid_below", "errors", "last_error", "encoder_stalled", "variant", "encoded_on", "fallback")},
     }

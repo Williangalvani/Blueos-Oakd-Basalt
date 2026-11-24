@@ -18,6 +18,8 @@ from stereo_config import (DEFAULT_LEVER_ARM_M, DEFAULT_REFRACTIVE_INDEX, DEPTH_
                            parse_intrinsics_override, parse_lever_arm)
 
 DVL_SOURCES = ("auto", "off")
+# depth_stream.VARIANTS (kept here so the schema does not import the stream code)
+DEPTH_STREAM_ENCODINGS = ("auto", "manip", "nv12", "yuv400p", "host_jpeg")
 VEHICLE_IP_RE = re.compile(r"^[A-Za-z0-9.\-:\[\]]+$")
 
 GROUPS = (
@@ -107,6 +109,14 @@ CONFIG_FIELDS = (
     ConfigField("depth_stream_quality", "int", 70, "Depth Stream JPEG Quality",
                 "PnP only: MJPEG quality on the camera (lower = less USB bandwidth)", minimum=10, maximum=100,
                 step=1),
+    ConfigField("depth_stream_encoding", "choice", "auto", "Depth Stream Encoding",
+                "PnP only: auto = manip, then host_jpeg if the camera encoder outputs nothing; manip = ImageManip "
+                "converts to NV12 for the camera encoder; nv12 / yuv400p = the Script builds the encoder's frame; "
+                "host_jpeg = the Pi encodes (uses Pi CPU, capped at 25 % of a core)",
+                choices=DEPTH_STREAM_ENCODINGS),
+    ConfigField("depth_stream_debug", "bool", False, "Depth stream camera debug log",
+                "PnP only: while the depth stream runs, the camera logs at DEBUG level and the stream nodes' log "
+                "lines appear under Live depth (and /api/status); back to normal when the stream stops"),
 
     ConfigField("algorithm", "choice", "basalt", "Algorithm", "PnP ignores the Basalt tuning", "camera",
                 choices=("basalt", "pnp")),

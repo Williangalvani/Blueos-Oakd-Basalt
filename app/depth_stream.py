@@ -1,13 +1,43 @@
 """
-Live depth stream of the PnP VIO for the web page, encoded on the OAK-D.
+Live depth stream of the PnP VIO for the web page, encoded on the OAK-D (or, as a last resort, on the Pi).
 
 Device (pnp_vio.build_depth_stream): a Script node takes stereo.depth (the same thresholded, filtered
 depth the VIO uses) from a non-blocking size-1 queue and, only while the host enabled it, every
 `every`-th frame turns the RAW16 millimetres into an 8-bit image with C-speed byte operations (strided
 byte slices, bytes.translate tables, one big-integer OR per chunk of rows; see device_script). A
-VideoEncoder node encodes that 8-bit frame (type YUV400p) as MJPEG and only the JPEG crosses the link. The VIO process
-writes it as-is to DIRECTORY/depth_stream.jpg; main.py forwards it as multipart/x-mixed-replace.
-Nothing is decoded or re-encoded on the Pi; the browser colorizes the gray image.
+VideoEncoder node encodes it as MJPEG and only the JPEG crosses the link. The VIO process writes it as-is
+to DIRECTORY/depth_stream.jpg; main.py forwards it as multipart/x-mixed-replace. The browser colorizes
+the gray image.
+
+Encoding variants (depth_stream_encoding, VARIANTS), all with the same gray scale:
+    manip      Script -> GRAY8 frame -> ImageManip (to NV12) -> VideoEncoder. The encoder gets a frame the
+               firmware allocated itself: explicit stride, plane offsets, aligned pool buffer.
+    nv12       Script -> NV12 frame (the gray plane + a 128 chroma plane, w*h*3/2 bytes) -> VideoEncoder
+    yuv400p    Script -> YUV400p frame (w*h bytes) -> VideoEncoder
+    host_jpeg  nothing extra on the camera: the VIO process converts the depth frame it already has and
+               JPEG-encodes it on a worker thread (HostJpegEncoder), capped at HOST_CPU_BUDGET of a core
+    auto       (default) manip, switching to host_jpeg for the rest of the run if the encoder stalls
+The Script variants build their frame with the Script runtime's ImgFrame API (DEVICE_IMGFRAME_API), which
+has no setStride: the host library's v3 ImgFrame leaves fb.stride at 0 unless set, so a Script frame may
+reach the encoder without a stride. ImageManip writes stride and plane offsets itself.
+
+VideoEncoder (MJPEG) input requirements, from the RVC2 firmware a406121b (depthai-core v3.3.0) strings and
+asserts of its PlgVidEnc and the depthai-core source:
+- type NV12 or YUV400p ("Arrived frame type ({}) is not either NV12 or YUV400p (8-bit Gray)"); GRAY8 (30)
+  is dropped, which is why manip converts to NV12 first;
+- width a multiple of 32 and height a multiple of 2 ("Width must be multiple of 32, height multiple of 2
+  for MJPEG encoder profile"), at most 16384 x 8192;
+- every frame the size of the first one ("Arrived frame ({}, {}) does not match the encoder size"; asserts
+  frm->fb.spec.width == FrameInfo.iWidth and height);
+- YUV400p needs an extra gray chroma buffer the encoder reserves ("Encoder couldn't reserve extra space for
+  gray chroma buffer", maxGrayChromaBufferSize != -1); NV12 does not;
+- source, timestamp and sequence metadata present (asserts pSrcMeta, pPtsMeta, pSeqMeta != nullptr), so the
+  Script copies the depth frame's timestamp and sequence number;
+- 64-byte aligned buffer base and size (asserts ((uint32_t)frm->base & 63) == 0, (frm->size & 63) == 0):
+  pool buffers are; a Script's ImgFrame(size) buffer is not guaranteed to be;
+- only one of the 'bitstream' and 'out' outputs may be linked;
+- with the debug log level it logs "VideoEncoder took '{}' ms." per frame (depth_stream_debug).
+WIDTH_ALIGN and HEIGHT_ALIGN check the size before building the pipeline.
 
 8-bit encoding (linear in depth over the stereo threshold range, near bright):
     0                      invalid (no depth, or outside min_mm..max_mm, as the VIO sees it)
@@ -23,13 +53,18 @@ Errors: the Script counts failed frames and sends the count with the last error 
 output, and while streaming its count of frames sent about once a second; the VIO process publishes them in
 DIRECTORY/depth_stream.json, which /api/status serves. The encoder drops frames it can't take with only a
 device log warning, so the VIO process flags the stream (encoder_stalled) when the Script keeps sending and
-no JPEG comes back.
+no JPEG comes back. HostJpegEncoder sends the same reports, so the flag works for every variant.
+
+Device log: DeviceLog keeps the camera's log lines (VideoEncoder, ImageManip and the stream Script first),
+which the metadata carries. With depth_stream_debug, DeviceLogDebug raises the device log level to DEBUG
+while the stream runs and restores it when the stream stops.
 
 depthai-free so it can be unit tested.
 """
 
 import json
 import os
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -67,8 +102,56 @@ DEVICE_IMGFRAME_API = frozenset({
     "getInstanceNum", "setInstanceNum", "getCategory", "setCategory", "getTransformation", "setTransformation",
 })
 # Frame types the RVC2 VideoEncoder takes; it drops others with "Arrived frame type (N) is not either NV12 or
-# YUV400p (8-bit Gray)" (GRAY8 is N = 30). YUV400p is GRAY8's single 8-bit plane, stride = width.
+# YUV400p (8-bit Gray)" (GRAY8 is N = 30). YUV400p is GRAY8's single 8-bit plane.
 DEVICE_ENCODER_INPUT_TYPES = frozenset({"NV12", "YUV400p"})
+# MJPEG profile: width a multiple of 32, height a multiple of 2
+WIDTH_ALIGN = 32
+HEIGHT_ALIGN = 2
+
+AUTO, MANIP, NV12, YUV400P, HOST_JPEG = "auto", "manip", "nv12", "yuv400p", "host_jpeg"
+VARIANTS = (AUTO, MANIP, NV12, YUV400P, HOST_JPEG)
+DEFAULT_VARIANT = AUTO
+# The frame type the Script builds for each variant that runs on the camera
+SCRIPT_FRAME_TYPES = {MANIP: "GRAY8", NV12: "NV12", YUV400P: "YUV400p"}
+# host_jpeg: at most this fraction of one Pi core on average
+HOST_CPU_BUDGET = 0.25
+HOST_STATS_EVERY = 50
+# ImageManip output buffers (depthai-core ImageManipImpl: DEPTHAI_STRIDE/HEIGHT/PLANE_ALIGNMENT)
+MANIP_STRIDE_ALIGN = 128
+MANIP_HEIGHT_ALIGN = 32
+MANIP_PLANE_ALIGN = 128 * 32
+MANIP_FRAMES_POOL = 3
+DEVICE_LOG_LINES = 30
+DEVICE_LOG_OTHER_LINES = 10
+DEVICE_LOG_MAX_CHARS = 300
+# Device log lines from these node types count as the stream's (besides its own Script)
+STREAM_NODE_TYPES = ("VideoEncoder", "ImageManip")
+
+
+def device_variant(variant):
+    """The variant that runs on the camera at the start (auto starts with manip), None for host_jpeg."""
+    if variant == AUTO:
+        return MANIP
+    return variant if variant in SCRIPT_FRAME_TYPES else None
+
+
+def size_problem(width, height):
+    """Why the MJPEG encoder would refuse width x height, or None."""
+    if width % WIDTH_ALIGN or height % HEIGHT_ALIGN:
+        return (f"{width}x{height}: the camera's MJPEG encoder needs a width that is a multiple of {WIDTH_ALIGN} "
+                f"and an even height")
+    return None
+
+
+def _align(value, alignment):
+    return (value + alignment - 1) // alignment * alignment
+
+
+def manip_output_size(width, height):
+    """Bytes of ImageManip's NV12 output frame (depthai-core getAlignedOutputFrameSize for NV12)."""
+    stride = _align(width, MANIP_STRIDE_ALIGN)
+    return (_align(stride * _align(height, MANIP_HEIGHT_ALIGN), MANIP_PLANE_ALIGN)
+            + _align(stride * _align(height // 2, MANIP_HEIGHT_ALIGN // 2), MANIP_PLANE_ALIGN))
 
 
 def depth_shift(max_mm):
@@ -121,17 +204,50 @@ def stream_divisor(camera_fps, stream_fps):
     return max(1, int(round(float(camera_fps) / max(float(stream_fps), 1e-3))))
 
 
-def device_script(every, min_mm, max_mm, chunk_rows=CHUNK_ROWS, stats_every=150, report_interval=REPORT_INTERVAL_S):
+def _frame_builder(frame_type):
+    """Script source of gray_frame(width, height, gray) for one SCRIPT_FRAME_TYPES value."""
+    if frame_type == "NV12":
+        head = [
+            "chroma = b''",
+            "",
+            "def gray_frame(width, height, gray):",
+            "    global chroma",
+            "    size = width * height",
+            "    if len(chroma) != size // 2:",
+            "        chroma = b'\\x80' * (size // 2)",
+            "    out = ImgFrame(size + size // 2)",
+            "    out.setData(gray + chroma)",
+        ]
+    elif frame_type in ("YUV400p", "GRAY8"):
+        head = [
+            "def gray_frame(width, height, gray):",
+            "    out = ImgFrame(width * height)",
+            "    out.setData(gray)",
+        ]
+    else:
+        raise ValueError(f"no Script frame builder for {frame_type!r}")
+    return head + [
+        f"    out.setType(ImgFrame.Type.{frame_type})",
+        "    out.setWidth(width)",
+        "    out.setHeight(height)",
+        "    return out",
+    ]
+
+
+def device_script(every, min_mm, max_mm, chunk_rows=CHUNK_ROWS, stats_every=150, report_interval=REPORT_INTERVAL_S,
+                  frame_type="YUV400p"):
     """
     Script node source: inputs 'depth' (RAW16 mm) and 'control' (Buffer, sequence number 1 = stream,
-    0 = stop); outputs 'gray' (8-bit YUV400p ImgFrame) for the VideoEncoder and 'status' (Buffer, see
-    parse_device_status) for the host. Plain CPython builtins only.
+    0 = stop); outputs 'gray' (an 8-bit ImgFrame of frame_type) for the VideoEncoder or ImageManip and
+    'status' (Buffer, see parse_device_status) for the host. Plain CPython builtins only.
+
+    frame_type (SCRIPT_FRAME_TYPES): "YUV400p" (w*h bytes) or "NV12" (the gray plane then a 128 chroma
+    plane, w*h*3/2 bytes) for the VideoEncoder, "GRAY8" (w*h bytes) for ImageManip.
 
     Only the on-device message API (the RVC2 firmware's Script bindings, not the host's): ImgFrame(size in
     bytes) and Buffer(size in bytes), each filled with setData; ImgFrame.setType/setWidth/setHeight (no
-    setStride: YUV400p's stride is the width), setTimestamp/setSequenceNum (no setMetadata or
-    setTimestampDevice); see DEVICE_IMGFRAME_API. The type is YUV400p, not GRAY8 (same bytes): the
-    encoder drops GRAY8 (DEVICE_ENCODER_INPUT_TYPES).
+    setStride), setTimestamp/setSequenceNum (no setMetadata or setTimestampDevice); see
+    DEVICE_IMGFRAME_API.
 
     Errors: each failed frame counts; the first one, then at most one per report_interval, is sent on
     'status' with the running count, and the 1st and every 100th also go to node.warn (the host log). While
@@ -169,13 +285,7 @@ def device_script(every, min_mm, max_mm, chunk_rows=CHUNK_ROWS, stats_every=150,
         "        parts.append((hi | lo).to_bytes(rows * width, 'little').translate(t_out))",
         "    return width, height, b''.join(parts)",
         "",
-        "def gray_frame(width, height, gray):",
-        "    out = ImgFrame(width * height)",
-        "    out.setData(gray)",
-        "    out.setType(ImgFrame.Type.YUV400p)",
-        "    out.setWidth(width)",
-        "    out.setHeight(height)",
-        "    return out",
+        *_frame_builder(frame_type),
         "",
         "def copy_metadata(src, out):",
         "    out.setTimestamp(src.getTimestamp())",
@@ -316,6 +426,261 @@ def _lease_fresh(path, now, lease_s):
         return False
 
 
+def status_report(kind, errors, sent, text=""):
+    """A 'status' message in device_script's format (parse_device_status)."""
+    return f"{kind}\t{int(errors)}\t{int(sent)}\t{text}"[:REPORT_MAX_CHARS].encode()
+
+
+class HostJpegEncoder:
+    """
+    host_jpeg: the VIO process converts its depth frames to the stream's gray scale and JPEG-encodes them.
+    submit(depth, sequence) once per VIO frame (every `every`-th one is taken while enabled); a worker
+    thread encodes; drain() returns the JPEGs and reports() the status messages, both on the VIO thread.
+
+    CPU: each encode's thread CPU time c pushes the next start c * (1 / cpu_budget - 1) after its end, so
+    the average stays at or below cpu_budget of one core; frames arriving earlier, or while one is being
+    encoded, are skipped (skipped_cpu, skipped_busy). Reports like the camera Script's, with the count of
+    frames offered (taken or skipped): 'sent' at most every report_interval, 'error' with the reason,
+    'stats' (mean and max encode ms) every stats_every frames. So encoder_stalled works the same way, and
+    also trips when the worker hangs: frames keep being offered and no JPEG comes back.
+    """
+
+    def __init__(self, min_mm, max_mm, quality, every=1, cpu_budget=HOST_CPU_BUDGET, threaded=True,
+                 clock=time.monotonic, cpu_clock=time.thread_time, encode=None, stats_every=HOST_STATS_EVERY,
+                 report_interval=REPORT_INTERVAL_S):
+        _, t_hi, t_lo, t_out = encoding_tables(min_mm, max_mm)
+        self._luts = tuple(np.frombuffer(t, np.uint8) for t in (t_hi, t_lo, t_out))
+        self.quality = int(quality)
+        self.every = max(1, int(every))
+        self.cpu_budget = min(max(float(cpu_budget), 0.01), 1.0)
+        self.clock = clock
+        self.cpu_clock = cpu_clock
+        self.encode = encode or self.encode_jpeg
+        self.stats_every = stats_every
+        self.report_interval = report_interval
+        self.enabled = False
+        self.count = self.every - 1
+        self.offered = self.sent = self.errors = self.frames = 0
+        self.skipped_cpu = self.skipped_busy = 0
+        self.last_error = None
+        self._lock = threading.Condition()
+        self._job = None
+        self._busy = False
+        self._next_start = float("-inf")
+        self._results, self._reports = [], []
+        self._reported = None
+        self._cpu = deque()  # (end, cpu seconds) of the encodes in the last RATE_WINDOW_S
+        self._took = []
+        self._size = None
+        self._closed = False
+        self.threaded = threaded
+        self._thread = None  # started with the first set_enabled(True)
+
+    def encode_jpeg(self, depth):
+        import cv2
+        t_hi, t_lo, t_out = self._luts
+        depth = np.asarray(depth, dtype=np.uint16)
+        gray = t_out[t_hi[depth >> 8] | t_lo[depth & 0xFF]]
+        ok, jpeg = cv2.imencode(".jpg", gray, [cv2.IMWRITE_JPEG_QUALITY, self.quality])
+        if not ok:
+            raise RuntimeError("cv2.imencode returned no image")
+        return jpeg.tobytes()
+
+    def set_enabled(self, enabled):
+        with self._lock:
+            if enabled and not self.enabled:
+                self.count = self.every - 1  # the first frame after a start goes out at once
+                self._reported = None
+            self.enabled = bool(enabled) and not self._closed
+            if self.enabled and self.threaded and self._thread is None:
+                self._thread = threading.Thread(target=self._worker, name="depth-jpeg", daemon=True)
+                self._thread.start()
+
+    def submit(self, depth, sequence=None):
+        """True if this frame was taken for encoding."""
+        if not self.enabled or depth is None:
+            return False
+        self.count += 1
+        if self.count < self.every:
+            return False
+        now = self.clock()
+        with self._lock:
+            self.offered += 1
+            if self._reported is None or now - self._reported >= self.report_interval:
+                self._reported = now
+                self._reports.append(status_report("sent", self.errors, self.offered))
+            if self._busy or self._job is not None:
+                self.skipped_busy += 1
+                self.count = self.every - 1
+                return False
+            if now < self._next_start:
+                self.skipped_cpu += 1
+                self.count = self.every - 1  # try again with the next frame
+                return False
+            self.count = 0
+            self.sent += 1
+            job = (depth, sequence)
+            if self._thread is not None:
+                self._job = job
+                self._lock.notify()
+                return True
+            self._busy = True
+        self._run(job)
+        return True
+
+    def _worker(self):
+        while True:
+            with self._lock:
+                while self._job is None and not self._closed:
+                    self._lock.wait()
+                if self._closed:
+                    return
+                job, self._job, self._busy = self._job, None, True
+            self._run(job)
+
+    def _run(self, job):
+        depth, sequence = job
+        cpu0, wall0 = self.cpu_clock(), time.perf_counter()
+        jpeg = error = None
+        try:
+            jpeg = self.encode(depth)
+        except Exception as e:
+            error = f"encode: {type(e).__name__}: {e}"
+        took, cpu = time.perf_counter() - wall0, max(self.cpu_clock() - cpu0, 0.0)
+        end = self.clock()
+        with self._lock:
+            self._busy = False
+            self._next_start = end + cpu * (1.0 / self.cpu_budget - 1.0)
+            self._cpu.append((end, cpu))
+            while self._cpu and end - self._cpu[0][0] > RATE_WINDOW_S:
+                self._cpu.popleft()
+            if error is not None:
+                self.errors += 1
+                self.last_error = error
+                self._reports.append(status_report("error", self.errors, self.offered, error))
+                return
+            self.frames += 1
+            self._results.append((jpeg, sequence))
+            self._took.append(took)
+            self._size = tuple(np.shape(depth)[1::-1])
+            if len(self._took) >= self.stats_every:
+                took_ms = [1000.0 * t for t in self._took]
+                self._took = []
+                width, height = self._size
+                self._reports.append(status_report(
+                    "stats", self.errors, self.offered,
+                    f"{sum(took_ms) / len(took_ms):.1f} {max(took_ms):.1f} {width} {height}"))
+
+    def drain(self):
+        """[(jpeg bytes, sequence)] encoded since the last call."""
+        with self._lock:
+            results, self._results = self._results, []
+        return results
+
+    def reports(self):
+        with self._lock:
+            reports, self._reports = self._reports, []
+        return reports
+
+    def stats(self, now=None):
+        now = self.clock() if now is None else now
+        with self._lock:
+            cpu = sum(c for end, c in self._cpu if now - end <= RATE_WINDOW_S)
+            return {"cpu_percent": round(100.0 * cpu / RATE_WINDOW_S, 1),
+                    "cpu_budget_percent": round(100.0 * self.cpu_budget, 1), "frames": self.frames,
+                    "offered": self.offered, "taken": self.sent, "errors": self.errors,
+                    "skipped_cpu": self.skipped_cpu, "skipped_busy": self.skipped_busy}
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+            self.enabled = False
+            self._lock.notify_all()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+
+def _level_name(level):
+    return None if level is None else str(getattr(level, "name", level))
+
+
+class DeviceLog:
+    """
+    The camera's log lines for /api/status. on_message is the depthai log callback (device.addLogCallback;
+    called on depthai's logging thread with a LogMessage: nodeIdName, level, payload). Lines from the
+    stream's own nodes (nodes: their "Type(id)" names) or any VideoEncoder/ImageManip, or that mention the
+    depth stream, go to `stream` (the last DEVICE_LOG_LINES); the rest to `other`.
+    """
+
+    def __init__(self, nodes=(), clock=time.time, max_lines=DEVICE_LOG_LINES, other_lines=DEVICE_LOG_OTHER_LINES):
+        self.nodes = set(nodes)
+        self.clock = clock
+        self._lock = threading.Lock()
+        self.stream = deque(maxlen=max_lines)
+        self.other = deque(maxlen=other_lines)
+        self.total = 0
+
+    def is_stream(self, node, text):
+        return node in self.nodes or node.split("(")[0] in STREAM_NODE_TYPES or "depth stream" in text
+
+    def on_message(self, message):
+        try:
+            node = str(getattr(message, "nodeIdName", "") or "")
+            text = str(getattr(message, "payload", "") or "").strip()[:DEVICE_LOG_MAX_CHARS]
+            line = {"unix_time": self.clock(), "node": node, "level": _level_name(getattr(message, "level", None)),
+                    "text": text}
+            with self._lock:
+                self.total += 1
+                (self.stream if self.is_stream(node, text) else self.other).append(line)
+        except Exception:
+            pass  # never raise into depthai's logging thread
+
+    def snapshot(self):
+        with self._lock:
+            return {"stream": list(self.stream), "other": list(self.other), "total": self.total}
+
+
+class DeviceLogDebug:
+    """depth_stream_debug: start() raises the device log level to `level`, stop() restores the previous one."""
+
+    def __init__(self, device, level, log=print):
+        self.device = device
+        self.level = level
+        self.log = log
+        self.saved = None
+        self.active = False
+        self.error = None
+
+    def start(self):
+        if self.active:
+            return
+        try:
+            self.saved = self.device.getLogLevel()
+            self.device.setLogLevel(self.level)
+        except Exception as e:
+            self.error = f"device log level not raised: {e}"
+            self.log(f"Depth stream debug: {self.error}")
+            return
+        self.active = True
+        self.log(f"Depth stream debug: device log level {_level_name(self.saved)} -> {_level_name(self.level)}")
+
+    def stop(self):
+        if not self.active:
+            return
+        self.active = False
+        try:
+            self.device.setLogLevel(self.saved)
+        except Exception as e:
+            self.error = f"device log level not restored: {e}"
+            self.log(f"Depth stream debug: {self.error}")
+            return
+        self.log(f"Depth stream debug: device log level back to {_level_name(self.saved)}")
+
+    def state(self):
+        return {"active": self.active, "level": _level_name(self.level), "restore_level": _level_name(self.saved),
+                "error": self.error}
+
+
 class DepthStreamService:
     """
     VIO process side. tick(depth) once per VIO frame: at most every poll_interval one stat of the
@@ -328,13 +693,28 @@ class DepthStreamService:
     streaming, encoder_stalled is set (with last_error, logged once) when the Script's frame count rose for
     over ENCODER_STALL_S since its first report after the last JPEG, reported without a gap; the next JPEG
     or the end of the stream clears it.
+
+    Variants: info["variant"] is the one running (info["requested_variant"] the configured one). With a
+    host_encoder (HostJpegEncoder), host_jpeg is encoded on the Pi: tick(depth, sequence) feeds it and
+    publishes its JPEGs and reports, and set_enabled (the camera's control) is not used. A requested "auto"
+    falls back from the camera to host_jpeg the first time the encoder stalls (fallback, logged once);
+    reports and JPEGs from the camera are ignored after that.
+
+    device_log (DeviceLog) adds the camera's log lines to the metadata; debug (DeviceLogDebug) is started
+    while a camera variant streams and stopped when it stops.
     """
 
     def __init__(self, directory, set_enabled, info=None, lease_s=LEASE_S, poll_interval=0.5, resend_interval=5.0,
-                 meta_interval=1.0, clock=time.time, log=print):
+                 meta_interval=1.0, clock=time.time, log=print, host_encoder=None, device_log=None, debug=None):
         self.directory = Path(directory)
         self.set_enabled = set_enabled
         self.info = dict(info or {})
+        self.host_encoder = host_encoder
+        self.device_log = device_log
+        self.debug = debug
+        self.variant = self.info.get("variant") or ""
+        self.requested_variant = self.info.get("requested_variant") or self.variant or None
+        self.fallback = None
         self.lease_s = lease_s
         self.poll_interval = poll_interval
         self.resend_interval = resend_interval
@@ -364,7 +744,11 @@ class DepthStreamService:
             log(f"Depth stream directory {self.directory} unusable: {e}")
         self.write_meta()
 
-    def tick(self, depth=None):
+    @property
+    def on_host(self):
+        return self.variant == HOST_JPEG and self.host_encoder is not None
+
+    def tick(self, depth=None, sequence=None):
         now = self.clock()
         if now - self._last_poll >= self.poll_interval:
             self._last_poll = now
@@ -378,6 +762,13 @@ class DepthStreamService:
                     self._last_meta = float("-inf")  # publish the change right away
                     if not wanted:
                         self.write_meta(now)
+        if self.on_host:
+            if self.enabled:
+                self.host_encoder.submit(depth, sequence)
+            for jpeg, frame_sequence in self.host_encoder.drain():
+                self._store_frame(jpeg, frame_sequence)
+            for report in self.host_encoder.reports():
+                self._on_status(report)
         if self.enabled and now - self._last_meta >= self.meta_interval:
             if depth is not None:
                 self.center = center_depth(depth)
@@ -385,17 +776,46 @@ class DepthStreamService:
 
     def _send(self, enabled, now):
         try:
-            self.set_enabled(enabled)
+            if self.on_host:
+                self.host_encoder.set_enabled(enabled)
+            else:
+                self.set_enabled(enabled)
         except Exception as e:
             self.log(f"Depth stream control not sent: {e}")
             return
         if enabled != self.enabled:
             self.encoder_stalled = False
             self._stall_base = None
+            if self.debug is not None:
+                if enabled and not self.on_host:
+                    self.debug.start()
+                else:
+                    self.debug.stop()
         self.enabled = enabled
         self._last_send = now
 
+    def _fall_back(self, reason, now):
+        """auto: the camera's encoder stalled; encode on the Pi from now on."""
+        previous, self.variant = self.variant, HOST_JPEG
+        self.fallback = {"from": previous, "to": HOST_JPEG, "reason": reason, "unix_time": now}
+        self.log(f"Depth stream: falling back from {previous} (camera) to host_jpeg (encoded on the Pi): {reason}")
+        try:
+            self.set_enabled(False)
+        except Exception as e:
+            self.log(f"Depth stream control not sent: {e}")
+        if self.debug is not None:
+            self.debug.stop()
+        self.encoder_stalled = False
+        self._stall_base = self._last_report = None
+        self.host_encoder.set_enabled(self.enabled)
+
     def on_frame(self, jpeg, sequence=None):
+        """An encoded frame from the camera (ignored once encoding moved to the Pi)."""
+        if self.on_host:
+            return False
+        return self._store_frame(jpeg, sequence)
+
+    def _store_frame(self, jpeg, sequence):
         now = self.clock()
         data = bytes(jpeg)
         try:
@@ -417,10 +837,16 @@ class DepthStreamService:
 
     def on_device_status(self, data):
         """A 'status' message from the device Script: errors (count, last text and time) or its own timing."""
+        if self.on_host:
+            return
+        self._on_status(data)
+
+    def _on_status(self, data):
         now = self.clock()
         status = parse_device_status(data)
         if status is None:
-            self.log(f"Depth stream: unreadable status from the camera: {bytes(data)[:80]!r}")
+            self.log(f"Depth stream: unreadable status from the {'Pi encoder' if self.on_host else 'camera'}: "
+                     f"{bytes(data)[:80]!r}")
             return
         self.errors = max(self.errors, status["errors"])
         self._watch_encoder(status["sent"], now)
@@ -430,11 +856,12 @@ class DepthStreamService:
                                  "convert_ms_max": status["convert_ms_max"]}
         elif status["kind"] != "sent":
             fatal = status["kind"] == "fatal"
+            where = "the Pi encoder" if self.on_host else "the camera"
             if fatal or self.last_error is None or self.last_error["text"] != status["text"]:
-                self.log(f"Depth stream {'stopped on the camera' if fatal else 'error on the camera'} "
+                self.log(f"Depth stream {'stopped on' if fatal else 'error on'} {where} "
                          f"({status['errors']} errors, {status['sent']} frames sent): {status['text']}")
             self.last_error = {"text": status["text"], "unix_time": now, "fatal": fatal, "errors": status["errors"],
-                               "frames_sent": status["sent"]}
+                               "frames_sent": status["sent"], "variant": self.variant or None}
         self.write_meta(now)
 
     def _watch_encoder(self, sent, now):
@@ -448,11 +875,17 @@ class DepthStreamService:
         if self.encoder_stalled or sent <= base[1] or now - base[0] <= ENCODER_STALL_S:
             return
         self.encoder_stalled = True
-        text = (f"{ENCODER_STALL_TEXT}: {sent - base[1]} frames sent in {now - base[0]:.1f} s, no JPEG back "
-                f"(the camera log has the VideoEncoder's reason)")
+        if self.on_host:
+            text = (f"the Pi took {sent - base[1]} frames in {now - base[0]:.1f} s but encoded none "
+                    f"(host_jpeg encoder stuck)")
+        else:
+            text = (f"{ENCODER_STALL_TEXT}: {sent - base[1]} frames sent in {now - base[0]:.1f} s, no JPEG back "
+                    f"(variant {self.variant or 'unknown'}; the camera log has the VideoEncoder's reason)")
         self.log(f"Depth stream: {text}")
         self.last_error = {"text": text, "unix_time": now, "fatal": False, "errors": self.errors,
-                           "frames_sent": sent}
+                           "frames_sent": sent, "variant": self.variant or None, "stall": True}
+        if self.requested_variant == AUTO and self.host_encoder is not None and not self.on_host:
+            self._fall_back(text, now)
 
     def rates(self, now):
         recent = [(t, size) for t, size in self.recent if now - t <= RATE_WINDOW_S]
@@ -469,7 +902,12 @@ class DepthStreamService:
                 "frames_total": self.frames, "bytes_total": self.bytes, "fps": fps, "kbps": kbps,
                 "last_frame": None if last is None else {"unix_time": last[0], "bytes": last[1], "sequence": last[2]},
                 "center": self.center, "errors": self.errors, "last_error": self.last_error,
-                "encoder_stalled": self.encoder_stalled, "device_stats": self.device_stats}
+                "encoder_stalled": self.encoder_stalled, "device_stats": self.device_stats,
+                "variant": self.variant or None, "requested_variant": self.requested_variant,
+                "encoded_on": "pi" if self.on_host else "camera", "fallback": self.fallback,
+                "host_encoder": self.host_encoder.stats() if self.on_host else None,
+                "debug": self.debug is not None, "debug_state": None if self.debug is None else self.debug.state(),
+                "device_log": None if self.device_log is None else self.device_log.snapshot()}
 
     def write_meta(self, now=None):
         now = self.clock() if now is None else now
@@ -482,6 +920,10 @@ class DepthStreamService:
     def close(self):
         """The pipeline is stopping (and the Script with it): only record that nothing streams any more."""
         self.enabled = False
+        if self.debug is not None:
+            self.debug.stop()
+        if self.host_encoder is not None:
+            self.host_encoder.close()
         self.write_meta()
 
 

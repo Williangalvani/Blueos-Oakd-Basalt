@@ -5,7 +5,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from device_open import DeviceOpenTimeout, wait_and_open  # noqa: E402
+from device_open import DeviceOpenTimeout, DeviceRestartWatch, wait_and_open  # noqa: E402
 
 
 class FakeTime:
@@ -101,3 +101,45 @@ def test_gives_up_reports_last_open_error():
     with pytest.raises(DeviceOpenTimeout, match="X_LINK_DEVICE_NOT_FOUND"):
         run(lambda: ["dev"], open_device, fake, timeout=5.0)
     assert fake.now == pytest.approx(5.0)
+
+
+# --- DeviceRestartWatch ---------------------------------------------------------------------------
+
+class ReconnectionStatus:
+    """Like dai.Device.ReconnectionStatus members: str() is 'ReconnectionStatus.X', .name is 'X'."""
+
+    def __init__(self, name):
+        self.name = name
+
+    def __str__(self):
+        return f"ReconnectionStatus.{self.name}"
+
+
+def test_restart_watch_triggers_on_depthai_reconnected():
+    logs = []
+    watch = DeviceRestartWatch(log=logs.append)
+    watch.on_reconnection(ReconnectionStatus("RECONNECTING"))
+    assert not watch.triggered
+    watch.on_reconnection(ReconnectionStatus("RECONNECTED"))
+    assert watch.triggered and "reconnected" in watch.reason
+    assert logs == ["depthai reconnection: RECONNECTING", "depthai reconnection: RECONNECTED"]
+    watch.on_reconnection("ReconnectionStatus.RECONNECT_FAILED")  # a plain string works too, reason kept
+    assert "reconnected" in watch.reason
+
+
+def test_restart_watch_ignores_normal_and_dropped_frames():
+    watch = DeviceRestartWatch(log=lambda line: None)
+    for sequence, t in [(0, 10.0), (1, 10.1), (40, 14.0), (38, 13.9), (41, 14.1)]:  # gaps, small reorder
+        assert not watch.on_frame(sequence, t)
+    assert not watch.triggered
+
+
+@pytest.mark.parametrize("frames", [
+    [(500, 60.0), (3, 0.4)],      # both start over
+    [(500, 60.0), (3, 61.0)],     # the sequence alone
+    [(500, 60.0), (501, 1.2)],    # the device clock alone
+])
+def test_restart_watch_notices_the_camera_starting_over(frames):
+    watch = DeviceRestartWatch(log=lambda line: None)
+    results = [watch.on_frame(sequence, t) for sequence, t in frames]
+    assert results == [False, True] and "the camera restarted" in watch.reason

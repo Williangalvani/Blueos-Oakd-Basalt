@@ -698,6 +698,41 @@ function depthStreamProblem(s) {
   return null;
 }
 
+function depthEncodingText(d) {
+  if (d.stale || !d.variant) return d.configured_encoding ? d.configured_encoding + ' (configured)' : '–';
+  const parts = [d.variant + (d.encoded_on === 'pi' ? ' · encoded on the Pi' : ' · encoded on the camera')];
+  if (d.requested_variant && d.requested_variant !== d.variant) parts.push('requested ' + d.requested_variant);
+  if (d.fallback) parts.push('fell back from ' + d.fallback.from + ' (camera encoder output nothing)');
+  const host = d.host_encoder;
+  if (d.encoded_on === 'pi' && host) {
+    parts.push('Pi CPU ' + fmt(host.cpu_percent, 1) + ' % of a core (cap ' + fmt(host.cpu_budget_percent, 0) + ' %)'
+      + (host.skipped_cpu ? ', ' + host.skipped_cpu + ' frames skipped for the cap' : ''));
+  }
+  if (d.size_problem) parts.push(d.size_problem);
+  if (d.debug) parts.push('camera debug log ' + (d.debug_state && d.debug_state.active ? 'on' : 'on while streaming'));
+  return parts.join(' · ');
+}
+
+function depthErrorsText(d, now) {
+  // The stall flag clears when the stream stops; the last error stays, so it is shown either way
+  if (d.stale) return '–';
+  const error = d.last_error;
+  const age = error && isNum(error.unix_time) && isNum(now) ? ' (' + Math.max(0, now - error.unix_time).toFixed(0) + ' s ago)' : '';
+  if (d.encoder_stalled) return 'encoder outputs nothing: ' + (error ? error.text + age : 'frames go in, no JPEG comes back');
+  if (d.errors) return d.errors + (error ? ' · ' + (error.fatal ? 'stopped: ' : '') + error.text + age : '');
+  return error ? 'none now · last: ' + error.text + age : 'none';
+}
+
+function renderDeviceLog(d, now) {
+  const log = !d.stale && d.device_log;
+  const lines = log ? log.stream.concat(log.other).sort((a, b) => a.unix_time - b.unix_time) : [];
+  $('ds-log-box').hidden = !lines.length && !d.debug;
+  setText('ds-log-summary', 'camera log (' + (log ? log.stream.length + ' stream, ' + log.other.length + ' other lines'
+    : 'none') + (d.debug ? ', debug level while streaming' : '') + ')');
+  setText('ds-log', lines.length ? lines.map(l => (isNum(now) ? '-' + Math.max(0, now - l.unix_time).toFixed(0) + ' s ' : '')
+    + l.level + ' ' + l.node + ': ' + l.text).join('\n') : 'no camera log lines yet');
+}
+
 function renderDepthStream(s) {
   const d = s.depth_stream || {};
   depthStream.scale = streamScale(d);
@@ -722,14 +757,12 @@ function renderDepthStream(s) {
   setText('ds-kbps', d.streaming && isNum(d.kbps) ? d.kbps.toFixed(0) + ' kbit/s' : '–');
   const last = d.last_frame;
   setText('ds-jpeg', (isNum(d.quality) ? 'quality ' + d.quality : '–') + (d.streaming && last ? ' · ' + (last.bytes / 1024).toFixed(1) + ' KiB/frame' : ''));
+  setText('ds-encoding', depthEncodingText(d));
   const cost = d.stale ? null : d.device_stats;
-  setText('ds-cost', cost ? fmt(cost.convert_ms_mean, 1) + ' ms mean, ' + fmt(cost.convert_ms_max, 1) + ' ms max' : '–');
-  const error = d.stale ? null : d.last_error;
-  const errorAge = error && isNum(error.unix_time) && isNum(s.server_time)
-    ? ' (' + Math.max(0, s.server_time - error.unix_time).toFixed(0) + ' s ago)' : '';
-  setText('ds-errors', d.stale ? '–'
-    : d.encoder_stalled ? (error ? error.text + errorAge : 'the camera encoder outputs nothing')
-    : !d.errors ? 'none' : d.errors + (error ? ' · ' + (error.fatal ? 'stopped: ' : '') + error.text + errorAge : ''));
+  setText('ds-cost', cost ? (d.encoded_on === 'pi' ? 'Pi encode ' : '') + fmt(cost.convert_ms_mean, 1) + ' ms mean, '
+    + fmt(cost.convert_ms_max, 1) + ' ms max' : '–');
+  setText('ds-errors', depthErrorsText(d, s.server_time));
+  renderDeviceLog(d, s.server_time);
 
   const problem = depthStreamProblem(s);
   const img = $('depth-stream-img');

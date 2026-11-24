@@ -4,6 +4,7 @@ OAKD_MOCK=1, its VIO process the fake one, and everything checked through HTTP.
 """
 import http.client
 import json
+import math
 import os
 import signal
 import socket
@@ -21,6 +22,7 @@ APP = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(APP))
 sys.path.insert(0, str(APP / "tools"))
 
+import depth_stream  # noqa: E402
 import dvl_source  # noqa: E402
 import feature_stream  # noqa: E402
 import mock_mode  # noqa: E402
@@ -238,6 +240,57 @@ def test_the_fake_pnp_tracks_then_fails_in_a_turbid_spell(tmp_path):
     assert all(f["ok"] for f in run(2.0)[-5:])  # clear water: a fresh reference within max_reference_age
 
 
+def test_the_mock_scene_pan_folds_back_instead_of_sticking_at_the_edge():
+    import mock_vio
+    assert [mock_vio.fold(v, 10) for v in (-10, -3, 0, 7, 10)] == [-10, -3, 0, 7, 10]
+    assert mock_vio.fold(12, 10) == 8 and mock_vio.fold(30, 10) == -10 and mock_vio.fold(-12, 10) == -8
+    values = [mock_vio.fold(v / 10, 10) for v in range(-1000, 1000)]
+    assert max(map(abs, np.diff(values))) <= 0.1 + 1e-9 and min(values) >= -10 and max(values) <= 10
+
+
+def mock_depth_vio(tmp_path, *argv):
+    import mock_vio
+    import vio_telemetry
+    now = [1795000000.0]
+    args = mock_vio.parse_args(["--fps", "10", "--snapshot-dir", str(tmp_path), "--telemetry-dir",
+                                str(tmp_path / "telemetry"), *argv])
+    vio = mock_vio.FakeVio(args, np.random.default_rng(2), clock=lambda: now[0])
+    vio.telemetry = vio_telemetry.Telemetry(tmp_path / "telemetry", fps=10, clock=lambda: now[0], log=print)
+    return vio, vio.make_depth_stream()
+
+
+def test_the_mock_host_jpeg_variant_encodes_on_the_pi(tmp_path):
+    import cv2
+    vio, stream = mock_depth_vio(tmp_path, "--depth-stream-encoding", "host_jpeg")
+    assert stream.on_host and stream.variant == "host_jpeg" and stream.meta()["encoded_on"] == "pi"
+    stream.host_encoder.threaded = False
+    depth_stream.touch_lease(tmp_path / "telemetry")
+    depth = vio.scene.depth_image(1795000000.0, vio.offset)
+    stream.tick(depth, 1)
+    assert stream.enabled and stream.frames == 1
+    jpeg = (tmp_path / "telemetry" / depth_stream.FRAME_FILE).read_bytes()
+    gray = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_GRAYSCALE)
+    assert gray.shape == (400, 640)
+    reference = depth_stream.gray_reference(depth, *vio.depth_range).astype(int)
+    assert np.abs(gray.astype(int) - reference).mean() < 6
+    stream.close()
+
+
+@pytest.mark.parametrize("encoding, variant", [("auto", "manip"), ("nv12", "nv12"), ("yuv400p", "yuv400p")])
+def test_the_mock_reports_the_camera_variant_and_its_debug_log(tmp_path, encoding, variant):
+    vio, stream = mock_depth_vio(tmp_path, "--depth-stream-encoding", encoding, "--depth-stream-debug")
+    meta = stream.meta()
+    assert (meta["variant"], meta["requested_variant"], meta["encoded_on"]) == (variant, encoding, "camera")
+    depth_stream.touch_lease(tmp_path / "telemetry")
+    stream.tick()
+    assert stream.enabled and vio.log_device.level == "DEBUG"
+    assert stream.on_frame(vio.encode_depth(1795000000.0), 1)
+    lines = [line["text"] for line in stream.meta()["device_log"]["stream"]]
+    assert lines[0].startswith("log level DEBUG") and "VideoEncoder took" in lines[-1] and "(mock)" in lines[-1]
+    stream.close()
+    assert vio.log_device.level == "WARN"
+
+
 def test_the_synthetic_stereo_is_consistent_with_its_depth():
     import mock_vio
     import rectified_intrinsics
@@ -297,6 +350,24 @@ def test_the_depth_stream_sends_three_jpeg_parts(server):
             break
         time.sleep(0.2)
     assert depth["frames_total"] >= 3 and 300 < depth["center"]["median_mm"] < 4000
+
+
+def test_the_pose_stream_follows_the_mock_survey(server):
+    port, root, _ = server
+    status, headers, body = request(port, "GET", "/api/stream/pose?events=12")
+    assert status == 200 and headers["content-type"].startswith("text/event-stream")
+    events = [block.split("\n") for block in body.decode().split("\n\n") if block.startswith("event: ")]
+    kinds = [lines[0][len("event: "):] for lines in events]
+    poses = [json.loads(lines[1][len("data: "):]) for lines in events if lines[0] == "event: pose"]
+    assert "status" in kinds and len(poses) >= 5
+    assert all(p["frame"] == "start-FRD" and len(p["q"]) == 4 for p in poses)
+    assert len({p["epoch"] for p in poses}) == 1 and poses[-1]["frames"] > poses[0]["frames"]
+    moved = math.dist([poses[0][k] for k in "xyz"], [poses[-1][k] for k in "xyz"])
+    assert moved > 0.01  # the survey moves at 0.15 - 0.35 m/s
+    status, pose = get_json(port, "/api/pose")
+    assert status == 200 and pose["epoch"] == poses[0]["epoch"]
+    _, s = get_json(port, "/api/status")
+    assert s["depth_stream"]["variant"] == "manip" and s["depth_stream"]["configured_encoding"] == "auto"
 
 
 def test_the_feature_stream_yields_events(server):
@@ -365,7 +436,7 @@ def test_the_blueos_helper_scan_still_finishes_at_once_in_mock_mode(server):
     snapshot_files = {p.name: p.stat().st_mtime_ns for p in (root / "snapshots").glob("*.json")}
     probe_results = sorted((root / "snapshots" / "depth_probe" / "results").glob("*.json"))
     start = time.monotonic()
-    for path in ("/", "/register_service", "/docs", "/widget/depth", "/cockpit_extras.json"):
+    for path in ("/", "/register_service", "/docs", "/widget/depth", "/widget/pose", "/cockpit_extras.json"):
         status, body, _ = helper_get(port, path)
         assert status == 200 and body, path
     status, body, _ = helper_get(port, "/openapi.json")
