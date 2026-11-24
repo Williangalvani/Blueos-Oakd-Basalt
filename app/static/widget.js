@@ -260,6 +260,11 @@ function renderStatus(s) {
     if (d.last_error) error.title = d.last_error.text;
     parts.push(error);
   }
+  if (!s.problem && d.encoder_stalled) {
+    const stalled = span('depth: camera encoder outputs nothing', 'bad');
+    if (d.last_error) stalled.title = d.last_error.text;
+    parts.push(stalled);
+  }
   line.replaceChildren(...parts);
 
   let message = s.problem || '';

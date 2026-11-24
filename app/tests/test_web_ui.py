@@ -376,7 +376,7 @@ def test_status_depth_stream_without_vio(client, tmp_path):
     main, http = client
     status = http.get("/api/status").json()["depth_stream"]
     assert status == {"enabled": False, "streaming": False, "stale": True, "age_s": None, "errors": 0,
-                      "last_error": None}
+                      "last_error": None, "encoder_stalled": False}
     save_config(tmp_path, algorithm="pnp")
     assert http.get("/api/status").json()["depth_stream"]["enabled"] is True
 

@@ -399,11 +399,12 @@ def depth_stream_status(config: dict, process_status: dict, now: float) -> dict:
     """
     The depth stream setting and what the VIO process last published about it (stale if from another run).
     errors counts the camera Script's failed frames; last_error is the latest one (text, unix_time, fatal).
+    encoder_stalled: the Script sends frames but the camera's encoder returns no JPEG (also in last_error).
     """
     meta = depth_stream.read_meta(telemetry_dir()) or {}
     stale = bool(not meta or not process_status.get("running")
                  or (process_status.get("pid") is not None and meta.get("pid") != process_status.get("pid")))
-    return {"errors": 0, "last_error": None, **meta,
+    return {"errors": 0, "last_error": None, "encoder_stalled": False, **meta,
             "enabled": bool(config.get("depth_stream", True)) and config.get("algorithm") == "pnp",
             "streaming": bool(meta.get("streaming")) and not stale, "stale": stale,
             "age_s": now - float(meta["unix_time"]) if meta.get("unix_time") else None}

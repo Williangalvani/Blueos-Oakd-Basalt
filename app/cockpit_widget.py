@@ -102,5 +102,5 @@ def widget_status(problem, telemetry, depth, log_only, now, mock=False):
         "mock": bool(mock),
         "depth": {key: depth.get(key) for key in (
             "enabled", "streaming", "fps", "fps_target", "image_size", "depth_range_mm", "gray_far", "gray_near",
-            "gray_invalid_below", "errors", "last_error")},
+            "gray_invalid_below", "errors", "last_error", "encoder_stalled")},
     }

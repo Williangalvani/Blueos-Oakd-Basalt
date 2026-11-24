@@ -1,3 +1,4 @@
+import enum
 import json
 import os
 import sys
@@ -144,8 +145,43 @@ class Buffer(DeviceBuffer):
 class ImgFrame(DeviceBuffer):
     API = depth_stream.DEVICE_IMGFRAME_API
 
-    class Type:
-        GRAY8 = "GRAY8"
+    class Type(enum.IntEnum):
+        """The values the device logs (GRAY8 is 'frame type (30)' in the VideoEncoder warning on test10)."""
+        YUV400p = 4
+        RAW16 = 14
+        NV12 = 22
+        GRAY8 = 30
+
+
+class FakeVideoEncoder(FakeOutput):
+    """
+    The Script's 'gray' output linked to the camera's VideoEncoder (PlgVidEnc in the RVC2 firmware): it
+    takes NV12 or YUV400p only and drops anything else with the firmware's warning, once per frame (test10:
+    GRAY8 frames sent, nothing encoded). The first frame sets the encoder size.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.encoded = []
+        self.warnings = []
+        self.size = None
+
+    def send(self, frame):
+        super().send(frame)
+        kind = frame.calls.get("setType")
+        width, height = frame.calls.get("setWidth"), frame.calls.get("setHeight")
+        if kind not in {getattr(ImgFrame.Type, name) for name in depth_stream.DEVICE_ENCODER_INPUT_TYPES}:
+            number = 0 if kind is None else int(kind)
+            self.warnings.append(f"[VideoEncoder(11)] [warning] Arrived frame type ({number}) is not either NV12 or "
+                                 f"YUV400p (8-bit Gray)")
+            return
+        self.size = self.size or (width, height)
+        if (width, height) != self.size:
+            self.warnings.append(f"Arrived frame ({width}, {height}) does not match the encoder size {self.size}")
+            return
+        planes = width * height * (3 if kind == ImgFrame.Type.NV12 else 2) // 2
+        assert len(frame.calls["setData"]) == planes <= frame.size, "wrong plane size for the frame type"
+        self.encoded.append(frame)
 
 
 def test_the_fake_device_messages_reject_what_the_camera_rejects():
@@ -157,11 +193,30 @@ def test_the_fake_device_messages_reject_what_the_camera_rejects():
         ImgFrame(4).setData(b"12345")
 
 
+def gray_img_frame(kind, width=64, height=40):
+    frame = ImgFrame(width * height)
+    frame.setData(bytes(width * height))
+    frame.setType(kind)
+    frame.setWidth(width)
+    frame.setHeight(height)
+    return frame
+
+
+def test_the_fake_encoder_drops_gray8_like_the_camera():
+    encoder = FakeVideoEncoder()
+    encoder.send(gray_img_frame(ImgFrame.Type.GRAY8))
+    assert encoder.encoded == []
+    assert encoder.warnings == ["[VideoEncoder(11)] [warning] Arrived frame type (30) is not either NV12 or "
+                                "YUV400p (8-bit Gray)"]
+    encoder.send(gray_img_frame(ImgFrame.Type.YUV400p))
+    assert len(encoder.encoded) == 1 and len(encoder.warnings) == 1
+
+
 def run_script(code, depth_items, control_items, after=None, clock=None):
     node = type("Node", (), {})()
     control = control_items if isinstance(control_items, FakeInput) else FakeInput(control_items)
     node.inputs = {"depth": FakeInput(depth_items, after), "control": control}
-    node.outputs = {"gray": FakeOutput(), "status": FakeOutput()}
+    node.outputs = {"gray": FakeVideoEncoder(), "status": FakeOutput()}
     node.warnings = []
     node.warn = node.warnings.append
     if clock is not None:
@@ -176,6 +231,10 @@ def reports(node):
     return [depth_stream.parse_device_status(message.calls["setData"]) for message in node.outputs["status"].sent]
 
 
+def errors_reported(node):
+    return [r for r in reports(node) if r["kind"] != "sent"]
+
+
 def depth_image(seed=0, height=400, width=640):
     depth = np.random.default_rng(seed).integers(0, 4500, (height, width)).astype(np.uint16)
     depth[depth < 250] = 0
@@ -186,18 +245,46 @@ def test_script_converts_like_the_reference_and_sends_every_nth_frame():
     frames = [DepthFrame(depth_image(n), n) for n in range(9)]
     code = depth_stream.device_script(3, 300, 4000)
     node = run_script(code, frames, [Control(True)])
-    sent = node.outputs["gray"].sent
-    # The first frame goes out right away, then every 3rd
-    assert [f.calls["setSequenceNum"] for f in sent] == [0, 3, 6]
-    for out in sent:
+    encoder = node.outputs["gray"]
+    # The first frame goes out right away, then every 3rd; the encoder takes all of them
+    assert [f.calls["setSequenceNum"] for f in encoder.sent] == [0, 3, 6]
+    assert encoder.encoded == encoder.sent and encoder.warnings == []
+    for out in encoder.sent:
         source = frames[out.calls["setSequenceNum"]]
         assert out.size == 640 * 400 and len(out.calls["setData"]) == out.size
-        assert out.calls["setType"] == "GRAY8"
+        assert out.calls["setType"] == ImgFrame.Type.YUV400p
         assert (out.calls["setWidth"], out.calls["setHeight"]) == (640, 400)
         assert out.calls["setTimestamp"] == source.getTimestamp()
         gray = np.frombuffer(out.calls["setData"], np.uint8).reshape(400, 640)
         np.testing.assert_array_equal(gray, depth_stream.gray_reference(source.depth, 300, 4000))
-    assert node.warnings == [] and node.outputs["status"].sent == []
+    assert node.warnings == []
+    assert reports(node)[0] == {"kind": "sent", "errors": 0, "sent": 1, "text": ""}
+    assert {r["kind"] for r in reports(node)} == {"sent"}
+
+
+def test_gray8_into_the_encoder_reproduces_test10():
+    """HEAD before this fix: the Script sends GRAY8, counts every frame as sent, and nothing is encoded."""
+    code = depth_stream.device_script(1, 300, 4000).replace("ImgFrame.Type.YUV400p", "ImgFrame.Type.GRAY8")
+    node = run_script(code, [DepthFrame(depth_image(n, 40, 64), n) for n in range(5)], [Control(True)])
+    encoder = node.outputs["gray"]
+    assert len(encoder.sent) == 5 and encoder.encoded == []
+    assert encoder.warnings == ["[VideoEncoder(11)] [warning] Arrived frame type (30) is not either NV12 or "
+                                "YUV400p (8-bit Gray)"] * 5
+    assert node.warnings == [] and reports(node)[0]["sent"] == 1  # no error on the camera's side
+
+
+def test_script_reports_frames_sent_about_once_a_second():
+    frames = [DepthFrame(depth_image(n, 20, 32), n) for n in range(25)]
+    t = [100.0]
+
+    def clock():  # read twice per frame: 0.125 s per frame
+        t[0] += 0.0625
+        return t[0]
+
+    node = run_script(depth_stream.device_script(1, 300, 4000), frames, [Control(True)], clock=clock)
+    progress = [r["sent"] for r in reports(node) if r["kind"] == "sent"]
+    assert progress == [1, 9, 17, 25]
+    assert len(node.outputs["gray"].encoded) == 25
 
 
 def script_calls(code):
@@ -233,7 +320,10 @@ def test_script_uses_only_the_on_device_message_api():
     assert {method for name, method in methods if name == "message"} == {"setData"}
     for missing_on_device in ("setStride", "setMetadata", "setTimestampDevice", "setFrame", "setCvFrame"):
         assert missing_on_device not in code
-    assert "ImgFrame.Type.GRAY8" in code
+    # The frame type is one the camera's VideoEncoder takes (it drops GRAY8: test10)
+    types = {node.attr for node in ast.walk(ast.parse(code)) if isinstance(node, ast.Attribute)
+             and ast.unparse(node.value) == "ImgFrame.Type"}
+    assert types == {"YUV400p"} and types <= depth_stream.DEVICE_ENCODER_INPUT_TYPES
 
 
 def test_script_reports_errors_on_its_status_output():
@@ -245,7 +335,7 @@ def test_script_reports_errors_on_its_status_output():
     node = run_script(depth_stream.device_script(1, 300, 4000), frames, [Control(True)])
     assert [f.calls["setSequenceNum"] for f in node.outputs["gray"].sent] == [1]  # keeps going
     assert len(node.warnings) == 1 and "no data" in node.warnings[0]
-    (report,) = reports(node)
+    (report,) = errors_reported(node)
     assert report["kind"] == "error" and report["errors"] == 1 and report["sent"] == 0
     assert report["text"] == "convert: RuntimeError: no data"
 
@@ -278,8 +368,8 @@ def test_script_sends_the_frame_when_only_its_metadata_fails():
     node = run_script(depth_stream.device_script(1, 300, 4000), [NoTimestamp(depth_image(0, 20, 32), 7)],
                       [Control(True)])
     (out,) = node.outputs["gray"].sent
-    assert out.calls["setType"] == "GRAY8" and "setSequenceNum" not in out.calls
-    (report,) = reports(node)
+    assert out.calls["setType"] == ImgFrame.Type.YUV400p and "setSequenceNum" not in out.calls
+    (report,) = errors_reported(node)
     assert report["kind"] == "error" and report["text"].startswith("metadata: TypeError")
 
 
@@ -348,7 +438,7 @@ def test_script_reports_its_cost():
     frames = [DepthFrame(depth_image(n, 40, 64), n) for n in range(4)]
     node = run_script(depth_stream.device_script(1, 300, 4000, stats_every=2), frames, [Control(True)])
     assert len(node.warnings) == 2 and "convert + send mean" in node.warnings[0] and "64x40" in node.warnings[0]
-    stats = reports(node)
+    stats = [r for r in reports(node) if r["kind"] == "stats"]
     assert [(r["kind"], r["sent"], r["errors"], r["size"]) for r in stats] == [("stats", 2, 0, [64, 40]),
                                                                                ("stats", 4, 0, [64, 40])]
     assert stats[0]["convert_ms_max"] >= stats[0]["convert_ms_mean"] >= 0.0
@@ -440,6 +530,8 @@ def test_parse_device_status():
         "kind": "error", "errors": 2, "sent": 5, "text": "convert: TypeError: a\tb"}
     stats = depth_stream.parse_device_status(np.frombuffer(b"stats\t0\t150\t41.5 60.2 640 400", np.uint8))
     assert stats["convert_ms_mean"] == 41.5 and stats["convert_ms_max"] == 60.2 and stats["size"] == [640, 400]
+    assert depth_stream.parse_device_status(b"sent\t0\t150\t") == {"kind": "sent", "errors": 0, "sent": 150,
+                                                                    "text": ""}
     for bad in (b"", b"error\tx\t0\tt", b"stats\t0\t1\tnot numbers", b"\xff\xfe"):
         assert depth_stream.parse_device_status(bad) is None
 
@@ -449,6 +541,7 @@ def test_service_publishes_the_device_errors(tmp_path):
     service = depth_stream.DepthStreamService(tmp_path, lambda enabled: None, clock=clock, log=logs.append)
     meta = depth_stream.read_meta(tmp_path)
     assert meta["errors"] == 0 and meta["last_error"] is None and meta["device_stats"] is None
+    assert meta["encoder_stalled"] is False
 
     text = "convert: TypeError: __init__(): incompatible constructor arguments"
     service.on_device_status(f"error\t1\t0\t{text}".encode())
@@ -470,6 +563,98 @@ def test_service_publishes_the_device_errors(tmp_path):
     assert meta["errors"] == 58 and meta["last_error"]["fatal"] is True and "stopped on the camera" in logs[-1]
     service.on_device_status(b"garbage")
     assert "unreadable status" in logs[-1] and depth_stream.read_meta(tmp_path)["errors"] == 58
+
+
+def streaming_service(tmp_path, clock, logs):
+    service = depth_stream.DepthStreamService(tmp_path, lambda enabled: None, clock=clock, log=logs.append)
+    depth_stream.touch_lease(tmp_path)
+    os.utime(tmp_path / depth_stream.LEASE_FILE, (clock.t, clock.t))
+    service.tick()
+    assert service.enabled
+    return service
+
+
+def test_service_flags_frames_sent_but_nothing_encoded(tmp_path):
+    """test10: the Script sent 150 frames (GRAY8) and the encoder dropped every one; the host saw nothing."""
+    clock, logs = Clock(1000.0), []
+    service = streaming_service(tmp_path, clock, logs)
+    assert depth_stream.read_meta(tmp_path)["encoder_stalled"] is False
+    for sent in range(1, 5):  # one progress report a second, no encoded frame: 3 s after the first one ...
+        clock.t += 1.0
+        service.on_device_status(f"sent\t0\t{sent * 5}\t".encode())
+        assert depth_stream.read_meta(tmp_path)["encoder_stalled"] is False
+    clock.t += 0.5  # ... and more
+    service.on_device_status(b"sent\t0\t22\t")
+    meta = depth_stream.read_meta(tmp_path)
+    assert meta["encoder_stalled"] is True and meta["errors"] == 0
+    assert meta["last_error"]["text"].startswith(depth_stream.ENCODER_STALL_TEXT)
+    assert meta["last_error"]["frames_sent"] == 22 and meta["last_error"]["unix_time"] == 1004.5
+    assert len(logs) == 2 and depth_stream.ENCODER_STALL_TEXT in logs[-1]
+    clock.t += 1.0
+    service.on_device_status(b"sent\t0\t27\t")
+    assert len(logs) == 2  # logged once
+
+    # Encoded frames again: cleared, the last error stays as a record
+    service.on_frame(b"\xff\xd8jpeg", 1)
+    meta = service.meta()
+    assert meta["encoder_stalled"] is False and meta["last_error"]["text"].startswith(depth_stream.ENCODER_STALL_TEXT)
+    assert "encoded frames arrive again" in logs[-1]
+
+    # Stalled again, then the stream stops: not streaming, so not stalled
+    for sent in (30, 35, 40, 45):
+        clock.t += 1.2
+        service.on_device_status(f"sent\t0\t{sent}\t".encode())
+    assert service.meta()["encoder_stalled"] is True
+    clock.t += depth_stream.LEASE_S + 1
+    service.tick()
+    assert not service.enabled and depth_stream.read_meta(tmp_path)["encoder_stalled"] is False
+
+
+def test_service_does_not_flag_a_working_or_idle_encoder(tmp_path):
+    clock, logs = Clock(1000.0), []
+    service = streaming_service(tmp_path, clock, logs)
+    for n in range(1, 30):  # 5 fps, a progress report a second, each frame encoded
+        clock.t += 0.2
+        os.utime(tmp_path / depth_stream.LEASE_FILE, (clock.t, clock.t))
+        service.tick()
+        if n % 5 == 0:
+            service.on_device_status(f"sent\t0\t{n}\t".encode())
+        service.on_frame(b"\xff\xd8jpeg", n)
+    assert service.meta()["encoder_stalled"] is False
+    clock.t += 0.5
+    service.on_device_status(b"sent\t0\t30\t")  # the report of a frame that already arrived
+    # The Script sent nothing for 10 s (no depth frames), then one frame whose JPEG is not in yet
+    clock.t += 10.0
+    os.utime(tmp_path / depth_stream.LEASE_FILE, (clock.t, clock.t))
+    service.tick()
+    service.on_device_status(b"sent\t0\t31\t")
+    assert service.meta()["encoder_stalled"] is False and service.last_error is None
+    assert logs == ["Depth stream started: a client is watching"]
+
+
+def test_service_flag_survives_a_restarted_script(tmp_path):
+    clock, logs = Clock(1000.0), []
+    service = streaming_service(tmp_path, clock, logs)
+    for sent in (500, 505, 3, 8, 13):  # the Script's count starts over after 505
+        service.on_device_status(f"sent\t0\t{sent}\t".encode())
+        assert service.meta()["encoder_stalled"] is False
+        clock.t += 1.0
+    clock.t += 0.5
+    service.on_device_status(b"sent\t0\t20\t")
+    assert service.meta()["encoder_stalled"] is True
+
+
+def test_service_waits_longer_for_reports_of_a_slow_stream(tmp_path):
+    clock, logs = Clock(1000.0), []
+    service = depth_stream.DepthStreamService(tmp_path, lambda enabled: None, {"fps_target": 0.5}, clock=clock,
+                                              log=logs.append)
+    depth_stream.touch_lease(tmp_path)
+    os.utime(tmp_path / depth_stream.LEASE_FILE, (clock.t, clock.t))
+    service.tick()
+    for sent in (1, 2, 3):  # one frame, and so one report, every 2 s and a bit
+        service.on_device_status(f"sent\t0\t{sent}\t".encode())
+        clock.t += 2.6
+    assert service.meta()["encoder_stalled"] is True
 
 
 def test_center_depth_ignores_invalid_pixels():

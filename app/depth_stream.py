@@ -5,7 +5,7 @@ Device (pnp_vio.build_depth_stream): a Script node takes stereo.depth (the same 
 depth the VIO uses) from a non-blocking size-1 queue and, only while the host enabled it, every
 `every`-th frame turns the RAW16 millimetres into an 8-bit image with C-speed byte operations (strided
 byte slices, bytes.translate tables, one big-integer OR per chunk of rows; see device_script). A
-VideoEncoder node encodes that GRAY8 frame as MJPEG and only the JPEG crosses the link. The VIO process
+VideoEncoder node encodes that 8-bit frame (type YUV400p) as MJPEG and only the JPEG crosses the link. The VIO process
 writes it as-is to DIRECTORY/depth_stream.jpg; main.py forwards it as multipart/x-mixed-replace.
 Nothing is decoded or re-encoded on the Pi; the browser colorizes the gray image.
 
@@ -20,7 +20,10 @@ at most every poll_interval and tells the Script to start or stop. With nobody w
 blocks on its control input, so nothing is converted, encoded or sent.
 
 Errors: the Script counts failed frames and sends the count with the last error (throttled) on its 'status'
-output; the VIO process publishes them in DIRECTORY/depth_stream.json, which /api/status serves.
+output, and while streaming its count of frames sent about once a second; the VIO process publishes them in
+DIRECTORY/depth_stream.json, which /api/status serves. The encoder drops frames it can't take with only a
+device log warning, so the VIO process flags the stream (encoder_stalled) when the Script keeps sending and
+no JPEG comes back.
 
 depthai-free so it can be unit tested.
 """
@@ -49,6 +52,13 @@ BOUNDARY = "depthframe"
 RATE_WINDOW_S = 5.0
 REPORT_INTERVAL_S = 1.0
 REPORT_MAX_CHARS = 400
+# Without a clock on the device, the Script reports its frame count every this many frames
+PROGRESS_EVERY = 5
+# encoder_stalled: the Script's count rose for this long since its first report after the last JPEG, with
+# its reports no further apart than ENCODER_REPORT_GAP seconds (or frame intervals, for a slow stream)
+ENCODER_STALL_S = 3.0
+ENCODER_REPORT_GAP = 2.5
+ENCODER_STALL_TEXT = "camera converts frames but the encoder outputs nothing"
 # ImgFrame methods of the Script runtime in the RVC2 firmware (depthai 3.3.0, device side a406121b);
 # a subset of the host's dai.ImgFrame. Its constructor is ImgFrame(size in bytes).
 DEVICE_IMGFRAME_API = frozenset({
@@ -56,6 +66,9 @@ DEVICE_IMGFRAME_API = frozenset({
     "getTimestamp", "getTimestampDevice", "setTimestamp", "getSequenceNum", "setSequenceNum",
     "getInstanceNum", "setInstanceNum", "getCategory", "setCategory", "getTransformation", "setTransformation",
 })
+# Frame types the RVC2 VideoEncoder takes; it drops others with "Arrived frame type (N) is not either NV12 or
+# YUV400p (8-bit Gray)" (GRAY8 is N = 30). YUV400p is GRAY8's single 8-bit plane, stride = width.
+DEVICE_ENCODER_INPUT_TYPES = frozenset({"NV12", "YUV400p"})
 
 
 def depth_shift(max_mm):
@@ -111,17 +124,19 @@ def stream_divisor(camera_fps, stream_fps):
 def device_script(every, min_mm, max_mm, chunk_rows=CHUNK_ROWS, stats_every=150, report_interval=REPORT_INTERVAL_S):
     """
     Script node source: inputs 'depth' (RAW16 mm) and 'control' (Buffer, sequence number 1 = stream,
-    0 = stop); outputs 'gray' (GRAY8 ImgFrame) for the VideoEncoder and 'status' (Buffer, see
+    0 = stop); outputs 'gray' (8-bit YUV400p ImgFrame) for the VideoEncoder and 'status' (Buffer, see
     parse_device_status) for the host. Plain CPython builtins only.
 
     Only the on-device message API (the RVC2 firmware's Script bindings, not the host's): ImgFrame(size in
     bytes) and Buffer(size in bytes), each filled with setData; ImgFrame.setType/setWidth/setHeight (no
-    setStride: GRAY8's stride is the width), setTimestamp/setSequenceNum (no setMetadata or
-    setTimestampDevice); see DEVICE_IMGFRAME_API.
+    setStride: YUV400p's stride is the width), setTimestamp/setSequenceNum (no setMetadata or
+    setTimestampDevice); see DEVICE_IMGFRAME_API. The type is YUV400p, not GRAY8 (same bytes): the
+    encoder drops GRAY8 (DEVICE_ENCODER_INPUT_TYPES).
 
     Errors: each failed frame counts; the first one, then at most one per report_interval, is sent on
     'status' with the running count, and the 1st and every 100th also go to node.warn (the host log). While
-    streaming it reports (status and node.warn) its conversion time every stats_every frames: the
+    streaming it reports its count of frames sent after the first frame, then at most once per
+    report_interval, and (status and node.warn) its conversion time every stats_every frames: the
     measured on-device cost.
     """
     _, t_hi, t_lo, t_out = encoding_tables(min_mm, max_mm)
@@ -131,6 +146,7 @@ def device_script(every, min_mm, max_mm, chunk_rows=CHUNK_ROWS, stats_every=150,
         f"STATS_EVERY = {int(stats_every)}",
         f"REPORT_INTERVAL = {float(report_interval)!r}",
         f"REPORT_MAX = {int(REPORT_MAX_CHARS)}",
+        f"PROGRESS_EVERY = {int(PROGRESS_EVERY)}",
         f"t_hi = {t_hi!r}",
         f"t_lo = {t_lo!r}",
         f"t_out = {t_out!r}",
@@ -156,7 +172,7 @@ def device_script(every, min_mm, max_mm, chunk_rows=CHUNK_ROWS, stats_every=150,
         "def gray_frame(width, height, gray):",
         "    out = ImgFrame(width * height)",
         "    out.setData(gray)",
-        "    out.setType(ImgFrame.Type.GRAY8)",
+        "    out.setType(ImgFrame.Type.YUV400p)",
         "    out.setWidth(width)",
         "    out.setHeight(height)",
         "    return out",
@@ -178,6 +194,7 @@ def device_script(every, min_mm, max_mm, chunk_rows=CHUNK_ROWS, stats_every=150,
         "busy = 0.0",
         "worst = 0.0",
         "reported = None",
+        "progressed = None",
         "",
         "def report(kind, text):",
         "    try:",
@@ -238,9 +255,13 @@ def device_script(every, min_mm, max_mm, chunk_rows=CHUNK_ROWS, stats_every=150,
         "        out = None",
         "        sent += 1",
         "        if clock:",
-        "            took = clock() - start",
+        "            now = clock()",
+        "            took = now - start",
         "            busy += took",
         "            worst = max(worst, took)",
+        "            if progressed is None or now - progressed >= REPORT_INTERVAL:",
+        "                progressed = now",
+        "                report('sent', '')",
         "            if sent % STATS_EVERY == 0:",
         "                mean_ms = round(1000.0 * busy / STATS_EVERY, 1)",
         "                max_ms = round(1000.0 * worst, 1)",
@@ -249,6 +270,8 @@ def device_script(every, min_mm, max_mm, chunk_rows=CHUNK_ROWS, stats_every=150,
         "                report('stats', str(mean_ms) + ' ' + str(max_ms) + ' ' + str(width) + ' ' + str(height))",
         "                busy = 0.0",
         "                worst = 0.0",
+        "        elif sent == 1 or sent % PROGRESS_EVERY == 0:",
+        "            report('sent', '')",
         "except Exception as e:",
         "    failed('stopped', e, 'fatal')",
         "    raise",
@@ -258,8 +281,8 @@ def device_script(every, min_mm, max_mm, chunk_rows=CHUNK_ROWS, stats_every=150,
 def parse_device_status(data):
     """
     One 'status' message of device_script: tab-separated kind, error count, frames sent, text. kind is
-    'error' (a frame failed; text says where and why), 'fatal' (the Script stopped) or 'stats' (text:
-    mean and max convert + send ms, width, height). None if malformed.
+    'error' (a frame failed; text says where and why), 'fatal' (the Script stopped), 'sent' (progress, no
+    text) or 'stats' (text: mean and max convert + send ms, width, height). None if malformed.
     """
     try:
         kind, errors, sent, text = bytes(data).decode("utf-8", "replace").split("\t", 3)
@@ -300,6 +323,11 @@ class DepthStreamService:
     was lost). on_frame(jpeg) with each encoded frame from the device: one atomic write of the JPEG.
     While streaming, the metadata (META_FILE, with the raw depth at the image centre) is rewritten at
     most every meta_interval.
+
+    on_device_status(data) with each Script report, after the encoded frames of the same loop: while
+    streaming, encoder_stalled is set (with last_error, logged once) when the Script's frame count rose for
+    over ENCODER_STALL_S since its first report after the last JPEG, reported without a gap; the next JPEG
+    or the end of the stream clears it.
     """
 
     def __init__(self, directory, set_enabled, info=None, lease_s=LEASE_S, poll_interval=0.5, resend_interval=5.0,
@@ -321,6 +349,11 @@ class DepthStreamService:
         self.errors = 0
         self.last_error = None
         self.device_stats = None
+        self.encoder_stalled = False
+        self._stall_base = None  # (unix time, Script frame count) of its first report since the last JPEG
+        self._last_report = None
+        fps = float(self.info.get("fps_target") or 0.0)
+        self._report_gap = max(ENCODER_REPORT_GAP, ENCODER_REPORT_GAP / fps if fps > 0 else 0.0)
         self.recent = deque()
         self._last_poll = self._last_send = self._last_meta = float("-inf")
         try:
@@ -356,6 +389,9 @@ class DepthStreamService:
         except Exception as e:
             self.log(f"Depth stream control not sent: {e}")
             return
+        if enabled != self.enabled:
+            self.encoder_stalled = False
+            self._stall_base = None
         self.enabled = enabled
         self._last_send = now
 
@@ -373,6 +409,10 @@ class DepthStreamService:
         self.recent.append((now, len(data)))
         while self.recent and now - self.recent[0][0] > RATE_WINDOW_S:
             self.recent.popleft()
+        self._stall_base = None
+        if self.encoder_stalled:
+            self.encoder_stalled = False
+            self.log("Depth stream: encoded frames arrive again")
         return True
 
     def on_device_status(self, data):
@@ -383,11 +423,12 @@ class DepthStreamService:
             self.log(f"Depth stream: unreadable status from the camera: {bytes(data)[:80]!r}")
             return
         self.errors = max(self.errors, status["errors"])
+        self._watch_encoder(status["sent"], now)
         if status["kind"] == "stats":
             self.device_stats = {"unix_time": now, "frames_sent": status["sent"], "size": status["size"],
                                  "convert_ms_mean": status["convert_ms_mean"],
                                  "convert_ms_max": status["convert_ms_max"]}
-        else:
+        elif status["kind"] != "sent":
             fatal = status["kind"] == "fatal"
             if fatal or self.last_error is None or self.last_error["text"] != status["text"]:
                 self.log(f"Depth stream {'stopped on the camera' if fatal else 'error on the camera'} "
@@ -395,6 +436,23 @@ class DepthStreamService:
             self.last_error = {"text": status["text"], "unix_time": now, "fatal": fatal, "errors": status["errors"],
                                "frames_sent": status["sent"]}
         self.write_meta(now)
+
+    def _watch_encoder(self, sent, now):
+        last, self._last_report = self._last_report, now
+        if not self.enabled:
+            return
+        base = self._stall_base
+        if base is None or sent < base[1] or last is None or now - last > self._report_gap:
+            self._stall_base = (now, sent)  # first report since the last JPEG, a restarted Script, or a pause
+            return
+        if self.encoder_stalled or sent <= base[1] or now - base[0] <= ENCODER_STALL_S:
+            return
+        self.encoder_stalled = True
+        text = (f"{ENCODER_STALL_TEXT}: {sent - base[1]} frames sent in {now - base[0]:.1f} s, no JPEG back "
+                f"(the camera log has the VideoEncoder's reason)")
+        self.log(f"Depth stream: {text}")
+        self.last_error = {"text": text, "unix_time": now, "fatal": False, "errors": self.errors,
+                           "frames_sent": sent}
 
     def rates(self, now):
         recent = [(t, size) for t, size in self.recent if now - t <= RATE_WINDOW_S]
@@ -411,7 +469,7 @@ class DepthStreamService:
                 "frames_total": self.frames, "bytes_total": self.bytes, "fps": fps, "kbps": kbps,
                 "last_frame": None if last is None else {"unix_time": last[0], "bytes": last[1], "sequence": last[2]},
                 "center": self.center, "errors": self.errors, "last_error": self.last_error,
-                "device_stats": self.device_stats}
+                "encoder_stalled": self.encoder_stalled, "device_stats": self.device_stats}
 
     def write_meta(self, now=None):
         now = self.clock() if now is None else now

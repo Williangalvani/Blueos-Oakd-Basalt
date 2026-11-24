@@ -199,7 +199,8 @@ def test_widget_status_from_live_telemetry():
     status = telemetry.status(now)
     status["stale"] = False
     s = cockpit_widget.widget_status(None, status, {"enabled": True, "streaming": True, "fps": 4.9,
-                                                    "depth_range_mm": [300, 4000], "gray_far": 16},
+                                                    "depth_range_mm": [300, 4000], "gray_far": 16,
+                                                    "encoder_stalled": True},
                                      log_only=True, now=now + 1)
     assert s["problem"] is None and s["log_only"] is True and s["output_mode"] == "log-only"
     assert s["fps"] == pytest.approx(10, rel=0.1) and s["ok_percent"] == pytest.approx(80, abs=5)
@@ -207,6 +208,7 @@ def test_widget_status_from_live_telemetry():
     assert s["sent_total"] == status["sent_total"] > 0
     assert s["last_failure"]["reason"] == "too_few_matches" and 0 < s["last_failure"]["age_s"] < 5
     assert s["depth"]["fps"] == 4.9 and s["depth"]["depth_range_mm"] == [300, 4000]
+    assert s["depth"]["encoder_stalled"] is True
     json.dumps(s, allow_nan=False)
     # Stale telemetry shows nothing old
     status["stale"] = True

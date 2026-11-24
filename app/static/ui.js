@@ -725,10 +725,11 @@ function renderDepthStream(s) {
   const cost = d.stale ? null : d.device_stats;
   setText('ds-cost', cost ? fmt(cost.convert_ms_mean, 1) + ' ms mean, ' + fmt(cost.convert_ms_max, 1) + ' ms max' : '–');
   const error = d.stale ? null : d.last_error;
-  setText('ds-errors', d.stale ? '–' : !d.errors ? 'none' : d.errors + (error
-    ? ' · ' + (error.fatal ? 'stopped: ' : '') + error.text + (isNum(error.unix_time) && isNum(s.server_time)
-      ? ' (' + Math.max(0, s.server_time - error.unix_time).toFixed(0) + ' s ago)' : '')
-    : ''));
+  const errorAge = error && isNum(error.unix_time) && isNum(s.server_time)
+    ? ' (' + Math.max(0, s.server_time - error.unix_time).toFixed(0) + ' s ago)' : '';
+  setText('ds-errors', d.stale ? '–'
+    : d.encoder_stalled ? (error ? error.text + errorAge : 'the camera encoder outputs nothing')
+    : !d.errors ? 'none' : d.errors + (error ? ' · ' + (error.fatal ? 'stopped: ' : '') + error.text + errorAge : ''));
 
   const problem = depthStreamProblem(s);
   const img = $('depth-stream-img');
