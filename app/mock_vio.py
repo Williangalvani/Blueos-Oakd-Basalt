@@ -21,9 +21,10 @@ at its edges.
 
 Published through the real services, at the configured fps:
 - vio_telemetry.Telemetry: status.json, history.npy (lease-gated), the chip temperature;
-- depth_stream.DepthStreamService: depth_stream.jpg (8-bit depth as the camera's Script encodes it, JPEG at
-  --depth-stream-quality) every round(fps / depth-stream-fps)-th frame, only while the lease is held. The
-  camera variants are emulated here; host_jpeg runs the real depth_stream.HostJpegEncoder. With
+- depth_stream.DepthStreamService: depth_stream.jpg (the camera image, or the disparity, as the camera's
+  encoder makes it, JPEG at --depth-stream-quality) every round(fps / depth-stream-fps)-th frame, only while
+  the lease is held. The camera variants are emulated here; host_jpeg runs the real
+  depth_stream.HostJpegEncoder. With
   --depth-stream-debug a stand-in device takes the log level and logs mock encoder lines;
 - feature_stream.FeatureStreamService: features.json while its lease is held;
 - pose_stream.PoseStreamService: pose.json and pose_trail.json while its lease is held; its attitude from
@@ -727,10 +728,7 @@ class FakeVio:
             host = depth_stream.HostJpegEncoder(*self.depth_range, self.args.depth_stream_quality,
                                                 1 if self.points_mode else info["every"])
         if info["variant"] != depth_stream.HOST_JPEG:
-            names = ("Script(4)", "VideoEncoder(5)")
-            if info["variant"] == depth_stream.MANIP:
-                names += ("ImageManip(6)",)
-            device_log = depth_stream.DeviceLog(names)
+            device_log = depth_stream.DeviceLog(("Script(4)", "VideoEncoder(5)"))
             if self.args.depth_stream_debug:
                 self.log_device = MockLogDevice(device_log)
                 debug = depth_stream.DeviceLogDebug(self.log_device, "DEBUG", log=print)
@@ -748,12 +746,10 @@ class FakeVio:
         depth = self.scene.depth_image(t, self.offset, self.turbidity(t))
         if self.stream.variant == depth_stream.MONO_FEATURES:
             gray = self.scene.frame("rect_left", t, self.offset)
-        elif self.stream.variant == depth_stream.DISPARITY:
+        else:
             gray = depth_stream.gray_disparity_reference(depth, self.scene.fx, BASELINE_M,
                                                          self.stream.info.get("disparity_max",
                                                                               depth_stream.DISPARITY_MAX))
-        else:
-            gray = depth_stream.gray_reference(depth, *self.depth_range)
         ok, jpeg = cv2.imencode(".jpg", gray, [cv2.IMWRITE_JPEG_QUALITY, int(self.args.depth_stream_quality)])
         self.last_depth = depth
         if not ok:

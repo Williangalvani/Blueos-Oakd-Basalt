@@ -197,7 +197,7 @@ def test_image_stream_rows_flag_raw_fallbacks():
          "viewed": True, "mbps": 0.912},
         {"name": "live_stream", "label": "Live stream", "codec": "mjpeg", "quality": 70, "encoded_on": "pi",
          "viewed": False, "mbps": None,
-         "fallback": "fallback: raw depth over the link, encoded on the Pi: blank frames from manip"},
+         "fallback": "fallback: raw depth over the link, encoded on the Pi: blank frames from mono_features"},
         {"name": "snapshot_rect_left", "label": "Snapshot rect_left", "codec": "mjpeg", "quality": 95,
          "encoded_on": "camera", "per_request": True, "last_bytes": 61440},
         {"name": "snapshot_depth", "label": "Snapshot depth", "codec": "png", "quality": None, "encoded_on": "pi",

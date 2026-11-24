@@ -209,7 +209,7 @@ OLD_CONFIG = {
     "algorithm": "basalt", "fps": 3, "resolution_width": 320, "resolution_height": 200, "min_inliers": 25,
     "optical_flow_grid_size": 80, "optical_flow_max_iterations": 3, "optical_flow_levels": 2,
     "optical_flow_skip_frames": 1, "vio_max_states": 2, "vio_max_kfs": 4, "vio_max_iterations": 3,
-    "dvl_source": "no_such_source", "stereo_median": "9x9",
+    "dvl_source": "no_such_source", "stereo_median": "9x9", "depth_stream_encoding": "manip",
 }
 
 
@@ -221,6 +221,7 @@ def test_an_older_saved_config_loads_without_the_removed_settings(client, tmp_pa
     # Kept settings keep their value; a removed choice falls back to the default
     assert (config["fps"], config["resolution_width"], config["resolution_height"]) == (3, 320, 200)
     assert config["min_inliers"] == 25 and config["dvl_source"] == "auto" and config["stereo_median"] == "7x7"
+    assert config["depth_stream_encoding"] == "auto"
     command = main.build_vio_command(config)
     assert command[:3] == ["python", "-u", "/app/pnp_vio.py"]
     assert http.get("/api/config").json() == config
@@ -753,7 +754,7 @@ def test_status_lists_every_image_stream_and_flags_the_raw_fallbacks(client, tmp
     running(http)
     meta = {"pid": os.getpid(), "unix_time": time.time(), "streaming": True, "variant": "host_jpeg",
             "encoded_on": "pi", "codec": "mjpeg", "quality": 70, "depth_frames": "on_demand", "kbps": 300.0,
-            "fallback": {"reason": "blank frames from manip", "from": "manip"}}
+            "fallback": {"reason": "blank frames from mono_features", "from": "mono_features"}}
     vio_telemetry.DEFAULT_DIR.mkdir(parents=True, exist_ok=True)
     snapshots.atomic_write(vio_telemetry.DEFAULT_DIR / depth_stream.META_FILE, json.dumps(meta).encode())
     service = snapshots.SnapshotService(("rect_left", "rect_right", "depth"), lambda stream, raw: None, None,
@@ -767,7 +768,7 @@ def test_status_lists_every_image_stream_and_flags_the_raw_fallbacks(client, tmp
     live = by_name["live_stream"]
     assert (live["codec"], live["quality"], live["encoded_on"], live["over_link"], live["viewed"]) == (
         "mjpeg", 70, "pi", "raw", True)
-    assert live["fallback"] == "fallback: raw depth over the link, encoded on the Pi: blank frames from manip"
+    assert live["fallback"] == "fallback: raw depth over the link, encoded on the Pi: blank frames from mono_features"
     left = by_name["snapshot_rect_left"]
     assert (left["codec"], left["quality"], left["encoded_on"], left["fallback"]) == ("mjpeg", 95, "camera", None)
     assert by_name["snapshot_depth"]["measurement"] is True and by_name["snapshot_depth"]["fallback"] is None

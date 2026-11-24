@@ -160,9 +160,8 @@ def parse_args(argv=None):
                              'mono_features (the rectified-left camera image the features are tracked on, '
                              'straight into the camera encoder; the browser draws the features), disparity (the '
                              'StereoDepth disparity straight into the camera encoder; needs a RAW8 disparity: '
-                             'subpixel and extended off and no filter after the median), manip (a Script GRAY8 '
-                             'depth frame through ImageManip), nv12 or yuv400p (the Script builds the encoder '
-                             'frame), host_jpeg (the Pi encodes the depth), auto (mono_features, then host_jpeg '
+                             'subpixel and extended off and no filter after the median), '
+                             'host_jpeg (the Pi encodes the depth), auto (mono_features, then host_jpeg '
                              'if the camera sends no or blank frames)')
     parser.add_argument('--depth-stream-debug', action=argparse.BooleanOptionalAction, default=False,
                         help='While the depth stream runs, raise the camera log level to DEBUG; the stream nodes\' '
@@ -598,12 +597,8 @@ def build_depth_stream(p, stereo, args, stereo_settings):
       the Script forwards the frame unchanged -> VideoEncoder;
     - disparity (explicit, only with a RAW8 disparity: stereo_config.disparity_format of the applied config):
       stereo.disparity -> the Script forwards it -> VideoEncoder. Both encode StereoDepth's own pooled frames,
-      which the encoder takes as RAW8 (test14); RAW16 would be dropped, so it runs as host_jpeg instead;
-    - manip: stereo.depth -> the Script converts to a GRAY8 frame -> ImageManip (NV12) -> VideoEncoder;
-    - nv12, yuv400p: stereo.depth -> the Script builds the encoder's frame -> VideoEncoder.
-    The Script-made frames have no pool: on an OAK-D-W ImageManip made them a constant image and the
-    encoder dropped them (test12); they stay for diagnosis. The encoder and host queues are non-blocking,
-    so a slow consumer only drops stream frames. The Script's 'status' output carries its errors and timing
+      which the encoder takes as RAW8 (test14); RAW16 would be dropped, so it runs as host_jpeg instead.
+    The encoder and host queues are non-blocking, so a slow consumer only drops stream frames. The Script's 'status' output carries its errors and timing
     (depth_stream.parse_device_status). host_jpeg adds nothing on the camera (the queues are None).
 
     Returns (control queue, JPEG queue, status queue, info, node log names).
@@ -631,15 +626,14 @@ def build_depth_stream(p, stereo, args, stereo_settings):
     if variant is None:
         return None, None, None, info, ()
 
-    frame_type = depth_stream.SCRIPT_FRAME_TYPES[variant]
     script = p.create(dai.node.Script)
     sources = {depth_stream.MONO_FEATURES: stereo.rectifiedLeft, depth_stream.DISPARITY: stereo.disparity}
-    sources.get(variant, stereo.depth).link(script.inputs["depth"])
+    sources[variant].link(script.inputs["depth"])
     script.inputs["depth"].setBlocking(False)
     script.inputs["depth"].setMaxSize(1)
     script.inputs["control"].setBlocking(False)
     script.inputs["control"].setMaxSize(4)
-    script.setScript(depth_stream.device_script(every, min_mm, max_mm, frame_type=frame_type))
+    script.setScript(depth_stream.device_script(every))
     if variant == depth_stream.DISPARITY:
         info["disparity_max"] = int(fmt["max_disparity"])
 
@@ -649,18 +643,7 @@ def build_depth_stream(p, stereo, args, stereo_settings):
     encoder.input.setBlocking(False)
     encoder.input.setMaxSize(1)
     nodes = [script, encoder]
-    if variant == depth_stream.MANIP:
-        manip = p.create(dai.node.ImageManip)
-        manip.initialConfig.setFrameType(dai.ImgFrame.Type.NV12)
-        manip.setMaxOutputFrameSize(depth_stream.manip_output_size(args.width, args.height))
-        manip.setNumFramesPool(depth_stream.MANIP_FRAMES_POOL)
-        manip.inputImage.setBlocking(False)
-        manip.inputImage.setMaxSize(1)
-        script.outputs["gray"].link(manip.inputImage)
-        manip.out.link(encoder.input)
-        nodes.append(manip)
-    else:
-        script.outputs["gray"].link(encoder.input)
+    script.outputs["gray"].link(encoder.input)
 
     control_queue = script.inputs["control"].createInputQueue(maxSize=4, blocking=False)
     frame_queue = encoder.out.createOutputQueue(maxSize=2, blocking=False)
@@ -773,14 +756,11 @@ def build_pipeline(p, device, args, stereo_settings):
         (handles.depth_stream_control_queue, handles.depth_stream_queue, handles.depth_stream_status_queue,
          handles.depth_stream_info, handles.depth_stream_nodes) = build_depth_stream(p, stereo, args, stereo_settings)
     # One extra frame per stereo output pool for the frame each gate queue holds, plus the one the
-    # depth stream Script is converting; the forwarding variants (mono_features, disparity) send
-    # StereoDepth's own frame on, which then also waits in (and is read by) the encoder (so does a
-    # rectified snapshot on its way to the mono encoder). points: the depth points Script's queue, the
-    # frame it keeps for the next request, the SLC's input and passthrough, and the full depth gate's frame
-    stream_extra = 0
-    if handles.depth_stream_control_queue is not None:
-        forwarding = handles.depth_stream_info.get("variant") in depth_stream.FORWARD_VARIANTS
-        stream_extra = 3 if forwarding else 2
+    # depth stream Script is forwarding; it sends StereoDepth's own frame on, which then also waits in (and
+    # is read by) the encoder (so does a rectified snapshot on its way to the mono encoder). points: the
+    # depth points Script's queue, the frame it keeps for the next request, the SLC's input and passthrough,
+    # and the full depth gate's frame
+    stream_extra = 3 if handles.depth_stream_control_queue is not None else 0
     points_extra = depth_points.POOL_FRAMES + 1 if points else 0
     snapshot_extra = 0
     if args.snapshots:

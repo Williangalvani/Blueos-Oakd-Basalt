@@ -17,25 +17,20 @@ Encoding variants (depth_stream_encoding, VARIANTS; the StereoDepth output each 
                subpixel off, extended off and no post-processing filter after the median
                (stereo_config.disparity_format; with the speckle filter on after the median it is RAW16);
                image: the disparity itself (DISPARITY_ENCODING, see "Disparity encoding" below)
-    manip      stereo.depth -> Script -> GRAY8 frame -> ImageManip (to NV12) -> VideoEncoder. Blank on test12
-    nv12       stereo.depth -> Script -> NV12 frame (the gray plane + a 128 chroma plane) -> VideoEncoder.
-               No output on test12
-    yuv400p    stereo.depth -> Script -> YUV400p frame (w*h bytes) -> VideoEncoder. No output on test12
     host_jpeg  nothing extra on the camera: the VIO process converts the depth frame it already has and
                JPEG-encodes it on a worker thread (HostJpegEncoder), capped at HOST_CPU_BUDGET of a core
     auto       (default) mono_features; host_jpeg from the start if the image size does not suit the
                encoder; switches to host_jpeg for the rest of the run (with the reason in the metadata's
                fallback) if the encoder stalls or its frames are blank. auto never picks disparity: it
                depends on the stereo settings, so it is only built when asked for
-manip, nv12 and yuv400p (gray8-depth-linear, DEPTH_ENCODING) build their frame with the Script runtime's
-ImgFrame API (DEVICE_IMGFRAME_API). They are kept for diagnosis.
 
 Why only StereoDepth's own frames work on the camera (firmware a406121b strings, depthai-core v3.3.0
-source, test12, test13 and the stereo probe on an OAK-D-W, test14, depthai 3.3.0, 640x400 @ 10 fps):
+source, test12, test13 and the stereo probe on an OAK-D-W, test14, depthai 3.3.0, 640x400 @ 10 fps), and
+why the earlier Script-built depth variants (manip, nv12, yuv400p) were removed:
 - A Script's new ImgFrame comes from a DynamicPool of size 0. ImageManip (PlgImageManipV2) needs an input
   pool of at least 2 ("Pool size of the input message is too small... Currently it is 0") and then sends a
   constant image (test12: every JPEG 4668 bytes, every pixel 1). The VideoEncoder drops pool-less frames
-  with no log (test12: nv12 and yuv400p, 0 bytes).
+  with no log (test12: Script-made NV12 and YUV400p frames, 0 bytes).
 - StereoDepth's outputs come from its own pools (StereoDepth.setNumFramesPool, default 3; the pipeline
   raises it), and a Script that forwards the frame it received (the same object) keeps that pool
   (test13: no pool error).
@@ -63,23 +58,22 @@ VideoEncoder (MJPEG) input requirements, from the RVC2 firmware a406121b (deptha
 asserts of its PlgVidEnc, the depthai-core source and test14:
 - an 8-bit type: NV12, YUV400p, or RAW8 from a StereoDepth pool (test14); the warning names only NV12 and
   YUV400p ("Arrived frame type ({}) is not either NV12 or YUV400p (8-bit Gray)"). GRAY8 (30) is dropped
-  (test10), which is why manip converts to NV12 first, and RAW16 (14) too (test14);
+  (test10), and RAW16 (14) too (test14);
 - width a multiple of 32 and height a multiple of 2 ("Width must be multiple of 32, height multiple of 2
   for MJPEG encoder profile"), at most 16384 x 8192;
 - every frame the size of the first one ("Arrived frame ({}, {}) does not match the encoder size"; asserts
   frm->fb.spec.width == FrameInfo.iWidth and height);
 - YUV400p needs an extra gray chroma buffer the encoder reserves ("Encoder couldn't reserve extra space for
   gray chroma buffer", maxGrayChromaBufferSize != -1); NV12 does not;
-- source, timestamp and sequence metadata present (asserts pSrcMeta, pPtsMeta, pSeqMeta != nullptr), so the
-  Script copies the depth frame's timestamp and sequence number;
+- source, timestamp and sequence metadata present (asserts pSrcMeta, pPtsMeta, pSeqMeta != nullptr);
 - 64-byte aligned buffer base and size (asserts ((uint32_t)frm->base & 63) == 0, (frm->size & 63) == 0):
   pool buffers are; a Script's ImgFrame(size) buffer is not guaranteed to be;
 - only one of the 'bitstream' and 'out' outputs may be linked;
 - with the debug log level it logs "VideoEncoder took '{}' ms." per frame (depth_stream_debug).
 WIDTH_ALIGN and HEIGHT_ALIGN check the size before building the pipeline.
 
-8-bit depth encoding (DEPTH_ENCODING: manip, nv12, yuv400p, host_jpeg; linear in depth over the stereo
-threshold range, near bright):
+8-bit depth encoding (DEPTH_ENCODING: host_jpeg; linear in depth over the stereo threshold range, near
+bright):
     0                      invalid (no depth, or outside min_mm..max_mm, as the VIO sees it)
     GRAY_FAR..GRAY_NEAR    max_mm (far) .. min_mm (near)
 Depth is quantised to 2**shift mm before the mapping (16 mm for the default 4 m range). JPEG ringing
@@ -100,9 +94,9 @@ own depth (stereo.depth, sampled every EXPECT_INTERVAL_S) has valid pixels that 
 or one flat depth is constant and right, so it is not blank; a camera image whose depth varies is not
 constant either. auto falls back to host_jpeg ("blank frames from <variant>"); an explicit variant only
 reports it. Between them, encoder_stalled (no JPEG) and blank (useless JPEGs) cover what test12 and test14
-saw from the camera variants that can't work.
+saw from camera frames the encoder can't take.
 
-Device log: DeviceLog keeps the camera's log lines (VideoEncoder, ImageManip and the stream Script first),
+Device log: DeviceLog keeps the camera's log lines (VideoEncoder and the stream Script first),
 which the metadata carries. With depth_stream_debug, DeviceLogDebug raises the device log level to DEBUG
 while the stream runs and restores it when the stream stops.
 
@@ -127,8 +121,6 @@ LEASE_S = 4.0
 GRAY_FAR = 16
 GRAY_NEAR = 255
 GRAY_INVALID_BELOW = 8
-# Device-side conversion works on this many rows at a time to keep the Script's heap small
-CHUNK_ROWS = 50
 CENTER_PATCH = 5
 BOUNDARY = "depthframe"
 RATE_WINDOW_S = 5.0
@@ -155,32 +147,17 @@ EXPECT_INTERVAL_S = 1.0
 EXPECT_MAX_AGE_S = 3.0
 EXPECT_VALID_MIN = 0.05
 EXPECT_GRAY_STD_MIN = 3.0
-# ImgFrame methods of the Script runtime in the RVC2 firmware (depthai 3.3.0, device side a406121b);
-# a subset of the host's dai.ImgFrame. Its constructor is ImgFrame(size in bytes).
-DEVICE_IMGFRAME_API = frozenset({
-    "getData", "setData", "getWidth", "setWidth", "getHeight", "setHeight", "setSize", "getType", "setType",
-    "getTimestamp", "getTimestampDevice", "setTimestamp", "getSequenceNum", "setSequenceNum",
-    "getInstanceNum", "setInstanceNum", "getCategory", "setCategory", "getTransformation", "setTransformation",
-})
-# Frame types the RVC2 VideoEncoder takes; it drops others with "Arrived frame type (N) is not either NV12 or
-# YUV400p (8-bit Gray)" (GRAY8 is N = 30 on test10, RAW16 N = 14 on test14). YUV400p is GRAY8's single 8-bit
-# plane; RAW8 from StereoDepth's pool (the disparity, rectifiedLeft/Right) encodes too (test14).
-DEVICE_ENCODER_INPUT_TYPES = frozenset({"NV12", "YUV400p", "RAW8"})
 # MJPEG profile: width a multiple of 32, height a multiple of 2
 WIDTH_ALIGN = 32
 HEIGHT_ALIGN = 2
 
-AUTO, MONO_FEATURES, DISPARITY, MANIP, NV12, YUV400P, HOST_JPEG = (
-    "auto", "mono_features", "disparity", "manip", "nv12", "yuv400p", "host_jpeg")
-VARIANTS = (AUTO, MONO_FEATURES, DISPARITY, MANIP, NV12, YUV400P, HOST_JPEG)
+AUTO, MONO_FEATURES, DISPARITY, HOST_JPEG = "auto", "mono_features", "disparity", "host_jpeg"
+VARIANTS = (AUTO, MONO_FEATURES, DISPARITY, HOST_JPEG)
 DEFAULT_VARIANT = AUTO
-# The frame type the Script builds for each variant that runs on the camera (None: it forwards the
-# StereoDepth frame unchanged, straight into the encoder)
-SCRIPT_FRAME_TYPES = {MONO_FEATURES: None, DISPARITY: None, MANIP: "GRAY8", NV12: "NV12", YUV400P: "YUV400p"}
-FORWARD_VARIANTS = tuple(v for v, frame_type in SCRIPT_FRAME_TYPES.items() if frame_type is None)
+# The variants that run on the camera: the Script forwards the StereoDepth frame unchanged into the encoder
+CAMERA_VARIANTS = (MONO_FEATURES, DISPARITY)
 # The StereoDepth output each variant shows (info "source")
-SOURCES = {MONO_FEATURES: "rectifiedLeft", DISPARITY: "disparity", MANIP: "depth", NV12: "depth",
-           YUV400P: "depth", HOST_JPEG: "depth"}
+SOURCES = {MONO_FEATURES: "rectifiedLeft", DISPARITY: "disparity", HOST_JPEG: "depth"}
 # What the gray values mean (info "encoding")
 DEPTH_ENCODING, DISPARITY_ENCODING, MONO_ENCODING = "gray8-depth-linear", "gray8-disparity", "gray8-mono-rectified-left"
 # StereoDepth's disparity search range without subpixel and extended disparity (stereo_config sets
@@ -200,14 +177,14 @@ DEVICE_LOG_LINES = 30
 DEVICE_LOG_OTHER_LINES = 10
 DEVICE_LOG_MAX_CHARS = 300
 # Device log lines from these node types count as the stream's (besides its own Script)
-STREAM_NODE_TYPES = ("VideoEncoder", "ImageManip")
+STREAM_NODE_TYPES = ("VideoEncoder",)
 
 
 def device_variant(variant):
     """The variant that runs on the camera at the start (auto starts with mono_features), None for host_jpeg."""
     if variant == AUTO:
         return MONO_FEATURES
-    return variant if variant in SCRIPT_FRAME_TYPES else None
+    return variant if variant in CAMERA_VARIANTS else None
 
 
 def disparity_problem(disparity_format):
@@ -227,8 +204,7 @@ def resolve_variant(requested, disparity_problem=None, problem=None):
     (variant built at the start, None for host_jpeg; why it is not the requested one, or None). auto:
     mono_features, or host_jpeg straight away if the size does not suit the encoder (problem). An explicit
     disparity request runs as host_jpeg when the disparity is not RAW8 (disparity_problem, with the reason);
-    the other explicit variants are built as asked (manip/nv12/yuv400p for diagnosis: their Script-made frames
-    came out blank or not at all on an OAK-D-W, test12).
+    mono_features and host_jpeg are built as asked.
     """
     variant = device_variant(requested)
     if requested == AUTO and problem:
@@ -342,126 +318,33 @@ def stream_divisor(camera_fps, stream_fps):
     return max(1, int(round(float(camera_fps) / max(float(stream_fps), 1e-3))))
 
 
-def _frame_builder(frame_type):
-    """Script source of gray_frame(width, height, gray) for one SCRIPT_FRAME_TYPES value."""
-    if frame_type == "NV12":
-        head = [
-            "chroma = b''",
-            "",
-            "def gray_frame(width, height, gray):",
-            "    global chroma",
-            "    size = width * height",
-            "    if len(chroma) != size // 2:",
-            "        chroma = b'\\x80' * (size // 2)",
-            "    out = ImgFrame(size + size // 2)",
-            "    out.setData(gray + chroma)",
-        ]
-    elif frame_type in ("YUV400p", "GRAY8"):
-        head = [
-            "def gray_frame(width, height, gray):",
-            "    out = ImgFrame(width * height)",
-            "    out.setData(gray)",
-        ]
-    else:
-        raise ValueError(f"no Script frame builder for {frame_type!r}")
-    return head + [
-        f"    out.setType(ImgFrame.Type.{frame_type})",
-        "    out.setWidth(width)",
-        "    out.setHeight(height)",
-        "    return out",
-    ]
-
-
-def device_script(every, min_mm, max_mm, chunk_rows=CHUNK_ROWS, stats_every=150, report_interval=REPORT_INTERVAL_S,
-                  frame_type="YUV400p"):
+def device_script(every, stats_every=150, report_interval=REPORT_INTERVAL_S):
     """
-    Script node source: inputs 'depth' (the source frame: RAW16 mm, or what a forwarding variant shows) and
-    'control' (Buffer, sequence number 1 = stream, 0 = stop); outputs 'gray' (an 8-bit ImgFrame) for the
-    VideoEncoder or ImageManip and 'status' (Buffer, see parse_device_status) for the host. Plain CPython
-    builtins only.
-
-    frame_type (SCRIPT_FRAME_TYPES): "YUV400p" (w*h bytes) or "NV12" (the gray plane then a 128 chroma
-    plane, w*h*3/2 bytes) for the VideoEncoder, "GRAY8" (w*h bytes) for ImageManip. None (FORWARD_VARIANTS:
-    mono_features, disparity): a gate only, the received RAW8 frame is sent on unchanged (the same message,
-    so it keeps its pool buffer and metadata; min_mm and max_mm are not used).
-
-    Only the on-device message API (the RVC2 firmware's Script bindings, not the host's): ImgFrame(size in
-    bytes) and Buffer(size in bytes), each filled with setData; ImgFrame.setType/setWidth/setHeight (no
-    setStride), setTimestamp/setSequenceNum (no setMetadata or setTimestampDevice); see
-    DEVICE_IMGFRAME_API.
+    Script node source, a gate: inputs 'depth' (the StereoDepth frame the variant shows, RAW8) and 'control'
+    (Buffer, sequence number 1 = stream, 0 = stop); outputs 'gray' (the received frame, sent on unchanged:
+    the same message, so it keeps its pool buffer and metadata) for the VideoEncoder and 'status' (Buffer, see
+    parse_device_status) for the host. Plain CPython builtins and the on-device message API only (the RVC2
+    firmware's Script bindings: Buffer(size in bytes) filled with setData; ImgFrame getters).
 
     Errors: each failed frame counts; the first one, then at most one per report_interval, is sent on
     'status' with the running count, and the 1st and every 100th also go to node.warn (the host log). While
     streaming it reports its count of frames sent after the first frame, then at most once per
-    report_interval, and (status and node.warn) its conversion time every stats_every frames: the
-    measured on-device cost.
+    report_interval, and (status and node.warn) its time per frame every stats_every frames: the measured
+    on-device cost.
     """
-    if frame_type is None:
-        convert = [
-            "        width = frame.getWidth()",
-            "        height = frame.getHeight()",
-            "        out = frame",
-        ]
-    else:
-        convert = [
-            "        try:",
-            "            width, height, gray = to_gray(frame)",
-            "            out = gray_frame(width, height, gray)",
-            "        except Exception as e:",
-            "            failed('convert', e)",
-            "            frame = None",
-            "            continue",
-            "        try:",
-            "            copy_metadata(frame, out)",
-            "        except Exception as e:",
-            "            failed('metadata', e)",
-        ]
-    _, t_hi, t_lo, t_out = encoding_tables(min_mm, max_mm)
     return "\n".join([
         f"every = {int(every)}",
-        f"chunk_rows = {int(chunk_rows)}",
         f"STATS_EVERY = {int(stats_every)}",
         f"REPORT_INTERVAL = {float(report_interval)!r}",
         f"REPORT_MAX = {int(REPORT_MAX_CHARS)}",
         f"PROGRESS_EVERY = {int(PROGRESS_EVERY)}",
-        *([] if frame_type is None else [
-            f"t_hi = {t_hi!r}",
-            f"t_lo = {t_lo!r}",
-            f"t_out = {t_out!r}",
-            "",
-            *_converter(),
-            "",
-            *_frame_builder(frame_type),
-            "",
-            "def copy_metadata(src, out):",
-            "    out.setTimestamp(src.getTimestamp())",
-            "    out.setSequenceNum(src.getSequenceNum())",
-        ]),
         "",
-        *_script_loop(convert),
+        *_script_loop([
+            "        width = frame.getWidth()",
+            "        height = frame.getHeight()",
+            "        out = frame",
+        ]),
     ])
-
-
-def _converter():
-    return [
-        "def to_gray(frame):",
-        "    width = frame.getWidth()",
-        "    height = frame.getHeight()",
-        "    data = frame.getData()",
-        "    row = width * 2",
-        "    stride = len(data) // height if height else row",
-        "    parts = []",
-        "    for top in range(0, height, chunk_rows):",
-        "        rows = min(chunk_rows, height - top)",
-        "        if stride == row:",
-        "            raw = bytes(data[top * row:(top + rows) * row])",
-        "        else:",
-        "            raw = b''.join([bytes(data[r * stride:r * stride + row]) for r in range(top, top + rows)])",
-        "        hi = int.from_bytes(raw[1::2].translate(t_hi), 'little')",
-        "        lo = int.from_bytes(raw[0::2].translate(t_lo), 'little')",
-        "        parts.append((hi | lo).to_bytes(rows * width, 'little').translate(t_out))",
-        "    return width, height, b''.join(parts)",
-    ]
 
 
 def _script_loop(convert):
@@ -774,7 +657,7 @@ class DeviceLog:
     """
     The camera's log lines for /api/status. on_message is the depthai log callback (device.addLogCallback;
     called on depthai's logging thread with a LogMessage: nodeIdName, level, payload). Lines from the
-    stream's own nodes (nodes: their "Type(id)" names) or any VideoEncoder/ImageManip, or that mention the
+    stream's own nodes (nodes: their "Type(id)" names) or any VideoEncoder, or that mention the
     depth stream, go to `stream` (the last DEVICE_LOG_LINES); the rest to `other`.
     """
 

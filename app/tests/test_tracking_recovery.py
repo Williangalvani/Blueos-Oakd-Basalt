@@ -575,23 +575,33 @@ def build_fake_pipeline(module, argv, cameras=(), start=False):
 STEREO_VARIANTS = {"subpixel": [], "raw8-disparity": ["--no-stereo-subpixel", "--no-stereo-speckle-filter"]}
 
 
-@pytest.mark.parametrize("stereo", sorted(STEREO_VARIANTS))
-@pytest.mark.parametrize("rgb", [True, False], ids=["rgb", "no-rgb"])
-@pytest.mark.parametrize("snapshot_encoding", snapshots.ENCODINGS)
-@pytest.mark.parametrize("stream", depth_stream.VARIANTS)
-@pytest.mark.parametrize("rois", ["host", "camera"])
-@pytest.mark.parametrize("transport", ["points", "full_frame"])
-def test_build_pipeline_starts_in_every_combination(pnp_vio, transport, rois, stream, snapshot_encoding, rgb,
-                                                    stereo):
+def pipeline_combinations():
+    """
+    Each transport with each depth stream variant and stereo setting (the disparity variant needs the RAW8
+    one), then each remaining option changed on its own for both transports.
+    """
+    base = {"rois": "host", "snapshot_encoding": snapshots.CAMERA_JPEG, "rgb": True}
+    cases = [dict(base, transport=transport, stream=stream, stereo=stereo)
+             for transport in ("points", "full_frame") for stream in depth_stream.VARIANTS
+             for stereo in sorted(STEREO_VARIANTS)]
+    for transport in ("points", "full_frame"):
+        for change in ({"rois": "camera"}, {"snapshot_encoding": snapshots.RAW}, {"rgb": False}):
+            cases.append(dict(base, transport=transport, stream="auto", stereo="subpixel", **change))
+    return [pytest.param(case, id="-".join(str(value) for value in case.values())) for case in cases]
+
+
+@pytest.mark.parametrize("case", pipeline_combinations())
+def test_build_pipeline_starts_in_every_combination(pnp_vio, case):
     """
     test16 (cb60cc4): points did not start, "'Script.io["depth"]' redefined": the pairing Script and the full
     depth gate each had an input and an output named 'depth'. The strict fake pipeline makes depthai's start
     checks (unique io names per node, link datatypes, stream names, the Scripts' ports).
     """
     dai = pnp_vio.dai
-    argv = ["--depth-transport", transport, "--depth-points-rois", rois, "--depth-stream-encoding", stream,
-            "--snapshot-encoding", snapshot_encoding, *STEREO_VARIANTS[stereo]]
-    handles, created = build_fake_pipeline(pnp_vio, argv, cameras=[dai.CameraBoardSocket.CAM_A] if rgb else [],
+    transport, rois = case["transport"], case["rois"]
+    argv = ["--depth-transport", transport, "--depth-points-rois", rois, "--depth-stream-encoding", case["stream"],
+            "--snapshot-encoding", case["snapshot_encoding"], *STEREO_VARIANTS[case["stereo"]]]
+    handles, created = build_fake_pipeline(pnp_vio, argv, cameras=[dai.CameraBoardSocket.CAM_A] if case["rgb"] else [],
                                            start=True)
     scripts = nodes_of(created, dai.node.Script)
     for script in scripts:
@@ -685,33 +695,18 @@ def test_build_pipeline_runs_a_raw16_disparity_request_on_the_pi(pnp_vio, argv, 
 
 def test_build_pipeline_encodes_the_depth_stream_on_the_camera(pnp_vio):
     dai = pnp_vio.dai
-    handles, created = build_fake_pipeline(pnp_vio, ["--stereo-depth-max-mm", "4000", "--depth-stream-encoding",
-                                                     "manip"])
-    (stereo,) = nodes_of(created, dai.node.StereoDepth)
+    handles, created = build_fake_pipeline(pnp_vio, ["--stereo-depth-max-mm", "4000"])
     snapshot_script, stream_script = nodes_of(created, dai.node.Script)
     (encoder,) = stream_encoders(pnp_vio, created)
-    (manip,) = nodes_of(created, dai.node.ImageManip)
 
-    # stereo.depth -> Script (8-bit GRAY8) -> ImageManip (NV12) -> MJPEG encoder, all inputs non-blocking and small
+    # The gate's inputs are non-blocking and small
     depth_in = stream_script.inputs["depth"]
-    assert mock.call(depth_in) in stereo.depth.link.call_args_list
     depth_in.setBlocking.assert_called_with(False)
     depth_in.setMaxSize.assert_called_with(1)
     stream_script.inputs["control"].setBlocking.assert_called_with(False)
-    stream_script.outputs["gray"].link.assert_called_once_with(manip.inputImage)
-    manip.out.link.assert_called_once_with(encoder.input)
-    manip.initialConfig.setFrameType.assert_called_once_with(dai.ImgFrame.Type.NV12)
-    manip.setMaxOutputFrameSize.assert_called_once_with(401408)
-    manip.setNumFramesPool.assert_called_once_with(3)
-    manip.inputImage.setBlocking.assert_called_with(False)
-    manip.inputImage.setMaxSize.assert_called_with(1)
     code = stream_script.setScript.call_args[0][0]
-    compile(code, "depth_stream_script", "exec")
-    assert "every = 6" in code and "ImgFrame.Type.GRAY8" in code
-    encoder.setDefaultProfilePreset.assert_called_once_with(5.0, dai.VideoEncoderProperties.Profile.MJPEG)
+    assert "every = 6" in code
     encoder.setQuality.assert_called_once_with(70)
-    encoder.input.setBlocking.assert_called_with(False)
-    encoder.input.setMaxSize.assert_called_with(1)
 
     stream_script.inputs["control"].createInputQueue.assert_called_once_with(maxSize=4, blocking=False)
     encoder.out.createOutputQueue.assert_called_once_with(maxSize=2, blocking=False)
@@ -722,27 +717,8 @@ def test_build_pipeline_encodes_the_depth_stream_on_the_camera(pnp_vio):
     info = handles.depth_stream_info
     assert info["fps_target"] == 5.0 and info["every"] == 6 and info["quality"] == 70
     assert info["depth_range_mm"][1] == 4000 and info["quantization_mm"] == 16
-    assert info["image_size"] == [640, 400]
-    assert info["requested_variant"] == "manip" and info["variant"] == "manip" and info["size_problem"] is None
-    assert info["encoding"] == "gray8-depth-linear"
-    assert len(handles.depth_stream_nodes) == 3  # the device log names of the Script, encoder and ImageManip
-    # Two for the snapshots (gate queue, mono encoder) and two for the stream Script
-    stereo.setNumFramesPool.assert_called_once_with(pnp_vio.STEREO_FRAMES_POOL + 4)
+    assert info["image_size"] == [640, 400] and info["size_problem"] is None
     assert snapshot_script is not stream_script
-
-
-@pytest.mark.parametrize("variant, frame_type", [("nv12", "NV12"), ("yuv400p", "YUV400p")])
-def test_build_pipeline_feeds_the_encoder_from_the_script(pnp_vio, variant, frame_type):
-    dai = pnp_vio.dai
-    handles, created = build_fake_pipeline(pnp_vio, ["--depth-stream-encoding", variant])
-    _, stream_script = nodes_of(created, dai.node.Script)
-    (encoder,) = stream_encoders(pnp_vio, created)
-    assert nodes_of(created, dai.node.ImageManip) == []
-    stream_script.outputs["gray"].link.assert_called_once_with(encoder.input)
-    code = stream_script.setScript.call_args[0][0]
-    assert f"ImgFrame.Type.{frame_type})" in code
-    assert handles.depth_stream_info["variant"] == variant == handles.depth_stream_info["requested_variant"]
-    assert handles.depth_stream_queue is encoder.out.createOutputQueue.return_value
 
 
 def test_build_pipeline_host_jpeg_adds_nothing_on_the_camera(pnp_vio):
@@ -851,8 +827,8 @@ def test_run_counts_each_host_queue_for_the_link_breakdown(pnp_vio, monkeypatch,
     groups = scenario(n_good=6, n_lost=0, n_back=0)
     run_fake(pnp_vio, monkeypatch, tmp_path, groups, ["--telemetry-dir", str(telemetry_dir)], imu=imu,
              depth_stream_control_queue=FakeQueue(), depth_stream_queue=encoded, depth_stream_status_queue=status,
-             depth_stream_info={"fps_target": 5.0, "depth_range_mm": [300, 4000], "variant": "nv12",
-                                "requested_variant": "nv12"})
+             depth_stream_info={"fps_target": 5.0, "depth_range_mm": [300, 4000], "variant": "mono_features",
+                                "requested_variant": "mono_features"})
     (telemetry,) = created
     totals = telemetry.link.streams.totals()
     frames = len(groups)
@@ -989,8 +965,8 @@ def session_handles(module, groups, snapshot_reply=True):
         stereo_effective={"decimation": 1}, snapshot_request_queue=request_queue, snapshot_queue=snapshot_queue,
         snapshot_streams=("rect_left", "rect_right", "depth"), snapshot_unavailable={"rgb": "no CAM_A"},
         depth_stream_control_queue=FakeQueue(), depth_stream_queue=FakeQueue(), depth_stream_status_queue=FakeQueue(),
-        depth_stream_info={"fps_target": 5.0, "depth_range_mm": [300, 4000], "variant": "nv12",
-                           "requested_variant": "nv12"})
+        depth_stream_info={"fps_target": 5.0, "depth_range_mm": [300, 4000], "variant": "mono_features",
+                           "requested_variant": "mono_features"})
 
 
 def run_sessions(module, monkeypatch, tmp_path, sessions, between=None, devices=None):

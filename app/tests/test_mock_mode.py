@@ -327,8 +327,7 @@ def test_the_mock_auto_streams_the_rectified_left_image_on_the_camera(tmp_path):
 @pytest.mark.parametrize("encoding, variant, argv", [
     ("auto", "mono_features", []), ("mono_features", "mono_features", []),
     ("disparity", "disparity", ["--no-stereo-subpixel", "--no-stereo-speckle-filter"]),
-    ("disparity", "disparity", ["--no-stereo-subpixel", "--stereo-median-last"]),
-    ("manip", "manip", []), ("nv12", "nv12", []), ("yuv400p", "yuv400p", [])])
+    ("disparity", "disparity", ["--no-stereo-subpixel", "--stereo-median-last"])])
 def test_the_mock_reports_the_camera_variant_and_its_debug_log(tmp_path, encoding, variant, argv):
     vio, stream = mock_depth_vio(tmp_path, "--depth-stream-encoding", encoding, "--depth-stream-debug", *argv)
     meta = stream.meta()

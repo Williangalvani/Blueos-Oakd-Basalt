@@ -245,7 +245,7 @@ def test_widget_status_from_live_telemetry():
     # The depth encoding, blank frames and the pose's attitude source reach the widget
     status["pose"] = {"frame": "NED", "frame_text": "NED", "attitude_source": "gyro",
                       "attitude_text": "gyro-integrated, drifting", "attitude_age_s": 7.5, "x": 1.0}
-    blank = {"variant": "manip", "text": "blank frames from manip: ..."}
+    blank = {"variant": "mono_features", "text": "blank frames from mono_features: ..."}
     s = cockpit_widget.widget_status(None, status, {"encoding": "gray8-disparity", "blank": blank,
                                                     "disparity": {"nearest_mm": 347}}, False, now + 1)
     assert s["pose"] == {"frame": "NED", "frame_text": "NED", "attitude_source": "gyro",

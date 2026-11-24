@@ -91,9 +91,20 @@ class FakeOutput:
         self.sent.append(message)
 
 
-# Frames of StereoDepth's outputs come from its pool (numFramesPool, 3 + extras); a Script's ImgFrame(size)
-# from a dynamic pool of size 0 (test12: ImageManip logged "Currently it is 0")
+# Frames of StereoDepth's outputs come from its pool (numFramesPool, 3 + extras); a message the Script makes
+# itself has none (test12)
 STEREO_POOL = 5
+# ImgFrame methods of the Script runtime in the RVC2 firmware (depthai 3.3.0, device side a406121b);
+# a subset of the host's dai.ImgFrame. Its constructor is ImgFrame(size in bytes).
+DEVICE_IMGFRAME_API = frozenset({
+    "getData", "setData", "getWidth", "setWidth", "getHeight", "setHeight", "setSize", "getType", "setType",
+    "getTimestamp", "getTimestampDevice", "setTimestamp", "getSequenceNum", "setSequenceNum",
+    "getInstanceNum", "setInstanceNum", "getCategory", "setCategory", "getTransformation", "setTransformation",
+})
+# Frame types the RVC2 VideoEncoder takes; it drops others with "Arrived frame type (N) is not either NV12 or
+# YUV400p (8-bit Gray)" (GRAY8 is N = 30 on test10, RAW16 N = 14 on test14). RAW8 from StereoDepth's pool
+# (the disparity, rectifiedLeft/Right) encodes too (test14).
+ENCODER_INPUT_TYPES = frozenset({"NV12", "YUV400p", "RAW8"})
 
 
 class DepthFrame:
@@ -149,14 +160,6 @@ class Raw16DisparityFrame(DepthFrame):
     """
 
 
-def frame_fields(frame):
-    """(type, width, height, data) of a Script-made frame (its set* calls) or a pooled one (its getters)."""
-    if isinstance(frame, DeviceBuffer):
-        calls = frame.calls
-        return calls.get("setType"), calls.get("setWidth"), calls.get("setHeight"), bytes(calls.get("setData", b""))
-    return frame.getType(), frame.getWidth(), frame.getHeight(), bytes(frame.getData())
-
-
 class DeviceBuffer:
     """
     A message as the camera's Script runtime has it, not the host's dai one: the constructor only takes the
@@ -188,7 +191,7 @@ class Buffer(DeviceBuffer):
 
 
 class ImgFrame(DeviceBuffer):
-    API = depth_stream.DEVICE_IMGFRAME_API
+    API = DEVICE_IMGFRAME_API
 
     class Type(enum.IntEnum):
         """The values the device logs (GRAY8 is 'frame type (30)' in the VideoEncoder warning on test10)."""
@@ -204,60 +207,38 @@ class FakeVideoEncoder(FakeOutput):
     The camera's VideoEncoder (PlgVidEnc in the RVC2 firmware) at the end of the stream: it takes NV12,
     YUV400p and RAW8 (test14: StereoDepth's RAW8 disparity and rectified images encode directly) and drops
     anything else with the firmware's warning, once per frame (test10: GRAY8 frames sent, nothing encoded;
-    test14: RAW16, "frame type (14)"). A frame without a pool (a Script's ImgFrame) it drops silently (test12:
-    the nv12 and yuv400p variants sent frames, 0 bytes came back, no log line). The first frame sets the
-    encoder size.
+    test14: RAW16, "frame type (14)"). The first frame sets the encoder size.
     """
 
     def __init__(self):
         super().__init__()
         self.encoded = []
-        self.dropped = []
         self.warnings = []
         self.size = None
 
     def send(self, frame):
         super().send(frame)
-        kind, width, height, data = frame_fields(frame)
-        if kind not in {getattr(ImgFrame.Type, name) for name in depth_stream.DEVICE_ENCODER_INPUT_TYPES}:
-            number = 0 if kind is None else int(kind)
-            self.warnings.append(f"[VideoEncoder(11)] [warning] Arrived frame type ({number}) is not either NV12 or "
-                                 f"YUV400p (8-bit Gray)")
+        kind, width, height = frame.getType(), frame.getWidth(), frame.getHeight()
+        if kind not in {getattr(ImgFrame.Type, name) for name in ENCODER_INPUT_TYPES}:
+            self.warnings.append(f"[VideoEncoder(11)] [warning] Arrived frame type ({int(kind)}) is not either NV12 "
+                                 f"or YUV400p (8-bit Gray)")
             return
-        if frame.pool < 1:
-            self.dropped.append(frame)
-            return
+        assert frame.pool >= 1
         self.size = self.size or (width, height)
         if (width, height) != self.size:
             self.warnings.append(f"Arrived frame ({width}, {height}) does not match the encoder size {self.size}")
             return
-        planes = width * height * (3 if kind == ImgFrame.Type.NV12 else 2) // 2
-        assert len(data) == planes, "wrong plane size for the frame type"
-        assert not isinstance(frame, DeviceBuffer) or planes <= frame.size
+        assert len(bytes(frame.getData())) == width * height, "wrong plane size for RAW8"
         self.encoded.append(frame)
 
 
 def test_the_fake_device_messages_reject_what_the_camera_rejects():
     with pytest.raises(TypeError, match="incompatible constructor"):
-        ImgFrame()
+        Buffer()
     with pytest.raises(AttributeError):
-        ImgFrame(4).setStride(2)
+        Buffer(4).setStride(2)
     with pytest.raises(RuntimeError, match="too small"):
-        ImgFrame(4).setData(b"12345")
-
-
-def gray_img_frame(kind, width=64, height=40):
-    frame = ImgFrame(width * height)
-    frame.setData(bytes(width * height))
-    frame.setType(kind)
-    frame.setWidth(width)
-    frame.setHeight(height)
-    return frame
-
-
-def pooled(frame, pool=depth_stream.MANIP_FRAMES_POOL):
-    frame.pool = pool
-    return frame
+        Buffer(4).setData(b"12345")
 
 
 def test_the_fake_encoder_takes_pooled_raw8_and_drops_raw16_with_a_warning():
@@ -270,19 +251,6 @@ def test_the_fake_encoder_takes_pooled_raw8_and_drops_raw16_with_a_warning():
     assert len(encoder.encoded) == 2
     assert encoder.warnings == ["[VideoEncoder(11)] [warning] Arrived frame type (14) is not either NV12 or "
                                 "YUV400p (8-bit Gray)"]
-
-
-def test_the_fake_encoder_drops_gray8_and_pool_less_frames_like_the_camera():
-    encoder = FakeVideoEncoder()
-    encoder.send(pooled(gray_img_frame(ImgFrame.Type.GRAY8)))
-    assert encoder.encoded == []
-    assert encoder.warnings == ["[VideoEncoder(11)] [warning] Arrived frame type (30) is not either NV12 or "
-                                "YUV400p (8-bit Gray)"]
-    encoder.send(pooled(gray_img_frame(ImgFrame.Type.YUV400p)))
-    assert len(encoder.encoded) == 1 and len(encoder.warnings) == 1
-    # A Script's own ImgFrame: right type and size, no pool: gone without a word
-    encoder.send(gray_img_frame(ImgFrame.Type.YUV400p))
-    assert len(encoder.encoded) == 1 and len(encoder.dropped) == 1 and len(encoder.warnings) == 1
 
 
 def run_script(code, depth_items, control_items, after=None, clock=None, gray=None):
@@ -314,47 +282,79 @@ def depth_image(seed=0, height=400, width=640):
     return depth
 
 
-def test_script_converts_like_the_reference_and_sends_every_nth_frame():
-    frames = [DepthFrame(depth_image(n), n) for n in range(9)]
-    code = depth_stream.device_script(3, 300, 4000)
-    node = run_script(code, frames, [Control(True)])
-    encoder = node.outputs["gray"]
-    # The first frame goes out right away, then every 3rd; the encoder drops them all, silently (no pool)
-    assert [f.calls["setSequenceNum"] for f in encoder.sent] == [0, 3, 6]
-    assert encoder.encoded == [] and encoder.dropped == encoder.sent and encoder.warnings == []
-    for out in encoder.sent:
-        source = frames[out.calls["setSequenceNum"]]
-        assert out.size == 640 * 400 and len(out.calls["setData"]) == out.size
-        assert out.calls["setType"] == ImgFrame.Type.YUV400p
-        assert (out.calls["setWidth"], out.calls["setHeight"]) == (640, 400)
-        assert out.calls["setTimestamp"] == source.getTimestamp()
-        gray = np.frombuffer(out.calls["setData"], np.uint8).reshape(400, 640)
-        np.testing.assert_array_equal(gray, depth_stream.gray_reference(source.depth, 300, 4000))
-    assert node.warnings == []
+def disparity_image(seed=0, height=40, width=64):
+    disparity = np.random.default_rng(seed).integers(8, 96, (height, width)).astype(np.uint8)
+    disparity[:, :4] = 0  # the left edge band has no depth
+    return disparity
+
+
+def mono_image(seed=0, height=40, width=64):
+    return np.random.default_rng(seed).integers(0, 256, (height, width)).astype(np.uint8)
+
+
+def mono_frames(n, height=40, width=64):
+    return [RectifiedFrame(mono_image(k, height, width), k) for k in range(n)]
+
+
+class RefusingEncoder(FakeVideoEncoder):
+    """An encoder input that refuses the frames whose sequence number `refuse` accepts."""
+
+    def __init__(self, refuse):
+        super().__init__()
+        self.refuse = refuse
+
+    def send(self, frame):
+        if self.refuse(frame.getSequenceNum()):
+            raise RuntimeError(f"queue full {frame.getSequenceNum()}")
+        super().send(frame)
+
+
+def encoded_y(encoder):
+    """The images the fake encoder took."""
+    return [np.frombuffer(bytes(f.getData()), np.uint8).reshape(f.getHeight(), f.getWidth()) for f in encoder.encoded]
+
+
+@pytest.mark.parametrize("make", [lambda n: DisparityFrame(disparity_image(n), n),
+                                  lambda n: RectifiedFrame(mono_image(n), n)], ids=["disparity", "mono_features"])
+def test_the_gate_sends_every_nth_stereodepth_raw8_frame_straight_to_the_encoder(make):
+    """The Script only gates; the encoder gets the pooled StereoDepth frame itself."""
+    frames = [make(n) for n in range(6)]
+    encoder = FakeVideoEncoder()
+    node = run_script(depth_stream.device_script(2), frames, [Control(True)], gray=encoder)
+    # The first frame goes out right away, then every 2nd
+    assert [f.getSequenceNum() for f in encoder.sent] == [0, 2, 4]
+    assert all(sent is frames[sent.sequence] for sent in encoder.sent)  # the same message: its pool and metadata
+    assert encoder.warnings == [] and len(encoder.encoded) == 3
+    for y, sent in zip(encoded_y(encoder), encoder.sent):
+        np.testing.assert_array_equal(y, sent.depth)  # the data as it is: disparity px or the camera's gray
+    assert node.warnings == [] and errors_reported(node) == []
     assert reports(node)[0] == {"kind": "sent", "errors": 0, "sent": 1, "text": ""}
-    assert {r["kind"] for r in reports(node)} == {"sent"}
 
 
-def test_gray8_into_the_encoder_reproduces_test10():
-    """HEAD before this fix: the Script sends GRAY8, counts every frame as sent, and nothing is encoded."""
-    code = depth_stream.device_script(1, 300, 4000).replace("ImgFrame.Type.YUV400p", "ImgFrame.Type.GRAY8")
-    node = run_script(code, [DepthFrame(depth_image(n, 40, 64), n) for n in range(5)], [Control(True)])
-    encoder = node.outputs["gray"]
-    assert len(encoder.sent) == 5 and encoder.encoded == []
-    assert encoder.warnings == ["[VideoEncoder(11)] [warning] Arrived frame type (30) is not either NV12 or "
-                                "YUV400p (8-bit Gray)"] * 5
-    assert node.warnings == [] and reports(node)[0]["sent"] == 1  # no error on the camera's side
+def test_a_raw16_disparity_through_the_gate_encodes_nothing():
+    """Why auto never picks disparity with the saved settings: the RAW16 frames get the encoder's warning."""
+    frames = [Raw16DisparityFrame(depth_image(n, 40, 64), n) for n in range(3)]
+    encoder = FakeVideoEncoder()
+    run_script(depth_stream.device_script(1), frames, [Control(True)], gray=encoder)
+    assert len(encoder.sent) == 3 and encoder.encoded == []
+    assert len(encoder.warnings) == 3 and "frame type (14)" in encoder.warnings[0]
+
+
+def test_the_disparity_gate_waits_for_the_control():
+    frames = [DisparityFrame(disparity_image(n), n) for n in range(4)]
+    encoder = FakeVideoEncoder()
+    node = run_script(depth_stream.device_script(1), frames, [Control(False), Control(True)], gray=encoder)
+    assert len(encoder.encoded) == 4 and [r["sent"] for r in reports(node) if r["kind"] == "sent"][0] == 1
 
 
 def test_script_reports_frames_sent_about_once_a_second():
-    frames = [DepthFrame(depth_image(n, 20, 32), n) for n in range(25)]
     t = [100.0]
 
     def clock():  # read twice per frame: 0.125 s per frame
         t[0] += 0.0625
         return t[0]
 
-    node = run_script(depth_stream.device_script(1, 300, 4000), frames, [Control(True)], clock=clock)
+    node = run_script(depth_stream.device_script(1), mono_frames(25), [Control(True)], clock=clock)
     progress = [r["sent"] for r in reports(node) if r["kind"] == "sent"]
     assert progress == [1, 9, 17, 25]
     assert len(node.outputs["gray"].sent) == 25
@@ -377,73 +377,43 @@ def script_calls(code):
 def test_script_uses_only_the_on_device_message_api():
     """The bug on test9: ImgFrame() does not exist in the camera's Script runtime, only ImgFrame(size)."""
     import ast
-    code = depth_stream.device_script(3, 300, 4000)
+    code = depth_stream.device_script(3)
+    json.dumps(code)
     constructors, methods = script_calls(code)
-    (img_frame,) = constructors["ImgFrame"]
-    assert not img_frame.keywords and len(img_frame.args) == 1
-    size = img_frame.args[0]
-    assert isinstance(size, ast.BinOp) and isinstance(size.op, ast.Mult)
-    assert (size.left.id, size.right.id) == ("width", "height")
+    assert "ImgFrame" not in constructors  # no new frame: the received one goes on
     (buffer,) = constructors["Buffer"]
     assert len(buffer.args) == 1 and ast.unparse(buffer.args[0]) == "len(data)"
-    # Every call on an ImgFrame (the output 'out', the input 'frame' / 'src') exists on the device
-    on_frames = {method for name, method in methods if name in ("out", "frame", "src")}
-    assert on_frames <= depth_stream.DEVICE_IMGFRAME_API, on_frames - depth_stream.DEVICE_IMGFRAME_API
-    assert {"setData", "setType", "setWidth", "setHeight", "setTimestamp", "setSequenceNum"} <= on_frames
+    frame_methods = {method for obj, method in methods if obj == "frame"}
+    assert frame_methods <= DEVICE_IMGFRAME_API and {"getWidth", "getHeight"} <= frame_methods
     assert {method for name, method in methods if name == "message"} == {"setData"}
     for missing_on_device in ("setStride", "setMetadata", "setTimestampDevice", "setFrame", "setCvFrame"):
         assert missing_on_device not in code
-    # The frame type is one the camera's VideoEncoder takes (it drops GRAY8: test10)
-    types = {node.attr for node in ast.walk(ast.parse(code)) if isinstance(node, ast.Attribute)
-             and ast.unparse(node.value) == "ImgFrame.Type"}
-    assert types == {"YUV400p"} and types <= depth_stream.DEVICE_ENCODER_INPUT_TYPES
 
 
 def test_script_reports_errors_on_its_status_output():
-    class Broken(DepthFrame):
-        def getData(self):
-            raise RuntimeError("no data")
-
-    frames = [Broken(depth_image(0, 20, 32), 0), DepthFrame(depth_image(1, 20, 32), 1)]
-    node = run_script(depth_stream.device_script(1, 300, 4000), frames, [Control(True)])
-    assert [f.calls["setSequenceNum"] for f in node.outputs["gray"].sent] == [1]  # keeps going
-    assert len(node.warnings) == 1 and "no data" in node.warnings[0]
+    encoder = RefusingEncoder(lambda sequence: sequence == 0)
+    node = run_script(depth_stream.device_script(1), mono_frames(2), [Control(True)], gray=encoder)
+    assert [f.getSequenceNum() for f in encoder.sent] == [1]  # keeps going
+    assert len(node.warnings) == 1 and "queue full 0" in node.warnings[0]
     (report,) = errors_reported(node)
     assert report["kind"] == "error" and report["errors"] == 1 and report["sent"] == 0
-    assert report["text"] == "convert: RuntimeError: no data"
+    assert report["text"] == "send: RuntimeError: queue full 0"
 
 
 def test_script_error_reports_are_throttled():
-    class Broken(DepthFrame):
-        def getData(self):
-            raise RuntimeError("no data %d" % self.sequence)
-
-    frames = [Broken(depth_image(0, 20, 32), n) for n in range(250)]
     t = [100.0]
 
     def clock():  # read twice per frame: 10 ms per frame
         t[0] += 0.005
         return t[0]
 
-    node = run_script(depth_stream.device_script(1, 300, 4000), frames, [Control(True)], clock=clock)
+    node = run_script(depth_stream.device_script(1), mono_frames(250, 8, 32), [Control(True)], clock=clock,
+                      gray=RefusingEncoder(lambda sequence: True))
     # 250 errors over 2.5 s: the first right away, then about one a second, with the running count
     counts = [r["errors"] for r in reports(node)]
     assert counts[0] == 1 and len(counts) == 3 and counts == sorted(counts) and counts[-1] <= 250
-    assert reports(node)[-1]["text"].startswith("convert: RuntimeError: no data ")
+    assert reports(node)[-1]["text"].startswith("send: RuntimeError: queue full ")
     assert len(node.warnings) == 3  # the 1st, 100th and 200th
-
-
-def test_script_sends_the_frame_when_only_its_metadata_fails():
-    class NoTimestamp(DepthFrame):
-        def getTimestamp(self):
-            raise TypeError("incompatible function arguments")
-
-    node = run_script(depth_stream.device_script(1, 300, 4000), [NoTimestamp(depth_image(0, 20, 32), 7)],
-                      [Control(True)])
-    (out,) = node.outputs["gray"].sent
-    assert out.calls["setType"] == ImgFrame.Type.YUV400p and "setSequenceNum" not in out.calls
-    (report,) = errors_reported(node)
-    assert report["kind"] == "error" and report["text"].startswith("metadata: TypeError")
 
 
 def test_script_reports_when_it_stops():
@@ -457,205 +427,48 @@ def test_script_reports_when_it_stops():
     node.warnings = []
     node.warn = node.warnings.append
     with pytest.raises(RuntimeError, match="input closed"):
-        exec(depth_stream.device_script(1, 300, 4000), {"node": node, "ImgFrame": ImgFrame, "Buffer": Buffer})
+        exec(depth_stream.device_script(1), {"node": node, "ImgFrame": ImgFrame, "Buffer": Buffer})
     (report,) = reports(node)
     assert report["kind"] == "fatal" and report["text"] == "stopped: RuntimeError: input closed"
     assert "input closed" in node.warnings[0]
 
 
 def test_script_status_survives_a_failing_status_output():
-    class Broken(DepthFrame):
-        def getData(self):
-            raise RuntimeError("no data")
-
     class Refusing(FakeOutput):
         def send(self, message):
             raise RuntimeError("queue full")
 
     node = type("Node", (), {})()
-    node.inputs = {"depth": FakeInput([Broken(depth_image(0, 8, 8), 0), DepthFrame(depth_image(1, 8, 8), 1)]),
-                   "control": FakeInput([Control(True)])}
-    node.outputs = {"gray": FakeOutput(), "status": Refusing()}
+    node.inputs = {"depth": FakeInput(mono_frames(2, 8, 32)), "control": FakeInput([Control(True)])}
+    node.outputs = {"gray": RefusingEncoder(lambda sequence: sequence == 0), "status": Refusing()}
     node.warnings = []
     node.warn = node.warnings.append
     with pytest.raises(Done):
-        exec(depth_stream.device_script(1, 300, 4000), {"node": node, "ImgFrame": ImgFrame, "Buffer": Buffer})
+        exec(depth_stream.device_script(1), {"node": node, "ImgFrame": ImgFrame, "Buffer": Buffer})
     assert len(node.outputs["gray"].sent) == 1 and "status not sent: queue full" in node.warnings[-1]
 
 
-def test_script_handles_padded_rows():
-    depth = depth_image(3, height=120, width=200)
-    node = run_script(depth_stream.device_script(1, 300, 4000, chunk_rows=50), [DepthFrame(depth, 0, padding=48)],
-                      [Control(True)])
-    (out,) = node.outputs["gray"].sent
-    np.testing.assert_array_equal(np.frombuffer(out.calls["setData"], np.uint8).reshape(120, 200),
-                                  depth_stream.gray_reference(depth, 300, 4000))
-
-
 def test_script_waits_for_the_host_and_stops_when_told():
-    frames = [DepthFrame(depth_image(n, 40, 64), n) for n in range(10)]
+    frames = mono_frames(10)
     control = FakeInput([Control(False), Control(True)])
 
     def stop_after_frame_4(frame):
         if frame.sequence == 4:
             control.items.append(Control(False))
 
-    code = depth_stream.device_script(2, 300, 4000)
-    node = run_script(code, frames, control, after=stop_after_frame_4)
+    node = run_script(depth_stream.device_script(2), frames, control, after=stop_after_frame_4)
     assert len(node.inputs["depth"].items) == 5  # never read past the stop
     # Off until enabled, sends frames 0, 2, 4, then blocks on the control input again once disabled
-    assert [f.calls["setSequenceNum"] for f in node.outputs["gray"].sent] == [0, 2, 4]
+    assert [f.getSequenceNum() for f in node.outputs["gray"].sent] == [0, 2, 4]
 
 
 def test_script_reports_its_cost():
-    frames = [DepthFrame(depth_image(n, 40, 64), n) for n in range(4)]
-    node = run_script(depth_stream.device_script(1, 300, 4000, stats_every=2), frames, [Control(True)])
+    node = run_script(depth_stream.device_script(1, stats_every=2), mono_frames(4), [Control(True)])
     assert len(node.warnings) == 2 and "convert + send mean" in node.warnings[0] and "64x40" in node.warnings[0]
     stats = [r for r in reports(node) if r["kind"] == "stats"]
     assert [(r["kind"], r["sent"], r["errors"], r["size"]) for r in stats] == [("stats", 2, 0, [64, 40]),
                                                                                ("stats", 4, 0, [64, 40])]
     assert stats[0]["convert_ms_max"] >= stats[0]["convert_ms_mean"] >= 0.0
-
-
-class FakeImageManip(FakeOutput):
-    """
-    ImageManip (depthai v3 on RVC2, PlgImageManipV2; frame type NV12) in front of the encoder, as the
-    firmware a406121b and test12 show it. It sends an NV12 frame of the same size from its own pool of
-    manip_output_size buffers. Its input must come from a pool of at least 2 frames: a Script's ImgFrame
-    (pool 0) gets the firmware's error and a constant image (test12: every JPEG 4668 bytes, all pixels 1).
-    From a pooled frame, RAW8 / GRAY8 / YUV400p (the disparity, or a gray plane) become Y with neutral
-    chroma (colorConvertToNV12); RAW16 is not converted: an error and a constant image (test14: the RAW16
-    disparity through ImageManip gave "Processing failed, potentially unsupported config" and constant JPEGs).
-    """
-    MIN_POOL = 2
-
-    def __init__(self, encoder):
-        super().__init__()
-        self.encoder = encoder
-        self.errors = []
-
-    def send(self, frame):
-        super().send(frame)
-        kind, width, height, data = frame_fields(frame)
-        size = width * height
-        if frame.pool < self.MIN_POOL:
-            self.errors.append(f"[ImageManip(6)] [error] Pool size of the input message is too small... Currently "
-                               f"it is {frame.pool}")
-            y = b"\x01" * size
-        elif kind in (ImgFrame.Type.RAW8, ImgFrame.Type.GRAY8, ImgFrame.Type.YUV400p, ImgFrame.Type.NV12):
-            y = data[:size]
-        else:
-            self.errors.append("[ImageManip(6)] [error] Processing failed, potentially unsupported config")
-            y = b"\x00" * size
-        out = pooled(ImgFrame(depth_stream.manip_output_size(width, height)))
-        out.setData(y + b"\x80" * (size // 2))
-        out.setType(ImgFrame.Type.NV12)
-        out.setWidth(width)
-        out.setHeight(height)
-        self.encoder.send(out)
-
-
-def encoded_y(encoder):
-    """The Y planes the fake encoder took, as images."""
-    out = []
-    for frame in encoder.encoded:
-        _, width, height, data = frame_fields(frame)
-        out.append(np.frombuffer(data[:width * height], np.uint8).reshape(height, width))
-    return out
-
-
-def disparity_image(seed=0, height=40, width=64):
-    disparity = np.random.default_rng(seed).integers(8, 96, (height, width)).astype(np.uint8)
-    disparity[:, :4] = 0  # the left edge band has no depth
-    return disparity
-
-
-def mono_image(seed=0, height=40, width=64):
-    return np.random.default_rng(seed).integers(0, 256, (height, width)).astype(np.uint8)
-
-
-@pytest.mark.parametrize("make", [lambda n: DisparityFrame(disparity_image(n), n),
-                                  lambda n: RectifiedFrame(mono_image(n), n)], ids=["disparity", "mono_features"])
-def test_the_forwarding_gate_sends_stereodepth_s_own_raw8_frame_straight_to_the_encoder(make):
-    """disparity, mono_features: the Script only gates; the encoder gets the pooled StereoDepth frame, no ImageManip."""
-    frames = [make(n) for n in range(6)]
-    encoder = FakeVideoEncoder()
-    node = run_script(depth_stream.device_script(2, 300, 4000, frame_type=None), frames, [Control(True)],
-                      gray=encoder)
-    assert [f.getSequenceNum() for f in encoder.sent] == [0, 2, 4]
-    assert all(sent is frames[sent.sequence] for sent in encoder.sent)  # the same message: its pool and metadata
-    assert encoder.warnings == [] and encoder.dropped == [] and len(encoder.encoded) == 3
-    for y, sent in zip(encoded_y(encoder), encoder.sent):
-        np.testing.assert_array_equal(y, sent.depth)  # the data as it is: disparity px or the camera's gray
-    assert node.warnings == [] and errors_reported(node) == [] and reports(node)[0]["sent"] == 1
-
-
-def test_a_raw16_disparity_through_the_gate_encodes_nothing():
-    """Why auto never picks disparity with the saved settings: the RAW16 frames get the encoder's warning."""
-    frames = [Raw16DisparityFrame(depth_image(n, 40, 64), n) for n in range(3)]
-    encoder = FakeVideoEncoder()
-    run_script(depth_stream.device_script(1, 300, 4000, frame_type=None), frames, [Control(True)], gray=encoder)
-    assert len(encoder.sent) == 3 and encoder.encoded == []
-    assert len(encoder.warnings) == 3 and "frame type (14)" in encoder.warnings[0]
-
-
-def test_the_disparity_gate_waits_for_the_control_and_counts_like_the_converting_script():
-    frames = [DisparityFrame(disparity_image(n), n) for n in range(4)]
-    encoder = FakeVideoEncoder()
-    node = run_script(depth_stream.device_script(1, 300, 4000, frame_type=None), frames,
-                      [Control(False), Control(True)], gray=encoder)
-    assert len(encoder.encoded) == 4 and [r["sent"] for r in reports(node) if r["kind"] == "sent"][0] == 1
-
-
-def test_the_disparity_gate_uses_only_the_on_device_api():
-    code = depth_stream.device_script(3, 300, 4000, frame_type=None)
-    constructors, methods = script_calls(code)
-    assert "ImgFrame" not in constructors and "Buffer" in constructors  # no new frame, only the status reports
-    frame_methods = {method for obj, method in methods if obj == "frame"}
-    assert frame_methods <= depth_stream.DEVICE_IMGFRAME_API and {"getWidth", "getHeight"} <= frame_methods
-
-
-@pytest.mark.parametrize("frame", [DepthFrame(depth_image(0, 40, 64), 0),
-                                   Raw16DisparityFrame(depth_image(1, 40, 64), 1)], ids=["depth", "raw16-disparity"])
-def test_imagemanip_turns_raw16_into_a_constant_image(frame):
-    """test14: RAW16 (depth, or the disparity with a filter after the median) through ImageManip: ERR, constant."""
-    encoder = FakeVideoEncoder()
-    manip = FakeImageManip(encoder)
-    manip.send(frame)
-    assert manip.errors == ["[ImageManip(6)] [error] Processing failed, potentially unsupported config"]
-    (y,) = encoded_y(encoder)
-    assert y.std() == 0
-
-
-@pytest.mark.parametrize("variant", ["manip", "nv12", "yuv400p"])
-def test_the_script_built_variants_are_right_but_the_camera_blanks_them(variant):
-    """
-    Strict fakes, test12: the Script builds the right frame (type, planes, gray values), but it has no pool:
-    ImageManip (manip) turns it into a constant image with an error, the encoder (nv12, yuv400p) drops it.
-    """
-    frame_type = depth_stream.SCRIPT_FRAME_TYPES[variant]
-    frames = [DepthFrame(depth_image(n, 40, 64), n) for n in range(6)]
-    encoder = FakeVideoEncoder()
-    gray = FakeImageManip(encoder) if variant == "manip" else encoder
-    node = run_script(depth_stream.device_script(2, 300, 4000, frame_type=frame_type), frames, [Control(True)],
-                      gray=gray)
-    assert [f.calls["setSequenceNum"] for f in gray.sent] == [0, 2, 4]
-    assert all(f.calls["setType"] == getattr(ImgFrame.Type, frame_type) for f in gray.sent)
-    for sent in gray.sent:
-        data = bytes(sent.calls["setData"])
-        y = np.frombuffer(data[:64 * 40], np.uint8).reshape(40, 64)
-        np.testing.assert_array_equal(y, depth_stream.gray_reference(frames[sent.calls["setSequenceNum"]].depth,
-                                                                     300, 4000))
-        if sent.calls["setType"] == ImgFrame.Type.NV12:
-            assert len(data) == 64 * 40 * 3 // 2 and set(data[64 * 40:]) == {128}
-        else:
-            assert len(data) == 64 * 40
-    assert node.warnings == [] and errors_reported(node) == [] and encoder.warnings == []
-    if variant == "manip":
-        assert len(gray.errors) == 3 and "Currently it is 0" in gray.errors[0]
-        assert [set(y.ravel().tolist()) for y in encoded_y(encoder)] == [{1}] * 3  # blank
-    else:
-        assert encoder.encoded == [] and len(encoder.dropped) == 3  # nothing, not a word
 
 
 def test_manip_output_size_matches_depthai():
@@ -672,10 +485,10 @@ def test_size_problem():
 
 def test_device_variant():
     assert depth_stream.device_variant("auto") == "mono_features"
-    assert [depth_stream.device_variant(v) for v in ("mono_features", "disparity", "manip", "nv12", "yuv400p")] == [
-        "mono_features", "disparity", "manip", "nv12", "yuv400p"]
+    assert [depth_stream.device_variant(v) for v in ("mono_features", "disparity")] == ["mono_features", "disparity"]
     assert depth_stream.device_variant("host_jpeg") is None and depth_stream.device_variant("bogus") is None
-    assert depth_stream.FORWARD_VARIANTS == ("mono_features", "disparity")
+    assert depth_stream.VARIANTS == ("auto", "mono_features", "disparity", "host_jpeg")
+    assert depth_stream.CAMERA_VARIANTS == ("mono_features", "disparity")
 
 
 def saved_disparity_format(**changes):
@@ -710,19 +523,18 @@ def test_resolve_variant_starts_with_mono_features_and_needs_raw8_for_disparity(
     # An explicit disparity request: only with a RAW8 disparity, else host_jpeg with the reason
     assert resolve("disparity") == ("disparity", None)
     assert resolve("disparity", raw16) == (None, raw16)
-    # The other explicit variants are built as asked, for diagnosis (a size problem is only logged)
-    for variant in ("mono_features", "manip", "nv12", "yuv400p"):
-        assert resolve(variant, raw16, problem="600x400: ...") == (variant, None)
+    # An explicit mono_features is built as asked (a size problem is only logged)
+    assert resolve("mono_features", raw16, problem="600x400: ...") == ("mono_features", None)
     assert resolve("host_jpeg") == (None, None)
 
 
 def test_encoding_and_source_of_each_variant():
     assert depth_stream.encoding_for("disparity") == "gray8-disparity"
     assert depth_stream.encoding_for("mono_features") == "gray8-mono-rectified-left"
-    assert {depth_stream.encoding_for(v) for v in ("manip", "nv12", "host_jpeg", None)} == {"gray8-depth-linear"}
+    assert {depth_stream.encoding_for(v) for v in ("host_jpeg", None)} == {"gray8-depth-linear"}
     assert depth_stream.source_for("mono_features") == "stereo.rectifiedLeft"
     assert depth_stream.source_for("disparity") == "stereo.disparity"
-    assert {depth_stream.source_for(v) for v in ("manip", "nv12", "yuv400p", "host_jpeg")} == {"stereo.depth"}
+    assert depth_stream.source_for("host_jpeg") == "stereo.depth"
     assert depth_stream.source_for(None) is None
 
 
@@ -733,45 +545,6 @@ def test_disparity_scale_and_reference():
     assert depth_stream.disparity_scale(0.0, 0.075, 300, 4000) is None
     depth = np.array([0, 200, 347, 1000, 4000, 20000], np.uint16)
     assert depth_stream.gray_disparity_reference(depth, 440.0, 0.075).tolist() == [0, 95, 95, 33, 8, 2]
-
-
-def test_nv12_frames_are_sized_for_both_planes():
-    node = run_script(depth_stream.device_script(1, 300, 4000, frame_type="NV12"),
-                      [DepthFrame(depth_image(0, 400, 640), 0)], [Control(True)])
-    (out,) = node.outputs["gray"].sent
-    assert out.size == len(out.calls["setData"]) == 640 * 400 * 3 // 2
-
-
-@pytest.mark.parametrize("variant, size", [("manip", "width * height"), ("yuv400p", "width * height"),
-                                           ("nv12", "size + size // 2")])
-def test_each_variant_script_uses_only_the_on_device_message_api(variant, size):
-    import ast
-    frame_type = depth_stream.SCRIPT_FRAME_TYPES[variant]
-    code = depth_stream.device_script(3, 300, 4000, frame_type=frame_type)
-    json.dumps(code)
-    constructors, methods = script_calls(code)
-    (img_frame,) = constructors["ImgFrame"]
-    assert not img_frame.keywords and ast.unparse(img_frame.args[0]) == size
-    on_frames = {method for name, method in methods if name in ("out", "frame", "src")}
-    assert on_frames <= depth_stream.DEVICE_IMGFRAME_API
-    types = {node.attr for node in ast.walk(ast.parse(code)) if isinstance(node, ast.Attribute)
-             and ast.unparse(node.value) == "ImgFrame.Type"}
-    assert types == {frame_type}
-    # Only the ImageManip variant may send a type the encoder does not take itself
-    assert (frame_type in depth_stream.DEVICE_ENCODER_INPUT_TYPES) == (variant != "manip")
-    with pytest.raises(ValueError):
-        depth_stream.device_script(3, 300, 4000, frame_type="RAW8")
-
-
-def test_script_conversion_cost_on_this_host():
-    """Documents the per-frame work (it is far slower on the camera's CPU; the Script logs that)."""
-    namespace = {}
-    exec(depth_stream.device_script(3, 300, 4000).split("try:\n    import time")[0], namespace)
-    frame = DepthFrame(depth_image(), 0)
-    start = time.perf_counter()
-    for _ in range(10):
-        namespace["to_gray"](frame)
-    assert (time.perf_counter() - start) / 10 < 0.05
 
 
 # --- VIO process side -----------------------------------------------------------------------------
@@ -1007,7 +780,7 @@ def test_frame_reader_returns_each_fresh_frame_once(tmp_path):
 def test_multipart_part():
     part = depth_stream.multipart_part(b"\xff\xd8abc")
     assert part == b"--depthframe\r\nContent-Type: image/jpeg\r\nContent-Length: 5\r\n\r\n\xff\xd8abc\r\n"
-    json.dumps(depth_stream.device_script(3, 300, 4000))
+    json.dumps(depth_stream.device_script(3))
 
 
 # --- host_jpeg: encoded on the Pi -----------------------------------------------------------------
@@ -1152,7 +925,7 @@ def test_auto_falls_back_to_the_pi_when_the_camera_encoder_stalls(tmp_path):
     debug_device = FakeLogDevice()
     debug = depth_stream.DeviceLogDebug(debug_device, "DEBUG", log=logs.append)
     service, host, controls = host_service(
-        tmp_path, clock, logs, info={"fps_target": 5.0, "variant": "manip", "requested_variant": "auto"},
+        tmp_path, clock, logs, info={"fps_target": 5.0, "variant": "mono_features", "requested_variant": "auto"},
         debug=debug)
     assert not service.on_host and service.meta()["encoded_on"] == "camera"
     depth_stream.touch_lease(tmp_path)
@@ -1165,11 +938,11 @@ def test_auto_falls_back_to_the_pi_when_the_camera_encoder_stalls(tmp_path):
     meta = depth_stream.read_meta(tmp_path)
     assert controls == [True, False] and debug_device.level == "WARN"  # camera off, debug level restored
     assert meta["variant"] == "host_jpeg" and meta["requested_variant"] == "auto" and meta["encoded_on"] == "pi"
-    assert meta["fallback"]["from"] == "manip" and meta["fallback"]["to"] == "host_jpeg"
-    assert meta["fallback"]["reason"] == "no JPEG from manip (the camera encoder outputs nothing)"
+    assert meta["fallback"]["from"] == "mono_features" and meta["fallback"]["to"] == "host_jpeg"
+    assert meta["fallback"]["reason"] == "no JPEG from mono_features (the camera encoder outputs nothing)"
     assert depth_stream.ENCODER_STALL_TEXT in meta["fallback"]["detail"]
-    assert meta["encoder_stalled"] is False and meta["last_error"]["variant"] == "manip"
-    assert any("falling back from manip" in line for line in logs)
+    assert meta["encoder_stalled"] is False and meta["last_error"]["variant"] == "mono_features"
+    assert any("falling back from mono_features" in line for line in logs)
     assert host.enabled
     # From now on the frames come from the Pi; late camera frames and reports are ignored
     assert service.on_frame(b"\xff\xd8camera", 1) is False
@@ -1183,24 +956,24 @@ def test_auto_falls_back_to_the_pi_when_the_camera_encoder_stalls(tmp_path):
 
 # --- blank frames ---------------------------------------------------------------------------------
 
-def camera_jpegs(variant, n, height=40, width=64):
+def camera_jpegs(kind, n, height=40, width=64):
     """
-    JPEGs as the strict fakes' camera makes them for a variant: disparity (pooled StereoDepth frames through
-    ImageManip) varies, manip comes out constant (test12), from depth_image / disparity_image scenes.
+    JPEGs as the strict fakes' camera makes them through the gate: disparity and mono_features (pooled
+    StereoDepth frames) vary; blank is a constant camera image (test12: every JPEG the same, all pixels 1).
     """
     import cv2
     encoder = FakeVideoEncoder()
-    manip = FakeImageManip(encoder)
-    if variant == "disparity":
+    if kind == "disparity":
         frames = [DisparityFrame(disparity_image(k, height, width), k) for k in range(n)]
-        run_script(depth_stream.device_script(1, 300, 4000, frame_type=None), frames, [Control(True)], gray=manip)
+    elif kind == "blank":
+        frames = [RectifiedFrame(np.ones((height, width), np.uint8), k) for k in range(n)]
     else:
-        frames = [DepthFrame(depth_image(k, height, width), k) for k in range(n)]
-        run_script(depth_stream.device_script(1, 300, 4000, frame_type="GRAY8"), frames, [Control(True)], gray=manip)
+        frames = mono_frames(n, height, width)
+    run_script(depth_stream.device_script(1), frames, [Control(True)], gray=encoder)
     return [cv2.imencode(".jpg", y, [cv2.IMWRITE_JPEG_QUALITY, 70])[1].tobytes() for y in encoded_y(encoder)]
 
 
-def blank_service(tmp_path, clock, logs, variant="manip", requested="auto"):
+def blank_service(tmp_path, clock, logs, variant="mono_features", requested="auto"):
     info = {"fps_target": 5.0, "variant": variant, "requested_variant": requested, "depth_range_mm": [300, 4000]}
     service, host, controls = host_service(tmp_path, clock, logs, info=info)
     depth_stream.touch_lease(tmp_path)
@@ -1221,31 +994,35 @@ def stream_for(service, tmp_path, clock, jpegs, depth, seconds, step=0.2):
     return None
 
 
-def test_auto_falls_back_on_blank_frames_from_manip_within_a_few_seconds(tmp_path):
+def test_auto_falls_back_on_blank_frames_within_a_few_seconds(tmp_path):
     clock, logs = Clock(1000.0), []
     service, host, controls = blank_service(tmp_path, clock, logs)
-    jpegs = camera_jpegs("manip", 3)
+    jpegs = camera_jpegs("blank", 3)
     assert len(set(jpegs)) == 1  # byte-identical, as on test12 (4668 bytes each at 640x400)
     after = stream_for(service, tmp_path, clock, jpegs, depth_image(1, 40, 64), 6.0)
     assert after is not None and after <= depth_stream.BLANK_S + 1.0
     meta = depth_stream.read_meta(tmp_path)
-    assert meta["fallback"]["reason"] == "blank frames from manip" and meta["fallback"]["from"] == "manip"
+    assert (meta["fallback"]["reason"] == "blank frames from mono_features"
+            and meta["fallback"]["from"] == "mono_features")
     assert "constant JPEGs" in meta["fallback"]["detail"] and "gray 1" in meta["fallback"]["detail"]
-    assert meta["blank"]["variant"] == "manip" and meta["last_error"]["blank"] is True
+    assert meta["blank"]["variant"] == "mono_features" and meta["last_error"]["blank"] is True
     assert meta["variant"] == "host_jpeg" and meta["encoded_on"] == "pi" and meta["encoding"] == "gray8-depth-linear"
     assert controls == [True, False] and host.enabled
-    assert any("falling back from manip" in line and "blank frames from manip" in line for line in logs)
+    assert any("falling back from mono_features" in line and "blank frames from mono_features" in line
+               for line in logs)
 
 
-def test_disparity_frames_are_not_blank(tmp_path):
+@pytest.mark.parametrize("variant, encoding", [("disparity", "gray8-disparity"),
+                                               ("mono_features", "gray8-mono-rectified-left")])
+def test_camera_frames_are_not_blank(tmp_path, variant, encoding):
     clock, logs = Clock(1000.0), []
-    service, host, controls = blank_service(tmp_path, clock, logs, variant="disparity")
-    jpegs = camera_jpegs("disparity", 6)
+    service, host, controls = blank_service(tmp_path, clock, logs, variant=variant)
+    jpegs = camera_jpegs(variant, 6)
     assert len(set(jpegs)) == 6
     assert stream_for(service, tmp_path, clock, jpegs, depth_image(1, 40, 64), 8.0) is None
     meta = service.meta()
-    assert meta["blank"] is None and meta["fallback"] is None and meta["variant"] == "disparity"
-    assert meta["encoding"] == "gray8-disparity" and meta["frames_total"] == 40
+    assert meta["blank"] is None and meta["fallback"] is None and meta["variant"] == variant
+    assert meta["encoding"] == encoding and meta["frames_total"] == 40
 
 
 def test_constant_frames_of_a_view_without_depth_are_not_blank(tmp_path):
@@ -1264,21 +1041,21 @@ def test_constant_frames_of_a_view_without_depth_are_not_blank(tmp_path):
 
 def test_a_requested_variant_reports_blank_frames_without_falling_back_and_recovers(tmp_path):
     clock, logs = Clock(1000.0), []
-    service, host, controls = blank_service(tmp_path, clock, logs, requested="manip")
+    service, host, controls = blank_service(tmp_path, clock, logs, requested="mono_features")
     depth = depth_image(1, 40, 64)
-    assert stream_for(service, tmp_path, clock, camera_jpegs("manip", 2), depth, 4.0) is None
+    assert stream_for(service, tmp_path, clock, camera_jpegs("blank", 2), depth, 4.0) is None
     meta = service.meta()
-    assert meta["blank"]["text"].startswith("blank frames from manip") and meta["fallback"] is None
-    assert meta["variant"] == "manip" and meta["encoded_on"] == "camera"
+    assert meta["blank"]["text"].startswith("blank frames from mono_features") and meta["fallback"] is None
+    assert meta["variant"] == "mono_features" and meta["encoded_on"] == "camera"
     # Real frames again (e.g. the camera recovered): no longer blank
     clock.t += 1.0
-    stream_for(service, tmp_path, clock, camera_jpegs("disparity", 3), depth, 1.0)
+    stream_for(service, tmp_path, clock, camera_jpegs("mono_features", 3), depth, 1.0)
     assert service.blank is None and any("not blank any more" in line for line in logs)
 
 
 def test_empty_frames_are_not_frames_and_still_stall(tmp_path):
     clock, logs = Clock(1000.0), []
-    service, host, controls = blank_service(tmp_path, clock, logs, variant="nv12")
+    service, host, controls = blank_service(tmp_path, clock, logs, variant="disparity")
     depth_stream.touch_lease(tmp_path)
     service.tick()
     for sent in (5, 10, 15, 20, 25):
@@ -1287,7 +1064,7 @@ def test_empty_frames_are_not_frames_and_still_stall(tmp_path):
         service.on_device_status(f"sent\t0\t{sent}\t".encode())
     meta = depth_stream.read_meta(tmp_path)
     assert meta["bad_frames"] == 5 and meta["frames_total"] == 0
-    assert meta["fallback"]["reason"] == "no JPEG from nv12 (the camera encoder outputs nothing)"
+    assert meta["fallback"]["reason"] == "no JPEG from disparity (the camera encoder outputs nothing)"
     assert any("were not JPEGs" in line for line in logs)
 
 
@@ -1311,7 +1088,8 @@ def test_a_raw16_disparity_request_starts_on_the_pi_and_says_why(tmp_path):
 def test_a_fixed_camera_variant_does_not_fall_back(tmp_path):
     clock, logs = Clock(1000.0), []
     service = depth_stream.DepthStreamService(tmp_path, lambda on: None,
-                                              {"fps_target": 5.0, "variant": "nv12", "requested_variant": "nv12"},
+                                              {"fps_target": 5.0, "variant": "mono_features",
+                                               "requested_variant": "mono_features"},
                                               clock=clock, log=logs.append)
     depth_stream.touch_lease(tmp_path)
     os.utime(tmp_path / depth_stream.LEASE_FILE, (clock.t, clock.t))
@@ -1320,8 +1098,8 @@ def test_a_fixed_camera_variant_does_not_fall_back(tmp_path):
         clock.t += 1.0
         service.on_device_status(f"sent\t0\t{sent}\t".encode())
     meta = service.meta()
-    assert meta["encoder_stalled"] is True and meta["variant"] == "nv12" and meta["fallback"] is None
-    assert "variant nv12" in meta["last_error"]["text"] and meta["last_error"]["stall"] is True
+    assert meta["encoder_stalled"] is True and meta["variant"] == "mono_features" and meta["fallback"] is None
+    assert "variant mono_features" in meta["last_error"]["text"] and meta["last_error"]["stall"] is True
 
 
 # --- depth_stream_debug: the camera's log ---------------------------------------------------------
@@ -1351,12 +1129,12 @@ def test_device_log_keeps_the_stream_nodes_lines_bounded():
     log.on_message(LogMessage("VideoEncoder(13)", "VideoEncoder took '4' ms."))
     log.on_message(LogMessage("Script(12)", "depth stream: convert + send mean 40 ms"))
     log.on_message(LogMessage("StereoDepth(3)", "unrelated"))
-    log.on_message(LogMessage("ImageManip(14)", "x" * 1000, "WARN"))
+    log.on_message(LogMessage("VideoEncoder(13)", "x" * 1000, "WARN"))
     log.on_message(LogMessage("Script(2)", "the snapshot gate"))
     log.on_message(LogMessage("Camera(0)", "third other"))
     snap = log.snapshot()
     assert snap["total"] == 6
-    assert [line["node"] for line in snap["stream"]] == ["VideoEncoder(13)", "Script(12)", "ImageManip(14)"]
+    assert [line["node"] for line in snap["stream"]] == ["VideoEncoder(13)", "Script(12)", "VideoEncoder(13)"]
     assert len(snap["stream"][-1]["text"]) == depth_stream.DEVICE_LOG_MAX_CHARS
     assert snap["stream"][0] == {"unix_time": 5.0, "node": "VideoEncoder(13)", "level": "DEBUG",
                                  "text": "VideoEncoder took '4' ms."}
@@ -1402,7 +1180,7 @@ def test_service_raises_the_log_level_only_while_streaming(tmp_path):
     device = FakeLogDevice("INFO")
     device_log = depth_stream.DeviceLog(("Script(12)",), clock=clock)
     service = depth_stream.DepthStreamService(
-        tmp_path, lambda on: None, {"variant": "manip", "requested_variant": "manip"}, clock=clock,
+        tmp_path, lambda on: None, {"variant": "mono_features", "requested_variant": "mono_features"}, clock=clock,
         log=logs.append, device_log=device_log, debug=depth_stream.DeviceLogDebug(device, "DEBUG", log=logs.append))
     service.tick()
     assert device.calls == []

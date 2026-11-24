@@ -19,7 +19,7 @@ from stereo_config import (DEFAULT_LEVER_ARM_M, DEFAULT_REFRACTIVE_INDEX, DEPTH_
 
 DVL_SOURCES = ("auto", "off")
 # depth_stream.VARIANTS (kept here so the schema does not import the stream code)
-DEPTH_STREAM_ENCODINGS = ("auto", "mono_features", "disparity", "manip", "nv12", "yuv400p", "host_jpeg")
+DEPTH_STREAM_ENCODINGS = ("auto", "mono_features", "disparity", "host_jpeg")
 # pose_stream.ATTITUDE_MODES
 POSE_ATTITUDE_SOURCES = ("autopilot", "gyro")
 # depth_points.TRANSPORTS and ROI_SOURCES
@@ -140,8 +140,7 @@ CONFIG_FIELDS = (
                 "mono_features = the rectified-left camera image the features are tracked on, encoded on the "
                 "camera, with the tracked features drawn by the browser (Live camera); disparity = the camera's "
                 "disparity (pixels) straight to the camera encoder, needs an 8-bit disparity (Subpixel and "
-                "Extended off, Speckle off or Median filter last), else it runs as host_jpeg; manip / nv12 / "
-                "yuv400p = Script-built depth frames (blank or none on an OAK-D-W, for diagnosis); host_jpeg = the "
+                "Extended off, Speckle off or Median filter last), else it runs as host_jpeg; host_jpeg = the "
                 "Pi encodes the depth (uses Pi CPU, capped at 25 % of a core)",
                 choices=DEPTH_STREAM_ENCODINGS),
     ConfigField("depth_stream_debug", "bool", False, "Depth stream camera debug log",
