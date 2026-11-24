@@ -77,10 +77,11 @@ def test_page_is_one_self_contained_offline_page(client):
                   "panel-depth-stream", "depth-stream-img", "depth-stream-canvas", "depth-legend", "ds-cost",
                   "ds-errors", "depth-stream-title", "depth-stream-overlay", "depth-stream-features",
                   "depth-legend-box", "feature-legend-box", "ds-source", "ds-features", "ds-n-inlier",
-                  "ds-n-no_depth"):
+                  "ds-n-no_depth", "link-kv", "link-streams", "link-streams-body", "link-hint"):
         assert f'id="{panel}"' in page
-    # The shared features overlay is inlined before ui.js, which uses it
+    # The shared features overlay and camera link formatting are inlined before ui.js, which uses them
     assert page.index("const FEATURE_STATES = ") < page.index("function drawStreamFeatures")
+    assert page.index("function linkSummaryRows(") < page.index("function renderLink(")
     assert "integrated, drifts" in page
     # Every configuration field is in the form
     for field in config_schema.CONFIG_FIELDS:
@@ -88,7 +89,7 @@ def test_page_is_one_self_contained_offline_page(client):
 
 
 @pytest.mark.parametrize("asset, kind", [("ui.css", "text/css"), ("ui.js", "javascript"), ("ui.html", "text/html"),
-                                         ("features_overlay.js", "javascript")])
+                                         ("features_overlay.js", "javascript"), ("link_panel.js", "javascript")])
 def test_static_assets_are_served_without_external_urls(client, asset, kind):
     main, http = client
     response = http.get(f"/static/{asset}")
@@ -201,6 +202,33 @@ def test_status_with_live_telemetry(client):
     assert t["failures"]["by_reason"][0]["reason"] == "too_few_matches"
     assert t["output"]["mode"] == "sending" and t["output"]["rate_hz"] == pytest.approx(8.0, rel=0.15)
     assert status["uptime_s"] is not None and status["uptime_s"] >= 0
+
+
+def test_status_has_the_camera_link_block(client):
+    import link_stats
+    from types import SimpleNamespace
+    main, http = client
+    running(http)
+    clock = SimpleNamespace(t=0.0)
+    link = link_stats.LinkMonitor(clock=lambda: clock.t)
+    counter = SimpleNamespace(read=0)
+    link.set_device(lambda: SimpleNamespace(numBytesRead=counter.read, numBytesWritten=0), usb_speed="SUPER",
+                    protocol="USB")
+    link.sample()
+    for _ in range(3):
+        clock.t += 1.0
+        counter.read += 7_700_000
+        link.streams.add("depth", 15 * 512_500, 15)
+        link.sample()
+    live_telemetry(seconds=2.0, link=link).write_status()
+    block = http.get("/api/status").json()["telemetry"]["link"]
+    for key in ("available", "source", "usb_speed", "protocol", "down_mbps", "up_mbps", "down_mbps_10s",
+                "peak_down_mbps_60s", "totals_bytes", "streams", "streams_sum_mbps", "share_of_100mbps"):
+        assert key in block, key
+    assert block["available"] and block["source"] == "xlink profiling" and block["usb_speed"] == "SUPER"
+    assert block["down_mbps"] == pytest.approx(61.6) and block["share_of_100mbps"] == pytest.approx(0.616)
+    (depth,) = block["streams"]
+    assert set(depth) >= {"name", "mbps", "msgs_per_s", "bytes_per_msg"} and depth["name"] == "depth"
 
 
 def test_status_marks_telemetry_of_a_stopped_or_other_process_stale(client):

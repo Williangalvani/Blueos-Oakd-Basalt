@@ -321,6 +321,39 @@ def test_the_mock_reports_the_camera_variant_and_its_debug_log(tmp_path, encodin
     assert vio.log_device.level == "WARN"
 
 
+def test_the_mock_link_emulates_plausible_counters_and_streams(tmp_path):
+    import mock_vio
+    now = [1795000000.0]
+    args = mock_vio.parse_args(["--fps", "15", "--snapshot-dir", str(tmp_path)])
+    vio = mock_vio.FakeVio(args, np.random.default_rng(2), clock=lambda: now[0])
+    vio.start_link()
+    vio.link.sample()
+    for frame in range(12 * 15):
+        now[0] += 1.0 / 15
+        vio.count_link_frame(300)
+        if frame % 15 == 14:
+            vio.link.sample()
+    status = vio.link.status()
+    assert status["available"] and status["mock"] is True and "mock" in status["source"]
+    assert (status["usb_speed"], status["protocol"]) == ("SUPER", "USB")
+    streams = {s["name"]: s for s in status["streams"]}
+    depth = 640 * 400 * 2 * 15 * 8 / 1e6
+    assert streams["depth"]["mbps"] == pytest.approx(depth, rel=0.01)
+    assert streams["imu"]["msgs_per_s"] == pytest.approx(mock_vio.IMU_RATE_HZ, rel=0.02)
+    assert streams["features"]["msgs_per_s"] == pytest.approx(15, rel=0.01)
+    assert status["down_mbps_10s"] > status["streams_sum_mbps"] > depth
+    assert 0 < status["unaccounted_mbps"] < 0.05 * status["streams_sum_mbps"]
+    assert 0 < status["up_mbps_10s"] < 0.1
+    assert status["share_of_100mbps"] == pytest.approx(status["down_mbps_10s"] / 100)
+
+
+def test_the_mock_counts_the_camera_stream_jpegs(tmp_path):
+    vio, stream = mock_depth_vio(tmp_path)
+    jpeg = vio.encode_depth(1795000000.0)
+    assert vio.link.streams.totals()["depth_stream"] == (1, len(jpeg) + vio.link_stats.ENCODED_FRAME_OVERHEAD)
+    stream.close()
+
+
 def test_the_synthetic_stereo_is_consistent_with_its_depth():
     import mock_vio
     import rectified_intrinsics
@@ -348,6 +381,14 @@ def test_status_shows_mock_and_a_running_vio(server):
     assert 0 < recent["proc_ms_mean"] <= recent["proc_ms_max"]
     assert t["last_frame"]["valid_depth"] > 0 and t["sent_total"] > 0 and t["output"]["mode"] == "sending"
     assert s["camera_connected"] is True and 40 < s["chip_temperature_c"] < 55
+    link = t["link"]
+    assert link["mock"] is True and "mock" in link["source"] and link["available"] and link["usb_speed"] == "SUPER"
+    deadline = time.monotonic() + 3.0
+    while not link["streams"] and time.monotonic() < deadline:  # rates need two samples, 1 s apart
+        time.sleep(0.2)
+        link = get_json(port, "/api/status")[1]["telemetry"]["link"]
+    assert {"depth", "features", "imu"} <= {stream["name"] for stream in link["streams"]}
+    assert link["down_mbps"] > link["streams_sum_mbps"] * 0.5 > 0
     assert s["cpu_percent"] is None or 0 <= s["cpu_percent"] <= 100
     assert s["vehicle"]["armed"] is False and "mock" in s["vehicle"]["detail"]
     assert s["camera"]["intrinsics"] and s["camera"]["mock"]

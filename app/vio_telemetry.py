@@ -15,7 +15,8 @@ each: at most 19800 rows x 12 x 8 B = 1.9 MB (10 fps: 6600 rows, 0.63 MB). The f
 FAILURE_WINDOW_S of (time, reason) tuples, at most 300 s x 30 fps.
 
 The camera chip temperature is sampled on the publisher thread at most every TEMPERATURE_INTERVAL_S
-(an RPC to the device), never on the VIO loop.
+(an RPC to the device), never on the VIO loop. So is the camera link (link_stats.LinkMonitor, the XLink
+byte counters, about once a second whether or not anyone watches, so its 60-s peak is always complete).
 
 main.py side: touch_lease(), read_status(), HistoryReader, downsample(). depthai-free so it can be unit tested.
 """
@@ -171,11 +172,11 @@ class Telemetry:
     VIO process side. record_frame() per frame; start() runs the publisher thread, close() stops it.
     temperature() returns the chip temperature in °C (or raises); output_error() the MAVLink sender's
     last error; pose_status() the 3D pose's attitude source (pose_stream.PoseStreamService.status). All are
-    called on the publisher thread only.
+    called on the publisher thread only. link: a link_stats.LinkMonitor, sampled every link.interval_s.
     """
 
     def __init__(self, directory=DEFAULT_DIR, fps=10, min_inliers=15, mode="sending", temperature=None,
-                 output_error=None, pose_status=None, clock=time.time, log=print):
+                 output_error=None, pose_status=None, clock=time.time, log=print, link=None):
         self.directory = Path(directory)
         self.fps = fps
         self.min_inliers = min_inliers
@@ -183,6 +184,7 @@ class Telemetry:
         self.temperature = temperature
         self.output_error = output_error
         self.pose_status = pose_status
+        self.link = link
         self.clock = clock
         self.log = log
         self.phase = "starting"
@@ -201,7 +203,7 @@ class Telemetry:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
-        self._last_temperature = float("-inf")
+        self._last_temperature = self._last_link = float("-inf")
         self._last_status = self._last_history = float("-inf")
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
@@ -269,8 +271,14 @@ class Telemetry:
                 self.log(f"Telemetry publish failed: {e}")
 
     def publish_due(self, now=None):
-        """One publisher step: sample the temperature and write whatever is due and leased."""
+        """One publisher step: sample the link and the temperature and write whatever is due and leased."""
         now = self.clock() if now is None else now
+        if self.link is not None and now - self._last_link >= self.link.interval_s - 0.05:
+            self._last_link = now
+            try:
+                self.link.sample()
+            except Exception as e:
+                self.log(f"Camera link sample failed: {e}")
         if self.temperature is not None and now - self._last_temperature >= TEMPERATURE_INTERVAL_S:
             self._last_temperature = now
             self.sample_temperature(now)
@@ -311,6 +319,10 @@ class Telemetry:
             pose = self.pose_status() if self.pose_status is not None else None
         except Exception as e:
             pose = {"error": str(e)}
+        try:
+            link = self.link.status() if self.link is not None else None
+        except Exception as e:
+            link = {"available": False, "reason": f"link status failed: {e}"}
         return {
             "pid": os.getpid(),
             "unix_time": now,
@@ -334,6 +346,7 @@ class Telemetry:
             "chip_temperature_at": self.chip_temperature_at,
             "trajectory": {"x": position[0], "y": position[1], "yaw": position[2]},
             "pose": pose,
+            "link": link,
             "history": {"rows": self.history.count, "capacity": self.history.capacity, "bytes": self.history.nbytes,
                         "seconds": HISTORY_SECONDS},
         }

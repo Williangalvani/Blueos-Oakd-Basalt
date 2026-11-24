@@ -28,6 +28,10 @@ h2.sub { margin-top: 14px; }
 .panel-message { background: #2a1d1d; border: 1px solid #6b2a20; color: #f0b8ad; padding: 6px 8px; border-radius: 6px; margin-bottom: 8px; font-size: 13px; }
 .panel-message.info { background: #1d2533; border-color: #34425a; color: #b8c7da; }
 .stale { opacity: .45; }
+.link-streams { margin-top: 6px; font-size: 12px; }
+.link-streams td, .link-streams th { padding: 2px 4px; }
+.link-streams td:not(:first-child), .link-streams th:not(:first-child) { text-align: right; white-space: nowrap; }
+.link-bar { height: 3px; background: #6fa8d6; border-radius: 2px; margin-top: 2px; min-width: 1px; }
 .ok { color: #2ecc71; } .bad { color: #e74c3c; } .warn-text { color: #f1c40f; }
 
 button { background: #2d6cdf; color: #fff; border: 0; border-radius: 5px; padding: 7px 14px; font-weight: 600; cursor: pointer; font-size: 13px; }

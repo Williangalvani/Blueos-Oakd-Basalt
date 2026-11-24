@@ -181,6 +181,8 @@ def test_widget_page_is_self_contained_and_relative(client):
     assert page.index("function featureToView") < page.index("function drawOverlay")
     for element in ("depth-legend-box", "mono-label", "mono-rate"):
         assert f'id="{element}"' in page
+    # The camera link line comes from the formatting shared with the main page
+    assert page.index("function linkWidgetText(") < page.index("function renderStatus(")
 
 
 def test_full_page_links_the_widget_and_works_behind_the_proxy(client):
@@ -228,7 +230,15 @@ def test_widget_status_from_live_telemetry():
     assert s["depth"]["fps"] == 4.9 and s["depth"]["depth_range_mm"] == [300, 4000]
     assert s["depth"]["encoder_stalled"] is True
     assert s["pose"] is None  # the VIO's telemetry has no pose status without a pose stream
+    assert s["link"] is None  # nor a link block without a link monitor
     json.dumps(s, allow_nan=False)
+    # The camera link's headline numbers reach the widget
+    status["link"] = {"available": True, "mock": False, "down_mbps_10s": 61.9, "peak_down_mbps_60s": 64.0,
+                      "share_of_100mbps": 0.619, "reference_mbps": 100.0, "streams": [{"name": "depth"}]}
+    s = cockpit_widget.widget_status(None, status, {}, False, now + 1)
+    assert s["link"] == {"available": True, "mock": False, "down_mbps_10s": 61.9, "peak_down_mbps_60s": 64.0,
+                         "share_of_100mbps": 0.619, "reference_mbps": 100.0}
+    del status["link"]
     # The depth encoding, blank frames and the pose's attitude source reach the widget
     status["pose"] = {"frame": "NED", "frame_text": "NED", "attitude_source": "gyro",
                       "attitude_text": "gyro-integrated, drifting", "attitude_age_s": 7.5, "x": 1.0}

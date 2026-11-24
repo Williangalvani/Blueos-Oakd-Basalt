@@ -44,6 +44,17 @@
   <h2 class="sub">Failures <span class="muted" id="failures-window">(last 5 min)</span></h2>
   <div class="kv" id="failures-kv"><span class="muted">–</span><span></span></div>
 
+  <h2 class="sub">Camera link <span class="muted">(XLink between the camera and the Pi)</span></h2>
+  <div class="kv" id="link-kv"><span class="muted">–</span><span></span></div>
+  <table class="link-streams" id="link-streams" hidden>
+    <thead><tr><th>stream (estimate)</th><th>Mbps</th><th>msgs/s</th><th>per msg</th></tr></thead>
+    <tbody id="link-streams-body"></tbody>
+  </table>
+  <div class="hint" id="link-hint">Measured: depthai's XLink byte counters (device.getProfilingData), about
+    once a second; they count message payloads, not the USB/Ethernet framing. Streams: what the Pi reads from
+    each queue plus header estimates, over the last 10 s; the rest is protocol traffic and frames dropped in the
+    Pi's queues. 100 Mbps is the raw Ethernet rate of a PoE camera; the usable rate is lower.</div>
+
   <h2 class="sub">Output</h2>
   <div class="kv">
     <span>mode</span><span id="out-mode">–</span>

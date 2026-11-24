@@ -262,6 +262,8 @@ function renderStatus(s) {
     const pi = span('depth: encoded on the Pi' + (d.fallback ? ' (fallback: ' + d.fallback.reason + ')' : ''), 'muted');    if (d.fallback && d.fallback.detail) pi.title = d.fallback.detail;
     parts.push(pi);
   }
+  const link = s.problem ? '' : linkWidgetText(s.link);
+  if (link) parts.push(span(link, 'muted'));
   const pose = s.pose;
   if (!s.problem && pose && pose.attitude_source === 'gyro') {
     const gyro = span('3D pose attitude: gyro-integrated, drifting', 'warn');

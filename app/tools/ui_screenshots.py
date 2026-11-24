@@ -14,6 +14,8 @@ settings validation error (settings-error.png) and the page after Stop (vio-stop
 armed: the confirm dialog and the server's refusal while the fake autopilot is armed (armed-refusal.png).
 live: against a mock server (main.py --mock), the Live camera panel streaming with the tracked features
 drawn on it (live-camera.png) and the Cockpit widget (widget-camera.png).
+link: against a mock server, the status panel with the Camera link box and its per-stream table while the
+live stream runs (link-panel.png), and the widget's status line with the link (widget-link.png).
 """
 
 import argparse
@@ -175,11 +177,37 @@ def scenario_live(browser, url, out):
     browser.screenshot(out / "widget-camera.png")
 
 
+def scenario_link(browser, url, out):
+    browser.viewport(1000)
+    browser.send("Page.enable")
+    browser.send("Page.navigate", url=url)
+    browser.wait_for("document.readyState === 'complete'")
+    browser.js("document.getElementById('depth-stream-on').checked = true; toggleDepthStream()")
+    browser.wait_for("[...document.querySelectorAll('#link-streams-body td:first-child')]"
+                     ".some(td => td.textContent.startsWith('depth_stream'))", timeout=30)
+    time.sleep(1.5)
+    box = browser.js("JSON.stringify(document.getElementById('panel-status').getBoundingClientRect())")
+    box = json.loads(box)
+    browser.viewport(max(1000, box["y"] + box["height"] + 20))
+    time.sleep(0.5)
+    data = browser.send("Page.captureScreenshot", format="png", clip={
+        "x": box["x"], "y": box["y"], "width": box["width"], "height": box["height"], "scale": 1})["data"]
+    (out / "link-panel.png").write_bytes(base64.b64decode(data))
+    print(f"wrote {out / 'link-panel.png'}")
+    browser.js("document.getElementById('depth-stream-on').checked = false; toggleDepthStream()")
+    browser.send("Emulation.setDeviceMetricsOverride", width=1000, height=520, deviceScaleFactor=1, mobile=False)
+    browser.send("Page.navigate", url=urllib.parse.urljoin(url, "widget/depth"))
+    browser.wait_for("document.readyState === 'complete'")
+    browser.wait_for("document.getElementById('status-line').textContent.includes('link ')", timeout=20)
+    time.sleep(1.0)
+    browser.screenshot(out / "widget-link.png")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--url", default="http://127.0.0.1:8099/")
     parser.add_argument("--out", type=Path, default=Path.home() / "oakd-stage1/ui-impl")
-    parser.add_argument("--scenario", choices=("main", "armed", "live"), default="main")
+    parser.add_argument("--scenario", choices=("main", "armed", "live", "link"), default="main")
     parser.add_argument("--chrome", default=CHROME)
     parser.add_argument("--debug-port", type=int, default=9333)
     args = parser.parse_args()
@@ -190,8 +218,8 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     browser = Browser(args.chrome, args.debug_port)
     try:
-        {"main": scenario_main, "armed": scenario_armed, "live": scenario_live}[args.scenario](browser, args.url,
-                                                                                              args.out)
+        scenarios = {"main": scenario_main, "armed": scenario_armed, "live": scenario_live, "link": scenario_link}
+        scenarios[args.scenario](browser, args.url, args.out)
     finally:
         browser.close()
 

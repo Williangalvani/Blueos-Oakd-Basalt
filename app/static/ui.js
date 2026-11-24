@@ -172,7 +172,7 @@ function renderStatus(s) {
   const box = $('status-message');
   box.hidden = !message;
   if (message) { box.textContent = message[0]; box.className = 'panel-message ' + message[1]; }
-  for (const id of ['status-kv', 'failures-kv']) $(id).classList.toggle('stale', !live);
+  for (const id of ['status-kv', 'failures-kv', 'link-kv', 'link-streams']) $(id).classList.toggle('stale', !live);
   document.querySelector('#panel-status .big').classList.toggle('stale', !live);
 
   const last = (t && t.last_frame) || {};
@@ -215,6 +215,8 @@ function renderStatus(s) {
     failures.append(Object.assign(document.createElement('span'), { textContent: 'no data' }), document.createElement('span'));
   }
 
+  renderLink(t && t.link);
+
   const out = (t && t.output) || {};
   setText('out-mode', out.mode || (s.log_only ? 'log-only' : 'sending'));
   setText('out-sent', isNum(out.messages_sent) ? String(out.messages_sent) : '–');
@@ -229,6 +231,28 @@ function renderStatus(s) {
   const restarts = s.restart_count ? ' · ' + s.restart_count + ' automatic restart(s), last exit code ' + s.last_exit_code : '';
   setText('process-status', s.running ? 'VIO Running (PID: ' + s.pid + ')' + restarts : 'VIO Stopped' + restarts);
   renderDepthStream(s);
+}
+
+// Camera link box: link_panel.js formats telemetry.link
+function renderLink(link) {
+  const kv = $('link-kv');
+  kv.replaceChildren();
+  for (const [label, value] of linkSummaryRows(link)) {
+    kv.append(Object.assign(document.createElement('span'), { textContent: label }),
+              Object.assign(document.createElement('span'), { textContent: value }));
+  }
+  const rows = linkStreamRows(link);
+  $('link-streams').hidden = !rows.length;
+  $('link-streams-body').replaceChildren(...rows.map(r => {
+    const tr = document.createElement('tr');
+    tr.title = r.description;
+    const name = Object.assign(document.createElement('td'), { textContent: r.name });
+    const bar = Object.assign(document.createElement('div'), { className: 'link-bar' });
+    bar.style.width = (100 * r.fraction).toFixed(1) + '%';
+    name.append(bar);
+    tr.append(name, ...[r.mbps, r.rate, r.size].map(text => Object.assign(document.createElement('td'), { textContent: text })));
+    return tr;
+  }));
 }
 
 async function updateStatus() {

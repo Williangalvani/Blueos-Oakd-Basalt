@@ -184,6 +184,48 @@ def test_temperature_errors_give_none(tmp_path):
     assert telemetry.chip_temperature is None and telemetry.status()["chip_temperature_c"] is None
 
 
+def test_link_is_sampled_about_every_second_and_published(tmp_path):
+    import link_stats
+    from types import SimpleNamespace
+
+    link_clock = Clock(50.0)
+    counters = {"read": 0}
+
+    def profiling():
+        counters["read"] += 1_250_000  # 10 Mbit per sample
+        return SimpleNamespace(numBytesRead=counters["read"], numBytesWritten=0)
+
+    link = link_stats.LinkMonitor(clock=link_clock)
+    link.set_device(profiling, usb_speed="SUPER", protocol="USB")
+    telemetry, clock = make(tmp_path, link=link)
+    for now in (100.0, 100.4, 100.8, 101.0, 101.5, 102.0):
+        link_clock.now = 50.0 + (now - 100.0)
+        telemetry.publish_due(now)
+    assert len(link.samples) == 3  # at 100, 101 and 102: about once a second
+    status = telemetry.status()["link"]
+    assert status["available"] is True and status["usb_speed"] == "SUPER"
+    assert status["down_mbps"] == pytest.approx(10.0) and status["down_mbps_10s"] == pytest.approx(10.0)
+    json.dumps(telemetry.status())
+
+
+def test_without_a_link_monitor_the_status_has_none(tmp_path):
+    telemetry, clock = make(tmp_path)
+    telemetry.publish_due(100.0)
+    assert telemetry.status()["link"] is None
+
+
+def test_a_failing_link_sample_does_not_stop_the_publisher(tmp_path):
+    import link_stats
+
+    class Broken(link_stats.LinkMonitor):
+        def sample(self):
+            raise RuntimeError("boom")
+
+    telemetry, clock = make(tmp_path, link=Broken(), temperature=lambda: 40.0)
+    telemetry.publish_due(100.0)
+    assert telemetry.chip_temperature == 40.0
+
+
 def test_output_error_comes_from_the_sender(tmp_path):
     telemetry, clock = make(tmp_path, output_error=lambda: "12:00:01 connection refused")
     assert telemetry.status()["output"]["last_error"] == "12:00:01 connection refused"

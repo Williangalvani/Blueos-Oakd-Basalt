@@ -30,6 +30,9 @@ Published through the real services, at the configured fps:
   mock_mode.attitude_fetch (an in-process mavlink2rest ATTITUDE with gaps), and its gyro deltas carry
   mock_mode.GYRO_BIAS so the fallback drifts;
 - snapshots.SnapshotService and depth_probe.DepthProbeService; camera.json;
+- link_stats.LinkMonitor (telemetry.link): the per-stream counts the real VIO makes (RAW16 depth, tracked
+  features, Sync headers, IMU at IMU_RATE_HZ, snapshots, the camera's JPEGs), and stand-in XLink counters
+  (MockLinkCounters: those bytes plus a little protocol traffic), all marked mock;
 - a JSONL data log under --log-dir.
 Nothing is sent anywhere. --algorithm basalt only idles, as Basalt publishes none of this.
 """
@@ -50,6 +53,7 @@ import autopilot_attitude
 import depth_probe
 import depth_stream
 import feature_stream
+import link_stats
 import mock_mode
 import pose_stream
 import snapshots
@@ -65,6 +69,13 @@ TURBID_S = 2.5
 STARTUP_PHASE_S = 0.3
 STATS_EVERY = 150
 SNAPSHOT_HISTORY_S = 10.0
+# pnp_vio's IMU: accelerometer and gyroscope at 200 Hz, one packet per message (batch threshold 1)
+IMU_RATE_HZ = 200.0
+MOCK_LINK_SOURCE = "mock (synthetic XLink counters)"
+# Mock XLink traffic beyond the counted streams: a share of them plus RPC / timesync / watchdog bytes
+MOCK_LINK_OVERHEAD = 0.01
+MOCK_LINK_BACKGROUND_DOWN = 1500.0
+MOCK_LINK_BACKGROUND_UP = 800.0
 
 
 def parse_args(argv=None):
@@ -227,6 +238,20 @@ class MockLogDevice:
         self.device_log.on_message(type("LogMessage", (), {"nodeIdName": node, "level": level, "payload": text}))
 
 
+class MockLinkCounters:
+    """Stands in for device.getProfilingData(): the counted stream bytes, MOCK_LINK_OVERHEAD and a background."""
+
+    def __init__(self, streams, clock):
+        self.streams, self.clock, self.started = streams, clock, clock()
+
+    def __call__(self):
+        elapsed = self.clock() - self.started
+        counted = sum(nbytes for _, nbytes in self.streams.totals().values())
+        return type("ProfilingData", (), {
+            "numBytesRead": int(counted * (1.0 + MOCK_LINK_OVERHEAD) + MOCK_LINK_BACKGROUND_DOWN * elapsed),
+            "numBytesWritten": int(MOCK_LINK_BACKGROUND_UP * elapsed)})()
+
+
 class Features:
     """Tracked features on the view: ids kept while visible, replaced when lost (like the LK tracker)."""
 
@@ -283,6 +308,9 @@ class FakeVio:
         self.snapshot_overlay = None
         # (t, pan offset, overlay builder) of recent frames: a snapshot shows the frame of its request time
         self.frames = deque(maxlen=int(SNAPSHOT_HISTORY_S * max(args.fps, 1)) + 1)
+        self.link_stats = link_stats
+        self.link = link_stats.LinkMonitor(clock=clock, source=MOCK_LINK_SOURCE, mock=True)
+        self.imu_due = 0.0
 
     # --- per-frame model ---
 
@@ -372,6 +400,24 @@ class FakeVio:
                 "position_delta": position_delta, "yaw_delta": yaw_delta, "rotation_delta": rotation_delta,
                 "dt": delta_t, "reference_reset": reference_reset}
 
+    # --- camera link ---
+
+    def start_link(self):
+        self.link.set_device(MockLinkCounters(self.link.streams, self.clock), usb_speed="SUPER", protocol="USB",
+                             protocol_raw="X_LINK_USB_VSC", platform="RVC2 (mock)")
+
+    def count_link_frame(self, features):
+        """What one VIO frame takes from the host queues (pnp_vio's counts), and the IMU messages since the last."""
+        streams = self.link.streams
+        streams.add("depth", link_stats.frame_bytes(self.width * self.height * 2))
+        streams.add("features", link_stats.features_bytes(features))
+        streams.add("sync_group", link_stats.MESSAGE_GROUP_OVERHEAD)
+        self.imu_due += IMU_RATE_HZ / max(self.args.fps, 1)
+        messages = int(self.imu_due)
+        if messages:
+            self.imu_due -= messages
+            streams.add("imu", messages * link_stats.imu_bytes(1), messages)
+
     # --- services ---
 
     def camera_status(self):
@@ -453,6 +499,7 @@ class FakeVio:
         self.last_depth = depth
         if not ok:
             return None
+        self.link.streams.add("depth_stream", link_stats.encoded_bytes(len(jpeg)))
         took = time.perf_counter() - start
         self.stream_busy.append(took)
         self.stream_sent += 1
@@ -460,9 +507,10 @@ class FakeVio:
             self.log_device.say(f"VideoEncoder took '{1000 * took:.1f}' ms. (mock)")
         if self.stream_sent % STATS_EVERY == 0:
             busy, self.stream_busy = self.stream_busy, []
-            self.stream.on_device_status(
-                f"stats\t0\t{self.stream_sent}\t{1000 * sum(busy) / len(busy):.1f} {1000 * max(busy):.1f} "
-                f"{self.width} {self.height}".encode())
+            report = (f"stats\t0\t{self.stream_sent}\t{1000 * sum(busy) / len(busy):.1f} {1000 * max(busy):.1f} "
+                      f"{self.width} {self.height}").encode()
+            self.link.streams.add("depth_stream_status", link_stats.buffer_bytes(len(report)))
+            self.stream.on_device_status(report)
         return jpeg.tobytes()
 
     def run(self, stop):
@@ -472,12 +520,13 @@ class FakeVio:
                             log_only=args.log_only)
         self.telemetry = vio_telemetry.Telemetry(self.telemetry_dir, fps=args.fps, min_inliers=args.min_inliers,
                                                  mode="log-only" if args.log_only else "sending",
-                                                 temperature=self.temperature, log=print)
+                                                 temperature=self.temperature, log=print, link=self.link)
         writer = stream = None
         try:
             self.telemetry.set_phase("opening_device")
             self.telemetry.start()
             stop.wait(STARTUP_PHASE_S)
+            self.start_link()
             self.telemetry.set_phase("configuring")
             writer = snapshots.SnapshotWriter(args.snapshot_dir, self.depth_range, log=print)
             pending = []
@@ -539,11 +588,15 @@ class FakeVio:
             self.frames.append((t, tuple(self.offset), lambda values=built: snapshots.build_overlay(*values), sequence))
             features_out.tick(frame["uv"], (self.height, self.width), sequence, frame["ok"], frame["reason"],
                               frame["valid"], frame["matched_index"], frame["inlier_index"])
+            self.count_link_frame(len(frame["ids"]))
 
             snapshot_service.tick()
             turbid = self.turbidity(t)
             while pending:  # the "device" answers each request with the frame of its request time
                 pending.pop(0)
+                depth_shot = snapshot_service.pending is not None and snapshot_service.pending[0] == "depth"
+                self.link.streams.add("snapshot", link_stats.frame_bytes(self.width * self.height
+                                                                         * (2 if depth_shot else 1)))
                 shot_t, offset, self.snapshot_overlay, shot_sequence = self.frame_at(snapshot_service.pending[1])
                 snapshot_service.on_frame(lambda s, t=shot_t, o=offset: self.scene.frame(s, t, o, self.turbidity(t)),
                                           shot_t, shot_sequence)

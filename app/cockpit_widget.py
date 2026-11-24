@@ -92,6 +92,7 @@ def widget_status(problem, telemetry, depth, log_only, now, mock=False):
     failure = telemetry.get("last_failure")
     depth = depth or {}
     pose = telemetry.get("pose") or {}
+    link = telemetry.get("link") or {}
     return {
         "server_time": now,
         "problem": problem,
@@ -116,4 +117,6 @@ def widget_status(problem, telemetry, depth, log_only, now, mock=False):
             "encoding", "source", "requested_variant", "variant_reason", "disparity", "blank")},
         "pose": {key: pose.get(key) for key in ("frame", "frame_text", "attitude_source", "attitude_text",
                                                  "attitude_age_s")} if pose else None,
+        "link": {key: link.get(key) for key in ("available", "mock", "down_mbps_10s", "peak_down_mbps_60s",
+                                                 "share_of_100mbps", "reference_mbps")} if link else None,
     }

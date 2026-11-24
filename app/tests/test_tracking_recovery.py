@@ -132,6 +132,9 @@ class FakeMsg:
     def getFrame(self):
         return self.frame
 
+    def getData(self):
+        return np.zeros(0, np.uint8) if self.frame is None else self.frame.view(np.uint8).reshape(-1)
+
     def getCvFrame(self):
         return self.frame
 
@@ -682,6 +685,108 @@ def test_run_publishes_the_features_of_the_mono_image_s_own_frame(pnp_vio, monke
     assert len(features["points"]) == len(GOOD_UV)
     meta = depth_stream.read_meta(telemetry_dir)
     assert meta["source"] == "stereo.rectifiedLeft" and meta["encoding"] == "gray8-mono-rectified-left"
+
+
+def recorded_telemetry(module, monkeypatch):
+    created = []
+    real = module.vio_telemetry.Telemetry
+    monkeypatch.setattr(module.vio_telemetry, "Telemetry", lambda *a, **kw: created.append(real(*a, **kw)) or created[-1])
+    return created
+
+
+def test_run_counts_each_host_queue_for_the_link_breakdown(pnp_vio, monkeypatch, tmp_path):
+    link_stats = pnp_vio.link_stats
+    created = recorded_telemetry(pnp_vio, monkeypatch)
+    telemetry_dir = tmp_path / "snapshots" / "telemetry"
+    depth_stream.touch_lease(telemetry_dir)
+    snapshots.request_snapshot("depth", tmp_path / "snapshots")
+    jpeg = np.frombuffer(b"\xff\xd8" + b"j" * 1000 + b"\xff\xd9", np.uint8)
+    encoded = FakeQueue([SimpleNamespace(getData=lambda: jpeg, getSequenceNum=lambda: 3)] * 2)
+    report = np.frombuffer(b"stats\t0\t1\t2.0 3.0 640 400", np.uint8)
+    status = FakeQueue([SimpleNamespace(getData=lambda: report)])
+    imu = [still_gyro(0.9, 0.95), still_gyro(0.95, 1.0)]
+    groups = scenario(n_good=6, n_lost=0, n_back=0)
+    run_fake(pnp_vio, monkeypatch, tmp_path, groups, ["--telemetry-dir", str(telemetry_dir)], imu=imu,
+             depth_stream_control_queue=FakeQueue(), depth_stream_queue=encoded, depth_stream_status_queue=status,
+             depth_stream_info={"fps_target": 5.0, "depth_range_mm": [300, 4000], "variant": "nv12",
+                                "requested_variant": "nv12"})
+    (telemetry,) = created
+    totals = telemetry.link.streams.totals()
+    frames = len(groups)
+    assert totals["depth"] == (frames, frames * link_stats.frame_bytes(DEPTH.nbytes))
+    assert totals["features"] == (frames, frames * link_stats.features_bytes(len(GOOD_UV)))
+    assert totals["sync_group"] == (frames, frames * link_stats.MESSAGE_GROUP_OVERHEAD)
+    assert totals["imu"] == (2, sum(link_stats.imu_bytes(len(m.packets)) for m in imu))
+    assert totals["depth_stream"] == (2, 2 * link_stats.encoded_bytes(len(jpeg)))
+    assert totals["depth_stream_status"] == (1, link_stats.buffer_bytes(len(report)))
+    assert totals["snapshot"] == (1, link_stats.frame_bytes(DEPTH.nbytes))  # the fake device's reply
+
+
+def test_run_gives_the_link_monitor_each_camera_and_counts_its_log(pnp_vio, monkeypatch, tmp_path):
+    created = recorded_telemetry(pnp_vio, monkeypatch)
+    device = mock.MagicMock()
+    device.getUsbSpeed.return_value = "UsbSpeed.SUPER"
+    device.getDeviceInfo.return_value = SimpleNamespace(protocol=SimpleNamespace(name="X_LINK_USB_VSC"))
+    device.getPlatformAsString.return_value = "RVC2"
+    device.getProfilingData.return_value = SimpleNamespace(numBytesRead=1000, numBytesWritten=10)
+    monkeypatch.setattr(pnp_vio, "open_oak_device", lambda timeout, log: device)
+    run_fake(pnp_vio, monkeypatch, tmp_path, scenario(n_good=3, n_lost=0, n_back=0), [])
+    (telemetry,) = created
+    telemetry.link.sample()
+    status = telemetry.link.status()
+    assert status["available"] is True and status["totals_bytes"] == {"down": 1000, "up": 10}
+    assert (status["usb_speed"], status["protocol"], status["platform"]) == ("SUPER", "USB", "RVC2")
+    # A log callback counts the camera's log messages; it is removed with the session
+    (callback,), _ = device.addLogCallback.call_args
+    callback(SimpleNamespace(payload="x" * 36, level="WARN", nodeIdName="Script(4)"))
+    assert telemetry.link.streams.totals()["device_log"] == (1, 36 + pnp_vio.link_stats.LOG_MESSAGE_OVERHEAD)
+    device.removeLogCallback.assert_called_once_with(device.addLogCallback.return_value)
+
+
+def test_run_clears_the_link_while_the_camera_reconnects(pnp_vio, monkeypatch, tmp_path):
+    calls = []
+    real = pnp_vio.link_stats.LinkMonitor
+
+    class Recorded(real):
+        def set_device(self, profiling, **info):
+            calls.append(("set", profiling))
+            super().set_device(profiling, **info)
+
+        def clear_device(self, reason="no camera open"):
+            calls.append(("clear", reason))
+            super().clear_device(reason)
+
+    monkeypatch.setattr(pnp_vio.link_stats, "LinkMonitor", Recorded)
+    first = session_handles(pnp_vio, scenario(n_good=8, n_lost=0, n_back=0))
+    second = session_handles(pnp_vio, scenario(n_good=3, n_lost=0, n_back=0))
+    devices = []
+    real_get = first.sync_queue.get
+
+    def get():
+        if len(first.sync_queue.items) == 4:
+            devices[0].setMaxReconnectionAttempts.call_args[0][1](SimpleNamespace(name="RECONNECTED"))
+        return real_get()
+
+    first.sync_queue.get = get
+    run_sessions(pnp_vio, monkeypatch, tmp_path, [first, second], devices=devices)
+    assert [kind for kind, _ in calls] == ["set", "clear", "set"]
+    assert calls[0][1] is devices[0].getProfilingData and calls[2][1] is devices[1].getProfilingData
+    assert "reconnect" in calls[1][1]
+
+
+def test_the_periodic_log_line_has_the_link_summary(pnp_vio, monkeypatch):
+    lines = []
+    sink = pnp_vio.logger.add(lines.append, format="{message}")
+    try:
+        stats = pnp_vio.Stats(lambda: None, link=lambda: "link down 61.9 up 0.1 Mbps")
+        stats.frames, stats.ok, stats.proc_ms, stats.features = 1, 1, [1.0], [300]
+        stats.start -= pnp_vio.SUMMARY_INTERVAL
+        stats.maybe_report()
+        stats.start -= pnp_vio.SUMMARY_INTERVAL
+        stats.maybe_report()  # no frames
+    finally:
+        pnp_vio.logger.remove(sink)
+    assert len(lines) == 2 and all(", link down 61.9 up 0.1 Mbps" in line for line in lines)
 
 
 def test_run_without_a_watcher_keeps_the_stream_off(pnp_vio, monkeypatch, tmp_path):

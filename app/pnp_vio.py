@@ -27,6 +27,7 @@ import depth_probe
 import depth_stream
 import feature_stream
 import autopilot_attitude
+import link_stats
 import pose_stream
 import snapshots
 import vio_telemetry
@@ -192,9 +193,12 @@ class GyroBuffer:
         self.samples = deque(maxlen=GYRO_BUFFER_MAX_SAMPLES)
 
     def add(self, imu_data):
-        for packet in imu_data.packets:
+        """Returns the number of packets."""
+        packets = imu_data.packets
+        for packet in packets:
             g = packet.gyroscope
             self.samples.append((g.getTimestampDevice().total_seconds(), g.x, g.y, g.z))
+        return len(packets)
 
     def prune(self, before):
         while self.samples and self.samples[0][0] < before:
@@ -209,9 +213,11 @@ class GyroBuffer:
 
 
 class Stats:
-    def __init__(self, temperature=None):
+    def __init__(self, temperature=None, link=None):
         # Returns the last sampled chip temperature (°C) or None; sampled off the VIO loop by Telemetry
         self.temperature = temperature
+        # Returns the camera link summary (link_stats.LinkMonitor.summary), from the samples Telemetry takes
+        self.link = link
         self.reset()
 
     def reset(self):
@@ -242,6 +248,9 @@ class Stats:
         value = self.temperature() if self.temperature is not None else None
         return "" if value is None else f", chip {value:.1f}°C"
 
+    def link_summary(self):
+        return "" if self.link is None else f", {self.link()}"
+
     def maybe_report(self):
         elapsed = time.monotonic() - self.start
         if elapsed < SUMMARY_INTERVAL:
@@ -254,9 +263,9 @@ class Stats:
                 f"proc mean {np.mean(self.proc_ms):.1f} ms max {np.max(self.proc_ms):.1f} ms, "
                 f"mean features {np.mean(self.features):.0f}, mean inliers {mean_inliers:.0f}, "
                 f"failures {dict(self.reasons)}, gaps bridged {self.bridged}, reference resets "
-                f"{self.reference_resets}{recoveries}{self.chip_temperature()}")
+                f"{self.reference_resets}{recoveries}{self.chip_temperature()}{self.link_summary()}")
         else:
-            logger.warning(f"📊 {elapsed:.1f}s: no frames received{self.chip_temperature()}")
+            logger.warning(f"📊 {elapsed:.1f}s: no frames received{self.chip_temperature()}{self.link_summary()}")
         self.reset()
 
 
@@ -680,7 +689,7 @@ def main(argv=None):
 def run(args, log_only, data_log, stereo_settings):
     telemetry = vio_telemetry.Telemetry(args.telemetry_dir or args.snapshot_dir / "telemetry", fps=args.fps,
                                         min_inliers=args.min_inliers, mode="log-only" if log_only else "sending",
-                                        log=logger.warning)
+                                        log=logger.warning, link=link_stats.LinkMonitor())
     telemetry.set_phase("opening_device")
     telemetry.start()
     try:
@@ -741,6 +750,7 @@ def run_pipeline(args, log_only, data_log, stereo_settings, telemetry):
             if reason is None:
                 return
             telemetry.temperature = None
+            telemetry.link.clear_device(f"camera reconnecting: {reason}")
             reconnects += 1
             logger.warning(f"🔌 {reason}: restarting the pipeline (reconnect #{reconnects}) so snapshots, the depth "
                            f"stream and the feature tracker settings reach the camera again")
@@ -767,7 +777,8 @@ def run_session(device, args, log_only, data_log, stereo_settings, telemetry, ma
     except Exception as e:
         logger.warning(f"No depthai reconnection callback ({e}); a camera restart is noticed from its frames only")
 
-    writer = stream = log_callback = None
+    writer = stream = log_callback = link_log_callback = None
+    link_streams = telemetry.link.streams
     try:
         with dai.Pipeline(device) as p:
             handles = build_pipeline(p, device, args, stereo_settings)
@@ -777,7 +788,15 @@ def run_session(device, args, log_only, data_log, stereo_settings, telemetry, ma
                 log_warning(f"Stereo: {message}")
             data_log.event("stereo_config", requested=stereo_settings, effective=handles.stereo_effective,
                            warnings=warnings)
-            data_log.event("device", **log_device_info(device))
+            device_info = log_device_info(device)
+            link_info = link_stats.device_link_info(device, device_info.get("USB"))
+            telemetry.link.set_device(device.getProfilingData, **link_info)
+            data_log.event("device", **device_info, link=link_info)
+            try:
+                link_log_callback = device.addLogCallback(
+                    lambda message: link_streams.add("device_log", link_stats.log_bytes(message.payload)))
+            except Exception as e:
+                logger.warning(f"Camera link: camera log messages not counted ({e})")
             calibration = load_calibration(device, args)
             R_cam_imu = calibration.R_cam_imu
             rectified, rectified_problem = rectified_for_settings(calibration, stereo_settings, (args.width, args.height))
@@ -798,7 +817,7 @@ def run_session(device, args, log_only, data_log, stereo_settings, telemetry, ma
                 args.depth_scale, (args.width, args.height), log=logger.warning,
                 refractive_index=args.refractive_index)
             gyro = GyroBuffer()
-            stats = Stats(lambda: telemetry.chip_temperature)
+            stats = Stats(lambda: telemetry.chip_temperature, link=telemetry.link.summary)
             tracking = None
             last_quality_time = 0.0
             previous_ids = set()
@@ -886,7 +905,7 @@ def run_session(device, args, log_only, data_log, stereo_settings, telemetry, ma
                 reinit.step()
 
                 for imu_data in handles.imu_queue.tryGetAll():
-                    gyro.add(imu_data)
+                    link_streams.add("imu", link_stats.imu_bytes(gyro.add(imu_data)))
 
                 if features_msg.getSequenceNum() != depth_msg.getSequenceNum():
                     logger.warning(f"Sequence mismatch: features {features_msg.getSequenceNum()} "
@@ -920,6 +939,9 @@ def run_session(device, args, log_only, data_log, stereo_settings, telemetry, ma
                 ids = np.fromiter((f.id for f in tracked), dtype=np.int64, count=len(tracked))
                 uv = np.array([(f.position.x, f.position.y) for f in tracked], dtype=np.float64).reshape(-1, 2)
                 depth = depth_msg.getFrame()
+                link_streams.add("depth", link_stats.frame_bytes(link_stats.data_bytes(depth_msg)))
+                link_streams.add("features", link_stats.features_bytes(len(tracked)))
+                link_streams.add("sync_group", link_stats.MESSAGE_GROUP_OVERHEAD)
                 id_list = ids.tolist()
                 new_features, tracked_features = feature_id_counts(previous_ids, id_list)
                 previous_ids = set(id_list)
@@ -977,6 +999,7 @@ def run_session(device, args, log_only, data_log, stereo_settings, telemetry, ma
                 if handles.snapshot_queue is not None:
                     snapshot_msg = handles.snapshot_queue.tryGet()
                     if snapshot_msg is not None:
+                        link_streams.add("snapshot", link_stats.frame_bytes(link_stats.data_bytes(snapshot_msg)))
                         snapshot_service.on_frame(lambda stream, m=snapshot_msg: snapshot_frame(m, stream),
                                                   timestamp_seconds(snapshot_msg), snapshot_msg.getSequenceNum())
                 probe.tick()
@@ -984,6 +1007,8 @@ def run_session(device, args, log_only, data_log, stereo_settings, telemetry, ma
                 if stream is not None:
                     stream.tick(depth, depth_msg.getSequenceNum())
                     encoded = handles.depth_stream_queue.tryGetAll() if handles.depth_stream_queue is not None else ()
+                    for jpeg in encoded:
+                        link_streams.add("depth_stream", link_stats.encoded_bytes(link_stats.data_bytes(jpeg)))
                     if encoded:
                         image_sequence = encoded[-1].getSequenceNum()
                         if (stream.on_frame(encoded[-1].getData(), image_sequence)
@@ -991,7 +1016,9 @@ def run_session(device, args, log_only, data_log, stereo_settings, telemetry, ma
                             features_out.publish_for(image_sequence)
                     if handles.depth_stream_status_queue is not None:
                         for report in handles.depth_stream_status_queue.tryGetAll():
-                            stream.on_device_status(report.getData())
+                            data = report.getData()
+                            link_streams.add("depth_stream_status", link_stats.buffer_bytes(len(data)))
+                            stream.on_device_status(data)
                 proc_ms = (time.perf_counter() - start) * 1000.0
 
                 lever = lever_arm_fields(position_delta, R_prior, pose.rotation, args) if args.lever_arm else {}
@@ -1054,11 +1081,12 @@ def run_session(device, args, log_only, data_log, stereo_settings, telemetry, ma
     finally:
         if stream is not None:
             stream.close()
-        if log_callback is not None:
-            try:
-                device.removeLogCallback(log_callback)
-            except Exception:
-                pass
+        for callback in (log_callback, link_log_callback):
+            if callback is not None:
+                try:
+                    device.removeLogCallback(callback)
+                except Exception:
+                    pass
         if writer is not None:
             writer.close()
     if not restart.triggered:

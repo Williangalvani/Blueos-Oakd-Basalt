@@ -316,8 +316,8 @@ def render_page(config: dict) -> str:
     html = (STATIC_DIR / "ui.html").read_text()
     parts = {
         "<!--UI_CSS-->": f"<style>\n{(STATIC_DIR / 'ui.css').read_text()}\n</style>",
-        "<!--UI_JS-->": f"<script>\n{(STATIC_DIR / 'features_overlay.js').read_text()}\n</script>\n"
-                        f"<script>\n{(STATIC_DIR / 'ui.js').read_text()}\n</script>",
+        "<!--UI_JS-->": "\n".join(f"<script>\n{(STATIC_DIR / name).read_text()}\n</script>"
+                                  for name in ("features_overlay.js", "link_panel.js", "ui.js")),
         "<!--FIELDS_STEREO-->": stereo_form_fields(config),
     }
     for group, _ in config_schema.GROUPS:
@@ -340,11 +340,11 @@ def index():
 
 
 def render_widget() -> str:
-    """widget.html with widget.css, features_overlay.js and widget.js inlined, like render_page."""
+    """widget.html with widget.css, features_overlay.js, link_panel.js and widget.js inlined, like render_page."""
     html = (STATIC_DIR / "widget.html").read_text()
     html = html.replace("<!--WIDGET_CSS-->", f"<style>\n{(STATIC_DIR / 'widget.css').read_text()}\n</style>")
     scripts = "\n".join(f"<script>\n{(STATIC_DIR / name).read_text()}\n</script>"
-                        for name in ("features_overlay.js", "widget.js"))
+                        for name in ("features_overlay.js", "link_panel.js", "widget.js"))
     return html.replace("<!--WIDGET_JS-->", scripts)
 
 
