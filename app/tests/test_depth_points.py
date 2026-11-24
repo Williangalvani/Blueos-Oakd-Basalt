@@ -129,14 +129,21 @@ class FakeSLC:
         self.node.inputs["passthrough"].items.append(passthrough)
 
 
+def script_node(node, inputs, outputs):
+    """A fake Script node; depthai (Pipeline.cpp) rejects an input and an output with the same name at start."""
+    assert not set(inputs) & set(outputs), f"'Script.io[{sorted(set(inputs) & set(outputs))}]' redefined"
+    node.inputs, node.outputs = inputs, outputs
+    return node
+
+
 def run_device_script(roi_source, depth_frames, requests, thresholds=(199, 15001), clock=None, **slc_options):
     node = SimpleNamespace(warnings=[])
     node.warn = node.warnings.append
-    node.inputs = {"depth": FakeInput(depth_frames), "spatial": FakeInput(), "passthrough": FakeInput(),
-                   ("features" if roi_source == depth_points.ROIS_CAMERA else "rois"): FakeInput(requests)}
     slc = FakeSLC(node, **slc_options)
-    node.outputs = {"config": FakeOutput(slc.on_config), "depth": FakeOutput(slc.on_depth),
-                    "points": FakeOutput(), "status": FakeOutput()}
+    script_node(node, {"depth": FakeInput(depth_frames), "spatial": FakeInput(), "passthrough": FakeInput(),
+                       ("features" if roi_source == depth_points.ROIS_CAMERA else "rois"): FakeInput(requests)},
+                {"config": FakeOutput(slc.on_config), depth_points.SLC_DEPTH_OUT: FakeOutput(slc.on_depth),
+                 "points": FakeOutput(), "status": FakeOutput()})
     node.slc = slc
     code = depth_points.device_script(roi_source, IMAGE, thresholds)
     if clock is not None:
@@ -308,11 +315,11 @@ def test_camera_rois_fall_back_to_the_other_rect_constructors():
     uv = feature_uv(8)
     node = SimpleNamespace(warnings=[])
     node.warn = node.warnings.append
-    node.inputs = {"depth": FakeInput([DepthFrame(depth, 1)]), "features": FakeInput([Features(uv, 1)]),
-                   "spatial": FakeInput(), "passthrough": FakeInput()}
     slc = FakeSLC(node)
-    node.outputs = {"config": FakeOutput(slc.on_config), "depth": FakeOutput(slc.on_depth), "points": FakeOutput(),
-                    "status": FakeOutput()}
+    script_node(node, {"depth": FakeInput([DepthFrame(depth, 1)]), "features": FakeInput([Features(uv, 1)]),
+                       "spatial": FakeInput(), "passthrough": FakeInput()},
+                {"config": FakeOutput(slc.on_config), depth_points.SLC_DEPTH_OUT: FakeOutput(slc.on_depth),
+                 "points": FakeOutput(), "status": FakeOutput()})
     with pytest.raises(Done):
         exec(compile(depth_points.device_script("camera", IMAGE, (199, 15001)), "s", "exec"),
              {"node": node, **SCRIPT_GLOBALS, "Rect": FourArgRect})
@@ -487,12 +494,11 @@ def test_full_depth_gate_sends_the_finest_need_on_change_and_periodically():
 
 
 def run_gate(depth_frames, controls):
-    node = SimpleNamespace()
-    node.inputs = {"depth": FakeInput(depth_frames), "control": FakeInput(controls)}
-    node.outputs = {"depth": FakeOutput()}
+    node = script_node(SimpleNamespace(), {"depth": FakeInput(depth_frames), "control": FakeInput(controls)},
+                       {depth_points.GATE_OUT: FakeOutput()})
     with pytest.raises(Done):
         exec(compile(depth_points.gate_script(), "gate", "exec"), {"node": node})
-    return [frame.getSequenceNum() for frame in node.outputs["depth"].sent], node
+    return [frame.getSequenceNum() for frame in node.outputs[depth_points.GATE_OUT].sent], node
 
 
 def test_gate_script_forwards_every_nth_frame_only_while_on():

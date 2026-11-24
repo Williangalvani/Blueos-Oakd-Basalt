@@ -50,6 +50,10 @@ ROIS_HOST = "host"
 ROIS_CAMERA = "camera"
 ROI_SOURCES = (ROIS_HOST, ROIS_CAMERA)
 DEFAULT_ROI_SOURCE = ROIS_HOST
+# A Script's inputs and outputs are one key space in depthai (group "io"): none may share a name, and both
+# Scripts take stereo.depth on their input 'depth'
+SLC_DEPTH_OUT = "slc_depth"  # device_script: the depth frame to the SLC
+GATE_OUT = "full_depth"  # gate_script: the forwarded depth frame
 
 # pnp_odometry.PnPParams.depth_window: the same 5x5 window as the host lookup
 WINDOW_RADIUS = 2
@@ -158,7 +162,7 @@ def device_script(roi_source, image_size, thresholds, radius=WINDOW_RADIUS, stat
     """
     Script node source. Inputs: 'depth' (stereo.depth, non-blocking), 'rois' (the host's configs, rois "host")
     or 'features' (FeatureTracker.outputFeatures, rois "camera"), 'spatial' (SLC.out) and 'passthrough'
-    (SLC.passthroughDepth); outputs 'config', 'depth' (to the SLC), 'points' (the SLC's output, re-tagged) and
+    (SLC.passthroughDepth); outputs 'config', SLC_DEPTH_OUT (to the SLC), 'points' (the SLC's output, re-tagged) and
     'status' (parse_status). Only the camera's Script bindings: Buffer(size), the SLC config types by their
     firmware names, Rect probed (Rect(x, y, w, h, False), Rect(x, y, w, h), Rect(Point2f, Size2f)).
 
@@ -355,7 +359,7 @@ def device_script(roi_source, image_size, thresholds, radius=WINDOW_RADIUS, stat
         "        request = None",
         "        built = clock() if clock else 0.0",
         "        node.outputs['config'].send(config)",
-        "        node.outputs['depth'].send(frame)",
+        f"        node.outputs[{SLC_DEPTH_OUT!r}].send(frame)",
         "        config = None",
         "        frame = None",
         "        spatial = node.inputs['spatial'].get()",
@@ -405,7 +409,7 @@ def gate_script():
     """
     Script node source of the on-demand full depth gate (points mode): input 'depth' (stereo.depth,
     non-blocking size 1) and 'control' (Buffer, sequence number n: forward every n-th frame, 0: none);
-    output 'depth'. While off it blocks on 'control', so it costs nothing per frame.
+    output GATE_OUT. While off it blocks on 'control', so it costs nothing per frame.
     """
     return "\n".join([
         "every = 0",
@@ -427,7 +431,7 @@ def gate_script():
         "    count += 1",
         "    if count >= every:",
         "        count = 0",
-        "        node.outputs['depth'].send(frame)",
+        f"        node.outputs[{GATE_OUT!r}].send(frame)",
         "    frame = None",
     ])
 

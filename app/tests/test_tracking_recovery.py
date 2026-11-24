@@ -4,7 +4,7 @@ import os
 import signal
 import sys
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -548,34 +548,65 @@ def test_parse_args_depth_stream(pnp_vio, capsys):
 
 
 def fake_dai_pipeline():
-    """A MagicMock pipeline whose p.create() returns a distinct node per call, with real input/output dicts."""
-    created = []
-
-    def create(kind):
-        node = mock.MagicMock(name=str(kind))
-        node.inputs, node.outputs = defaultdict(mock.MagicMock), defaultdict(mock.MagicMock)
-        created.append((kind, node))
-        return node
-
-    p = mock.MagicMock()
-    p.create.side_effect = create
-    return p, created
+    """The strict fake pipeline (pipeline_fakes): p.create() returns a distinct MagicMock node per call."""
+    import pipeline_fakes
+    p = pipeline_fakes.StrictPipeline()
+    return p, p.created
 
 
 def nodes_of(created, kind):
     return [node for k, node in created if k is kind]
 
 
-def build_fake_pipeline(module, argv):
+def build_fake_pipeline(module, argv, cameras=(), start=False):
     """build_pipeline on fakes; full_frame (the previous pipeline, unchanged) unless argv picks a transport."""
     p, created = fake_dai_pipeline()
     device = mock.MagicMock()
-    device.getConnectedCameras.return_value = []
+    device.getConnectedCameras.return_value = list(cameras)
     if "--depth-transport" not in argv:
         argv = ["--depth-transport", "full_frame", *argv]
     args = module.parse_args(argv)
     handles = module.build_pipeline(p, device, args, module.resolve_stereo_settings(args))
+    if start:
+        p.start()
     return handles, created
+
+
+STEREO_VARIANTS = {"subpixel": [], "raw8-disparity": ["--no-stereo-subpixel", "--no-stereo-speckle-filter"]}
+
+
+@pytest.mark.parametrize("stereo", sorted(STEREO_VARIANTS))
+@pytest.mark.parametrize("rgb", [True, False], ids=["rgb", "no-rgb"])
+@pytest.mark.parametrize("snapshot_encoding", snapshots.ENCODINGS)
+@pytest.mark.parametrize("stream", depth_stream.VARIANTS)
+@pytest.mark.parametrize("rois", ["host", "camera"])
+@pytest.mark.parametrize("transport", ["points", "full_frame"])
+def test_build_pipeline_starts_in_every_combination(pnp_vio, transport, rois, stream, snapshot_encoding, rgb,
+                                                    stereo):
+    """
+    test16 (cb60cc4): points did not start, "'Script.io["depth"]' redefined": the pairing Script and the full
+    depth gate each had an input and an output named 'depth'. The strict fake pipeline makes depthai's start
+    checks (unique io names per node, link datatypes, stream names, the Scripts' ports).
+    """
+    dai = pnp_vio.dai
+    argv = ["--depth-transport", transport, "--depth-points-rois", rois, "--depth-stream-encoding", stream,
+            "--snapshot-encoding", snapshot_encoding, *STEREO_VARIANTS[stereo]]
+    handles, created = build_fake_pipeline(pnp_vio, argv, cameras=[dai.CameraBoardSocket.CAM_A] if rgb else [],
+                                           start=True)
+    scripts = nodes_of(created, dai.node.Script)
+    for script in scripts:
+        assert not set(script.inputs) & set(script.outputs)
+    expected = 1 + (transport == "points") * 2 + (handles.depth_stream_queue is not None)
+    assert len(scripts) == expected
+    if transport == "points":
+        assert handles.points_queue is not None and handles.full_depth_queue is not None
+        assert (handles.rois_queue is None) == (rois == "camera")
+
+
+@pytest.mark.parametrize("argv", [["--no-depth-stream"], ["--no-snapshots"], ["--no-depth-stream", "--no-snapshots"]])
+@pytest.mark.parametrize("transport", ["points", "full_frame"])
+def test_build_pipeline_starts_without_the_optional_parts(pnp_vio, transport, argv):
+    build_fake_pipeline(pnp_vio, ["--depth-transport", transport, *argv], start=True)
 
 
 def test_build_pipeline_streams_the_rectified_left_image_by_default(pnp_vio):
@@ -1453,7 +1484,8 @@ def test_build_pipeline_points_sends_no_depth_frames(pnp_vio):
     stereo.depth.link.assert_any_call(gate_script.inputs["depth"])
     assert mock.call(slc.inputDepth) not in stereo.depth.link.call_args_list
     points_script.outputs["config"].link.assert_called_once_with(slc.inputConfig)
-    points_script.outputs["depth"].link.assert_called_once_with(slc.inputDepth)
+    points_script.outputs[depth_points.SLC_DEPTH_OUT].link.assert_called_once_with(slc.inputDepth)
+    gate_script.outputs[depth_points.GATE_OUT].createOutputQueue.assert_called_once_with(maxSize=2, blocking=False)
     slc.out.link.assert_called_once_with(points_script.inputs["spatial"])
     slc.passthroughDepth.link.assert_called_once_with(points_script.inputs["passthrough"])
     slc.inputConfig.setWaitForMessage.assert_called_once_with(True)

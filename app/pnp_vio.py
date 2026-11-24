@@ -676,7 +676,7 @@ def build_depth_points(p, stereo, feature_tracker, args):
         script.inputs["rois"].setBlocking(False)
         script.inputs["rois"].setMaxSize(4)
         rois_queue = script.inputs["rois"].createInputQueue(maxSize=4, blocking=False)
-    for name, slc_input in (("config", slc.inputConfig), ("depth", slc.inputDepth)):
+    for name, slc_input in (("config", slc.inputConfig), (depth_points.SLC_DEPTH_OUT, slc.inputDepth)):
         script.outputs[name].link(slc_input)
         slc_input.setBlocking(True)
         slc_input.setMaxSize(1)
@@ -701,7 +701,7 @@ def build_full_depth_gate(p, stereo):
     script.inputs["control"].setMaxSize(4)
     script.setScript(depth_points.gate_script())
     control_queue = script.inputs["control"].createInputQueue(maxSize=4, blocking=False)
-    frame_queue = script.outputs["depth"].createOutputQueue(maxSize=2, blocking=False)
+    frame_queue = script.outputs[depth_points.GATE_OUT].createOutputQueue(maxSize=2, blocking=False)
     return control_queue, frame_queue
 
 
