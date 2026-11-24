@@ -210,7 +210,7 @@ OLD_CONFIG = {
     "optical_flow_grid_size": 80, "optical_flow_max_iterations": 3, "optical_flow_levels": 2,
     "optical_flow_skip_frames": 1, "vio_max_states": 2, "vio_max_kfs": 4, "vio_max_iterations": 3,
     "dvl_source": "no_such_source", "stereo_median": "9x9", "depth_stream_encoding": "manip",
-    "depth_points_rois": "camera",
+    "depth_points_rois": "camera", "stereo_median_last": True,
 }
 
 

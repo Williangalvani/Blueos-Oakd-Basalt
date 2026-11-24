@@ -103,7 +103,7 @@ DEVICE_IMGFRAME_API = frozenset({
 })
 # Frame types the RVC2 VideoEncoder takes; it drops others with "Arrived frame type (N) is not either NV12 or
 # YUV400p (8-bit Gray)" (GRAY8 is N = 30 on test10, RAW16 N = 14 on test14). RAW8 from StereoDepth's pool
-# (the disparity, rectifiedLeft/Right) encodes too (test14).
+# (rectifiedLeft/Right, a RAW8 disparity) encodes too (test14).
 ENCODER_INPUT_TYPES = frozenset({"NV12", "YUV400p", "RAW8"})
 
 
@@ -135,29 +135,15 @@ class DepthFrame:
         return self.sequence * 0.1
 
 
-class DisparityFrame(DepthFrame):
-    """
-    A RAW8 stereo.disparity frame (max disparity <= 255: subpixel and extended off, the median last; test14
-    cases B-D, F), disparity in px, from StereoDepth's pool.
-    """
+class RectifiedFrame(DepthFrame):
+    """A stereo.rectifiedLeft frame (RAW8 camera image, the FeatureTracker's input), from StereoDepth's pool."""
 
-    def __init__(self, disparity, sequence):
-        self.depth, self.sequence = disparity, sequence
-        self.data = np.asarray(disparity, np.uint8).tobytes()
+    def __init__(self, image, sequence):
+        self.depth, self.sequence = image, sequence
+        self.data = np.asarray(image, np.uint8).tobytes()
 
     def getType(self):
         return ImgFrame.Type.RAW8
-
-
-class RectifiedFrame(DisparityFrame):
-    """A stereo.rectifiedLeft frame (RAW8 camera image, the FeatureTracker's input), from StereoDepth's pool."""
-
-
-class Raw16DisparityFrame(DepthFrame):
-    """
-    A RAW16 stereo.disparity frame (test14 case A, the saved settings with subpixel off: the speckle filter
-    runs after the median, so getMaxDisparity is 8192 and the frame 16-bit), from StereoDepth's pool.
-    """
 
 
 class DeviceBuffer:
@@ -205,7 +191,7 @@ class ImgFrame(DeviceBuffer):
 class FakeVideoEncoder(FakeOutput):
     """
     The camera's VideoEncoder (PlgVidEnc in the RVC2 firmware) at the end of the stream: it takes NV12,
-    YUV400p and RAW8 (test14: StereoDepth's RAW8 disparity and rectified images encode directly) and drops
+    YUV400p and RAW8 (test14: StereoDepth's RAW8 rectified images encode directly) and drops
     anything else with the firmware's warning, once per frame (test10: GRAY8 frames sent, nothing encoded;
     test14: RAW16, "frame type (14)"). The first frame sets the encoder size.
     """
@@ -242,12 +228,12 @@ def test_the_fake_device_messages_reject_what_the_camera_rejects():
 
 
 def test_the_fake_encoder_takes_pooled_raw8_and_drops_raw16_with_a_warning():
-    """test14: RAW8 disparity and rectifiedLeft frames from StereoDepth's pool encode; RAW16 gets a warning."""
+    """test14: rectifiedLeft frames from StereoDepth's pool encode; RAW16 (depth, a 16-bit disparity) gets a warning."""
     encoder = FakeVideoEncoder()
-    encoder.send(DisparityFrame(disparity_image(0), 0))
+    encoder.send(RectifiedFrame(mono_image(0), 0))
     encoder.send(RectifiedFrame(mono_image(1), 1))
     assert len(encoder.encoded) == 2 and encoder.warnings == []
-    encoder.send(Raw16DisparityFrame(depth_image(2, 40, 64), 2))
+    encoder.send(DepthFrame(depth_image(2, 40, 64), 2))
     assert len(encoder.encoded) == 2
     assert encoder.warnings == ["[VideoEncoder(11)] [warning] Arrived frame type (14) is not either NV12 or "
                                 "YUV400p (8-bit Gray)"]
@@ -282,12 +268,6 @@ def depth_image(seed=0, height=400, width=640):
     return depth
 
 
-def disparity_image(seed=0, height=40, width=64):
-    disparity = np.random.default_rng(seed).integers(8, 96, (height, width)).astype(np.uint8)
-    disparity[:, :4] = 0  # the left edge band has no depth
-    return disparity
-
-
 def mono_image(seed=0, height=40, width=64):
     return np.random.default_rng(seed).integers(0, 256, (height, width)).astype(np.uint8)
 
@@ -314,11 +294,9 @@ def encoded_y(encoder):
     return [np.frombuffer(bytes(f.getData()), np.uint8).reshape(f.getHeight(), f.getWidth()) for f in encoder.encoded]
 
 
-@pytest.mark.parametrize("make", [lambda n: DisparityFrame(disparity_image(n), n),
-                                  lambda n: RectifiedFrame(mono_image(n), n)], ids=["disparity", "mono_features"])
-def test_the_gate_sends_every_nth_stereodepth_raw8_frame_straight_to_the_encoder(make):
+def test_the_gate_sends_every_nth_stereodepth_raw8_frame_straight_to_the_encoder():
     """The Script only gates; the encoder gets the pooled StereoDepth frame itself."""
-    frames = [make(n) for n in range(6)]
+    frames = mono_frames(6)
     encoder = FakeVideoEncoder()
     node = run_script(depth_stream.device_script(2), frames, [Control(True)], gray=encoder)
     # The first frame goes out right away, then every 2nd
@@ -326,25 +304,9 @@ def test_the_gate_sends_every_nth_stereodepth_raw8_frame_straight_to_the_encoder
     assert all(sent is frames[sent.sequence] for sent in encoder.sent)  # the same message: its pool and metadata
     assert encoder.warnings == [] and len(encoder.encoded) == 3
     for y, sent in zip(encoded_y(encoder), encoder.sent):
-        np.testing.assert_array_equal(y, sent.depth)  # the data as it is: disparity px or the camera's gray
+        np.testing.assert_array_equal(y, sent.depth)  # the camera's gray as it is
     assert node.warnings == [] and errors_reported(node) == []
     assert reports(node)[0] == {"kind": "sent", "errors": 0, "sent": 1, "text": ""}
-
-
-def test_a_raw16_disparity_through_the_gate_encodes_nothing():
-    """Why auto never picks disparity with the saved settings: the RAW16 frames get the encoder's warning."""
-    frames = [Raw16DisparityFrame(depth_image(n, 40, 64), n) for n in range(3)]
-    encoder = FakeVideoEncoder()
-    run_script(depth_stream.device_script(1), frames, [Control(True)], gray=encoder)
-    assert len(encoder.sent) == 3 and encoder.encoded == []
-    assert len(encoder.warnings) == 3 and "frame type (14)" in encoder.warnings[0]
-
-
-def test_the_disparity_gate_waits_for_the_control():
-    frames = [DisparityFrame(disparity_image(n), n) for n in range(4)]
-    encoder = FakeVideoEncoder()
-    node = run_script(depth_stream.device_script(1), frames, [Control(False), Control(True)], gray=encoder)
-    assert len(encoder.encoded) == 4 and [r["sent"] for r in reports(node) if r["kind"] == "sent"][0] == 1
 
 
 def test_script_reports_frames_sent_about_once_a_second():
@@ -471,12 +433,6 @@ def test_script_reports_its_cost():
     assert stats[0]["convert_ms_max"] >= stats[0]["convert_ms_mean"] >= 0.0
 
 
-def test_manip_output_size_matches_depthai():
-    # 640x400 NV12: Y 640 x 416 rows, UV 640 x 208 rows, each plane rounded up to 4096 bytes
-    assert depth_stream.manip_output_size(640, 400) == 401408
-    assert depth_stream.manip_output_size(640, 400) >= 640 * 400 * 3 // 2
-
-
 def test_size_problem():
     assert depth_stream.size_problem(640, 400) is None and depth_stream.size_problem(1280, 800) is None
     assert "multiple of 32" in depth_stream.size_problem(600, 400)
@@ -485,66 +441,28 @@ def test_size_problem():
 
 def test_device_variant():
     assert depth_stream.device_variant("auto") == "mono_features"
-    assert [depth_stream.device_variant(v) for v in ("mono_features", "disparity")] == ["mono_features", "disparity"]
+    assert depth_stream.device_variant("mono_features") == "mono_features"
     assert depth_stream.device_variant("host_jpeg") is None and depth_stream.device_variant("bogus") is None
-    assert depth_stream.VARIANTS == ("auto", "mono_features", "disparity", "host_jpeg")
-    assert depth_stream.CAMERA_VARIANTS == ("mono_features", "disparity")
+    assert depth_stream.VARIANTS == ("auto", "mono_features", "host_jpeg")
+    assert depth_stream.CAMERA_VARIANTS == ("mono_features",)
 
 
-def saved_disparity_format(**changes):
-    """stereo_config.disparity_format of the default settings with changes, nothing read back from a camera."""
-    import stereo_config
-    return stereo_config.disparity_format(None, stereo_config.resolve_stereo_settings(changes))
-
-
-def test_disparity_problem_follows_the_8192_rule():
-    # The saved defaults (speckle on, after the median): RAW16, with the reason and what to change
-    problem = depth_stream.disparity_problem(saved_disparity_format(stereo_subpixel=False))
-    assert problem.startswith("disparity is RAW16 (max disparity 8192) with the speckle filter on (it runs after "
-                              "the median); turn the speckle filter off") and problem.endswith("or use mono_features")
-    assert "stereo_median_last" in problem
-    # RAW8: speckle off, or the median moved last (probe cases B and G)
-    assert depth_stream.disparity_problem(saved_disparity_format(stereo_subpixel=False,
-                                                                 stereo_speckle_filter=False)) is None
-    assert depth_stream.disparity_problem(saved_disparity_format(stereo_subpixel=False,
-                                                                 stereo_median_last=True)) is None
-    assert "Subpixel on" in depth_stream.disparity_problem(saved_disparity_format(stereo_subpixel=True,
-                                                                                  stereo_speckle_filter=False))
-    assert depth_stream.disparity_problem(None) == "the disparity format is unknown"
-
-
-def test_resolve_variant_starts_with_mono_features_and_needs_raw8_for_disparity():
+def test_resolve_variant_starts_with_mono_features():
     resolve = depth_stream.resolve_variant
-    raw16 = depth_stream.disparity_problem(saved_disparity_format(stereo_subpixel=False))
-    # auto: mono_features whatever the disparity format; never the disparity
+    # auto: mono_features, or host_jpeg at once for a size the encoder rejects
     assert resolve("auto") == ("mono_features", None)
-    assert resolve("auto", raw16) == ("mono_features", None)
-    assert resolve("auto", raw16, problem="600x400: ...") == (None, "600x400: ...")
-    # An explicit disparity request: only with a RAW8 disparity, else host_jpeg with the reason
-    assert resolve("disparity") == ("disparity", None)
-    assert resolve("disparity", raw16) == (None, raw16)
+    assert resolve("auto", problem="600x400: ...") == (None, "600x400: ...")
     # An explicit mono_features is built as asked (a size problem is only logged)
-    assert resolve("mono_features", raw16, problem="600x400: ...") == ("mono_features", None)
+    assert resolve("mono_features", problem="600x400: ...") == ("mono_features", None)
     assert resolve("host_jpeg") == (None, None)
 
 
 def test_encoding_and_source_of_each_variant():
-    assert depth_stream.encoding_for("disparity") == "gray8-disparity"
     assert depth_stream.encoding_for("mono_features") == "gray8-mono-rectified-left"
     assert {depth_stream.encoding_for(v) for v in ("host_jpeg", None)} == {"gray8-depth-linear"}
     assert depth_stream.source_for("mono_features") == "stereo.rectifiedLeft"
-    assert depth_stream.source_for("disparity") == "stereo.disparity"
     assert depth_stream.source_for("host_jpeg") == "stereo.depth"
     assert depth_stream.source_for(None) is None
-
-
-def test_disparity_scale_and_reference():
-    scale = depth_stream.disparity_scale(440.0, 0.075, 300, 4000)
-    assert scale["depth_times_disparity"] == 33000.0 and scale["max_disparity"] == 95
-    assert scale["gray_far"] == 8.25 and scale["gray_near"] == 95.0 and scale["nearest_mm"] == 347
-    assert depth_stream.disparity_scale(0.0, 0.075, 300, 4000) is None
-    depth = np.array([0, 200, 347, 1000, 4000, 20000], np.uint16)
-    assert depth_stream.gray_disparity_reference(depth, 440.0, 0.075).tolist() == [0, 95, 95, 33, 8, 2]
 
 
 # --- VIO process side -----------------------------------------------------------------------------
@@ -958,14 +876,12 @@ def test_auto_falls_back_to_the_pi_when_the_camera_encoder_stalls(tmp_path):
 
 def camera_jpegs(kind, n, height=40, width=64):
     """
-    JPEGs as the strict fakes' camera makes them through the gate: disparity and mono_features (pooled
-    StereoDepth frames) vary; blank is a constant camera image (test12: every JPEG the same, all pixels 1).
+    JPEGs as the strict fakes' camera makes them through the gate: mono_features (pooled StereoDepth frames)
+    vary; blank is a constant camera image (test12: every JPEG the same, all pixels 1).
     """
     import cv2
     encoder = FakeVideoEncoder()
-    if kind == "disparity":
-        frames = [DisparityFrame(disparity_image(k, height, width), k) for k in range(n)]
-    elif kind == "blank":
+    if kind == "blank":
         frames = [RectifiedFrame(np.ones((height, width), np.uint8), k) for k in range(n)]
     else:
         frames = mono_frames(n, height, width)
@@ -1012,17 +928,15 @@ def test_auto_falls_back_on_blank_frames_within_a_few_seconds(tmp_path):
                for line in logs)
 
 
-@pytest.mark.parametrize("variant, encoding", [("disparity", "gray8-disparity"),
-                                               ("mono_features", "gray8-mono-rectified-left")])
-def test_camera_frames_are_not_blank(tmp_path, variant, encoding):
+def test_camera_frames_are_not_blank(tmp_path):
     clock, logs = Clock(1000.0), []
-    service, host, controls = blank_service(tmp_path, clock, logs, variant=variant)
-    jpegs = camera_jpegs(variant, 6)
+    service, host, controls = blank_service(tmp_path, clock, logs)
+    jpegs = camera_jpegs("mono_features", 6)
     assert len(set(jpegs)) == 6
     assert stream_for(service, tmp_path, clock, jpegs, depth_image(1, 40, 64), 8.0) is None
     meta = service.meta()
-    assert meta["blank"] is None and meta["fallback"] is None and meta["variant"] == variant
-    assert meta["encoding"] == encoding and meta["frames_total"] == 40
+    assert meta["blank"] is None and meta["fallback"] is None and meta["variant"] == "mono_features"
+    assert meta["encoding"] == "gray8-mono-rectified-left" and meta["frames_total"] == 40
 
 
 def test_constant_frames_of_a_view_without_depth_are_not_blank(tmp_path):
@@ -1055,7 +969,7 @@ def test_a_requested_variant_reports_blank_frames_without_falling_back_and_recov
 
 def test_empty_frames_are_not_frames_and_still_stall(tmp_path):
     clock, logs = Clock(1000.0), []
-    service, host, controls = blank_service(tmp_path, clock, logs, variant="disparity")
+    service, host, controls = blank_service(tmp_path, clock, logs)
     depth_stream.touch_lease(tmp_path)
     service.tick()
     for sent in (5, 10, 15, 20, 25):
@@ -1064,25 +978,8 @@ def test_empty_frames_are_not_frames_and_still_stall(tmp_path):
         service.on_device_status(f"sent\t0\t{sent}\t".encode())
     meta = depth_stream.read_meta(tmp_path)
     assert meta["bad_frames"] == 5 and meta["frames_total"] == 0
-    assert meta["fallback"]["reason"] == "no JPEG from disparity (the camera encoder outputs nothing)"
+    assert meta["fallback"]["reason"] == "no JPEG from mono_features (the camera encoder outputs nothing)"
     assert any("were not JPEGs" in line for line in logs)
-
-
-def test_a_raw16_disparity_request_starts_on_the_pi_and_says_why(tmp_path):
-    clock, logs = Clock(1000.0), []
-    reason = depth_stream.disparity_problem(saved_disparity_format(stereo_subpixel=False))
-    info = {"fps_target": 5.0, "variant": "host_jpeg", "requested_variant": "disparity", "variant_reason": reason}
-    service, host, controls = host_service(tmp_path, clock, logs, info=info)
-    meta = service.meta()
-    assert meta["fallback"] == {"from": "disparity", "to": "host_jpeg", "reason": reason,
-                                "detail": None, "unix_time": 1000.0, "at_start": True}
-    assert "speckle filter on (it runs after the median)" in reason
-    assert meta["source"] == "stereo.depth" and meta["encoding"] == "gray8-depth-linear"
-    assert service.on_host and any("disparity requested, encoding on the Pi" in line for line in logs)
-    # host_jpeg asked for: nothing to explain
-    plain, _, _ = host_service(tmp_path / "plain", clock, logs,
-                               info={"variant": "host_jpeg", "requested_variant": "host_jpeg", "variant_reason": None})
-    assert plain.fallback is None
 
 
 def test_a_fixed_camera_variant_does_not_fall_back(tmp_path):

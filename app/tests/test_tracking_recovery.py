@@ -572,21 +572,17 @@ def build_fake_pipeline(module, argv, cameras=(), start=False):
     return handles, created
 
 
-STEREO_VARIANTS = {"subpixel": [], "raw8-disparity": ["--no-stereo-subpixel", "--no-stereo-speckle-filter"]}
+STEREO_VARIANTS = {"subpixel": [], "subpixel-off": ["--no-stereo-subpixel", "--no-stereo-speckle-filter"]}
 
 
 def pipeline_combinations():
-    """
-    Each transport with each depth stream variant and stereo setting (the disparity variant needs the RAW8
-    one), then each remaining option changed on its own for both transports.
-    """
-    base = {"snapshot_encoding": snapshots.CAMERA_JPEG, "rgb": True}
-    cases = [dict(base, transport=transport, stream=stream, stereo=stereo)
-             for transport in ("points", "full_frame") for stream in depth_stream.VARIANTS
-             for stereo in sorted(STEREO_VARIANTS)]
+    """Each transport with each depth stream variant, then each other option changed on its own for both."""
+    base = {"snapshot_encoding": snapshots.CAMERA_JPEG, "rgb": True, "stereo": "subpixel"}
+    cases = [dict(base, transport=transport, stream=stream)
+             for transport in ("points", "full_frame") for stream in depth_stream.VARIANTS]
     for transport in ("points", "full_frame"):
-        for change in ({"snapshot_encoding": snapshots.RAW}, {"rgb": False}):
-            cases.append(dict(base, transport=transport, stream="auto", stereo="subpixel", **change))
+        for change in ({"snapshot_encoding": snapshots.RAW}, {"rgb": False}, {"stereo": "subpixel-off"}):
+            cases.append(dict(base, transport=transport, stream="auto", **change))
     return [pytest.param(case, id="-".join(str(value) for value in case.values())) for case in cases]
 
 
@@ -644,53 +640,10 @@ def test_build_pipeline_streams_the_rectified_left_image_by_default(pnp_vio):
     info = handles.depth_stream_info
     assert (info["requested_variant"], info["variant"], info["variant_reason"]) == ("auto", "mono_features", None)
     assert info["encoding"] == "gray8-mono-rectified-left" and info["source"] == "stereo.rectifiedLeft"
-    # The saved defaults: a RAW16 disparity, said in the status, though auto does not need it
-    assert info["disparity_format"]["type"] == "RAW16" and "speckle" in info["disparity_problem"]
     assert len(handles.depth_stream_nodes) == 2  # the Script and the encoder
     # snapshots 2 (the gate's queue, a rectified frame in the mono encoder), and 3 for the rectified frame in
     # the stream Script's queue, in the Script, in the encoder's queue
     stereo.setNumFramesPool.assert_called_once_with(pnp_vio.STEREO_FRAMES_POOL + 5)
-
-
-@pytest.mark.parametrize("argv", [["--no-stereo-subpixel", "--no-stereo-speckle-filter"],
-                                  ["--no-stereo-subpixel", "--stereo-median-last"]], ids=["speckle-off", "median-last"])
-def test_build_pipeline_encodes_a_raw8_disparity_on_the_camera(pnp_vio, argv):
-    """disparity (explicit) with a RAW8 disparity: stereo.disparity -> gate Script -> encoder, no ImageManip."""
-    dai = pnp_vio.dai
-    handles, created = build_fake_pipeline(pnp_vio, ["--depth-stream-encoding", "disparity", *argv])
-    (stereo,) = nodes_of(created, dai.node.StereoDepth)
-    _, stream_script = nodes_of(created, dai.node.Script)
-    (encoder,) = stream_encoders(pnp_vio, created)
-    assert nodes_of(created, dai.node.ImageManip) == []
-    disparity_in = stream_script.inputs["depth"]
-    stereo.disparity.link.assert_called_once_with(disparity_in)
-    stream_script.outputs["gray"].link.assert_called_once_with(encoder.input)
-    info = handles.depth_stream_info
-    assert (info["requested_variant"], info["variant"], info["variant_reason"]) == ("disparity", "disparity", None)
-    assert info["encoding"] == "gray8-disparity" and info["source"] == "stereo.disparity"
-    assert info["disparity_max"] == 95 and info["disparity_format"]["raw8"] is True
-    stereo.setNumFramesPool.assert_called_once_with(pnp_vio.STEREO_FRAMES_POOL + 5)
-
-
-def test_build_pipeline_median_last_sets_the_filtering_order(pnp_vio):
-    dai = pnp_vio.dai
-    Filter = dai.StereoDepthConfig.PostProcessing.Filter
-    _, created = build_fake_pipeline(pnp_vio, ["--stereo-median-last"])
-    (stereo,) = nodes_of(created, dai.node.StereoDepth)
-    assert stereo.initialConfig.postProcessing.filteringOrder == [
-        Filter.DECIMATION, Filter.SPECKLE, Filter.SPATIAL, Filter.TEMPORAL, Filter.MEDIAN]
-
-
-@pytest.mark.parametrize("argv, reason", [([], "Subpixel on"),
-                                          (["--no-stereo-subpixel"], "speckle filter on (it runs after the median)")])
-def test_build_pipeline_runs_a_raw16_disparity_request_on_the_pi(pnp_vio, argv, reason):
-    dai = pnp_vio.dai
-    handles, created = build_fake_pipeline(pnp_vio, ["--depth-stream-encoding", "disparity", *argv])
-    assert stream_encoders(pnp_vio, created) == [] and len(nodes_of(created, dai.node.Script)) == 1
-    info = handles.depth_stream_info
-    assert info["variant"] == "host_jpeg" and info["encoding"] == "gray8-depth-linear"
-    assert info["source"] == "stereo.depth"
-    assert reason in info["variant_reason"] and info["variant_reason"].endswith("or use mono_features")
 
 
 def test_build_pipeline_encodes_the_depth_stream_on_the_camera(pnp_vio):

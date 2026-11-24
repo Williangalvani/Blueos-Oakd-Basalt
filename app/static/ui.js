@@ -614,11 +614,9 @@ function focalCheck() {
 // The stream's gray (depth_stream.py, d.encoding): "gray8-mono-rectified-left" (mono_features, the default)
 // is the rectified left camera image the features are tracked on, shown as it is, with the tracked features
 // (api/stream/features, drawn by features_overlay.js) on top. "gray8-depth-linear" is linear in depth,
-// 0 = no depth, gray_far (max_mm) .. gray_near (min_mm); "gray8-disparity" (the disparity variant) is the
-// camera's disparity in pixels, 0 = no depth, depth_mm = d.disparity.depth_times_disparity / gray. Both depth
-// kinds are redrawn by depth on a canvas with a 256-entry lookup table: jet (min_mm red .. max_mm blue), or
-// with colorize off gray linear in depth (near bright), so the contrast is stretched; the JPEG itself is
-// unchanged and the legend shows the scale drawn.
+// 0 = no depth, gray_far (max_mm) .. gray_near (min_mm), redrawn by depth on a canvas with a 256-entry lookup
+// table: jet (min_mm red .. max_mm blue), or with colorize off gray linear in depth (near bright), so the
+// contrast is stretched; the JPEG itself is unchanged and the legend shows the scale drawn.
 
 const MONO_ENCODING = 'gray8-mono-rectified-left';
 const FEATURES_URL = 'api/stream/features';
@@ -637,12 +635,6 @@ const monoConfigured = d => d.stale && ['auto', 'mono_features'].includes(d.conf
 function streamScale(d) {
   const range = (d && d.depth_range_mm) || [300, 4000];
   if (d && (d.stale ? monoConfigured(d) : d.encoding === MONO_ENCODING)) return { kind: 'mono', min: range[0], max: range[1] };
-  const disparity = d && d.encoding === 'gray8-disparity' && d.disparity;
-  if (disparity && disparity.depth_times_disparity > 0) {
-    return { kind: 'disparity', min: range[0], max: range[1], far: disparity.gray_far, near: disparity.gray_near,
-             invalid: disparity.gray_invalid_below || 3, k: disparity.depth_times_disparity,
-             nearest: disparity.nearest_mm };
-  }
   return { kind: 'depth', min: range[0], max: range[1], far: (d && d.gray_far) || 16, near: (d && d.gray_near) || 255,
            invalid: (d && d.gray_invalid_below) || 8 };
 }
@@ -653,7 +645,6 @@ const colorOn = () => $('depth-stream-color').checked;
 // Depth (mm) of a gray value on the scale, NaN for no depth
 function grayDepth(scale, g) {
   if (g < scale.invalid) return NaN;
-  if (scale.kind === 'disparity') return scale.k / g;
   return scale.max - (scale.max - scale.min) * (g - scale.far) / (scale.near - scale.far);
 }
 
@@ -667,7 +658,7 @@ function depthColor(scale, mm, color) {
 }
 
 function depthLut(scale, color) {
-  const key = [scale.kind, scale.far, scale.near, scale.invalid, scale.k, scale.min, scale.max, color].join(',');
+  const key = [scale.kind, scale.far, scale.near, scale.invalid, scale.min, scale.max, color].join(',');
   if (depthStream.lutKey === key) return depthStream.lut;
   const lut = new Uint8ClampedArray(256 * 3);
   for (let g = 0; g < 256; g++) lut.set(depthColor(scale, grayDepth(scale, g), color), g * 3);
@@ -686,22 +677,14 @@ function drawDepthLegend(scale, color) {
   }
   ctx.putImageData(image, 0, 0);
   const m = mm => (mm / 1000).toFixed(2) + ' m';
-  // The disparity image's own values at each label: gray = disparity in px
-  const px = mm => (scale.kind === 'disparity' ? ' = ' + Math.min(scale.k / mm, scale.near).toFixed(1) + ' px' : '');
-  const nearest = scale.kind === 'disparity' && scale.nearest > scale.min ? ' (nearest ' + m(scale.nearest) + ')' : '';
-  setText('legend-near', m(scale.min) + px(scale.min) + ' near' + nearest);
-  setText('legend-mid', m((scale.min + scale.max) / 2) + px((scale.min + scale.max) / 2));
-  setText('legend-far', m(scale.max) + px(scale.max) + ' far');
+  setText('legend-near', m(scale.min) + ' near');
+  setText('legend-mid', m((scale.min + scale.max) / 2));
+  setText('legend-far', m(scale.max) + ' far');
 }
 
-// "16 mm steps, 240 gray levels" or, for disparity, the depth step of one pixel at 1 m and at max_mm
+// "16 mm steps, 240 gray levels"
 function quantizationText(d, scale) {
   if (isMono(scale)) return 'camera image (8-bit gray), not depth';
-  if (scale.kind === 'disparity') {
-    const step = mm => (mm * mm / scale.k).toFixed(0) + ' mm';
-    return 'disparity ' + scale.far.toFixed(1) + '–' + scale.near.toFixed(1) + ' px (1 px = ' + step(1000)
-      + ' at 1 m, ' + step(scale.max) + ' at ' + (scale.max / 1000).toFixed(1) + ' m)';
-  }
   return isNum(d.quantization_mm) ? d.quantization_mm + ' mm steps, ' + (d.gray_near - d.gray_far + 1) + ' gray levels' : '–';
 }
 
@@ -851,7 +834,6 @@ function depthEncodingText(d) {
   if (d.requested_variant && d.requested_variant !== d.variant) parts.push('requested ' + d.requested_variant);
   if (d.variant_reason && d.requested_variant !== 'auto') parts.push(d.variant_reason);
   if (d.fallback) parts.push('fallback: ' + d.fallback.reason + (d.fallback.at_start ? '' : ' (from ' + d.fallback.from + ')'));
-  if (d.encoding === 'gray8-disparity') parts.push('gray = disparity (px), depth = f·B / disparity');
   if (d.encoding === MONO_ENCODING) parts.push('gray = the camera image, not depth');
   const host = d.host_encoder;
   if (d.encoded_on === 'pi' && host) {
@@ -892,8 +874,7 @@ function renderDepthStream(s) {
   setText('depth-stream-title', mono ? 'Live camera' : 'Live depth');
   setText('depth-stream-subtitle', mono
     ? '(the rectified left camera image the features are tracked on, with the tracked features, MJPEG-encoded on the camera; only sent while streaming)'
-    : '(stereo ' + (depthStream.scale.kind === 'disparity' ? 'disparity' : 'depth') + ' as MJPEG, encoded on the '
-      + (d.encoded_on === 'pi' ? 'Pi' : 'camera') + ', with the tracked features; only sent while streaming)');
+    : '(stereo depth as MJPEG, encoded on the ' + (d.encoded_on === 'pi' ? 'Pi' : 'camera') + ', with the tracked features; only sent while streaming)');
   $('depth-legend-box').hidden = mono;
   $('depth-stream-color-label').hidden = mono;
   setText('feature-legend-title', mono ? 'camera image (rectified left), not depth; the tracked features:'
@@ -902,11 +883,8 @@ function renderDepthStream(s) {
     ? 'The camera encodes the rectified left image the feature tracker works on; the Pi only forwards the JPEGs, and '
       + 'the browser draws the tracked features on it. Raw = device depth in air, before the refractive index and '
       + 'depth scale. The crosshair marks the centre pixel.'
-    : (depthStream.scale.kind === 'disparity'
-      ? 'The camera encodes its 8-bit disparity (gray = disparity in px); the browser redraws it by depth. '
-      : 'The VIO\'s depth (after the stereo filters and the min/max depth thresholds) as 8-bit gray, linear in depth; '
-        + 'the browser redraws it by depth. ')
-      + 'Raw = device depth in air, before the refractive index and depth scale. The crosshair marks the centre pixel.');
+    : 'The VIO\'s depth (after the stereo filters and the min/max depth thresholds) as 8-bit gray, linear in depth; '
+      + 'the browser redraws it by depth. Raw = device depth in air, before the refractive index and depth scale. The crosshair marks the centre pixel.');
   const legendKey = JSON.stringify(depthStream.scale) + colorOn();
   if (!mono && renderDepthStream.legend !== legendKey) {
     drawDepthLegend(depthStream.scale, colorOn());

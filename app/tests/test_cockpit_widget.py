@@ -246,12 +246,11 @@ def test_widget_status_from_live_telemetry():
     status["pose"] = {"frame": "NED", "frame_text": "NED", "attitude_source": "gyro",
                       "attitude_text": "gyro-integrated, drifting", "attitude_age_s": 7.5, "x": 1.0}
     blank = {"variant": "mono_features", "text": "blank frames from mono_features: ..."}
-    s = cockpit_widget.widget_status(None, status, {"encoding": "gray8-disparity", "blank": blank,
-                                                    "disparity": {"nearest_mm": 347}}, False, now + 1)
+    s = cockpit_widget.widget_status(None, status, {"encoding": "gray8-depth-linear", "blank": blank},
+                                     False, now + 1)
     assert s["pose"] == {"frame": "NED", "frame_text": "NED", "attitude_source": "gyro",
                          "attitude_text": "gyro-integrated, drifting", "attitude_age_s": 7.5}
-    assert s["depth"]["encoding"] == "gray8-disparity" and s["depth"]["blank"] == blank
-    assert s["depth"]["disparity"] == {"nearest_mm": 347}
+    assert s["depth"]["encoding"] == "gray8-depth-linear" and s["depth"]["blank"] == blank
     # mono_features: the widget shows the camera image, not depth, and says where it comes from
     mono = {"encoding": "gray8-mono-rectified-left", "variant": "mono_features", "requested_variant": "auto",
             "encoded_on": "camera", "source": "stereo.rectifiedLeft", "variant_reason": None}

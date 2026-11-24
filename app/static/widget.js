@@ -3,8 +3,8 @@
 // Sources, both only while this page is visible (the camera and the VIO stop publishing a few seconds
 // after the last client leaves):
 //   api/stream/depth     MJPEG (depth_stream.py): with mono_features (the default) the rectified-left camera
-//                        image the features are tracked on, shown as it is; else gray linear in depth (or
-//                        disparity), colorized here on a canvas. status.depth.encoding says which
+//                        image the features are tracked on, shown as it is; else gray linear in depth,
+//                        colorized here on a canvas. status.depth.encoding says which
 //   api/stream/features  server-sent events: "features" (points [u, v, state] on the depth image's
 //                        pixel grid, feature_stream.py; drawn by features_overlay.js, inlined before this)
 //                        and "status" (cockpit_widget.widget_status)
@@ -39,24 +39,17 @@ function jet(x) {
   return [c(1.5 - Math.abs(4 * x - 3)), c(1.5 - Math.abs(4 * x - 2)), c(1.5 - Math.abs(4 * x - 1))];
 }
 
-// d.encoding "gray8-depth-linear": gray linear in depth (gray_far at max_mm .. gray_near at min_mm);
-// "gray8-disparity": gray = disparity in px, depth_mm = d.disparity.depth_times_disparity / gray. 0 = no depth.
+// d.encoding "gray8-depth-linear": gray linear in depth (gray_far at max_mm .. gray_near at min_mm), 0 = no depth.
 // "gray8-mono-rectified-left": the camera image, no depth scale (kind 'mono', shown without a lookup table).
 function streamScale(d) {
   const range = (d && d.depth_range_mm) || [300, 4000];
   if (d && d.encoding === MONO_ENCODING) return { kind: 'mono', min: range[0], max: range[1] };
-  const disparity = d && d.encoding === 'gray8-disparity' && d.disparity;
-  if (disparity && disparity.depth_times_disparity > 0) {
-    return { kind: 'disparity', min: range[0], max: range[1], far: disparity.gray_far, near: disparity.gray_near,
-             invalid: disparity.gray_invalid_below || 3, k: disparity.depth_times_disparity };
-  }
   return { kind: 'depth', min: range[0], max: range[1], far: (d && d.gray_far) || 16, near: (d && d.gray_near) || 255,
            invalid: (d && d.gray_invalid_below) || 8 };
 }
 
 function grayDepth(scale, g) {
   if (g < scale.invalid) return NaN;
-  if (scale.kind === 'disparity') return scale.k / g;
   return scale.max - (scale.max - scale.min) * (g - scale.far) / (scale.near - scale.far);
 }
 
@@ -70,7 +63,7 @@ function depthColor(scale, mm) {
 }
 
 function depthLut(scale) {
-  const key = [scale.kind, scale.far, scale.near, scale.invalid, scale.k, scale.min, scale.max, COLORIZE].join(',');
+  const key = [scale.kind, scale.far, scale.near, scale.invalid, scale.min, scale.max, COLORIZE].join(',');
   if (w.lutKey === key) return w.lut;
   const lut = new Uint8ClampedArray(256 * 3);
   for (let g = 0; g < 256; g++) lut.set(depthColor(scale, grayDepth(scale, g)), g * 3);
@@ -212,7 +205,7 @@ function renderStatus(s) {
     if (!mono) drawLegend(w.scale);
     renderStatus.legend = key;
   }
-  // The legend is a depth scale: only for the depth and disparity images
+  // The legend is a depth scale: only for the depth image
   $('depth-legend-box').hidden = mono;
   $('mono-label').hidden = !mono;
   document.title = mono ? 'OAK-D VIO camera' : 'OAK-D VIO depth';

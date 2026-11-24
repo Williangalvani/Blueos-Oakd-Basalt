@@ -299,16 +299,6 @@ def test_the_mock_host_jpeg_variant_encodes_on_the_pi(tmp_path):
     stream.close()
 
 
-@pytest.mark.parametrize("argv", [[], ["--no-stereo-subpixel"]], ids=["saved", "subpixel-off"])
-def test_the_mock_disparity_request_with_a_raw16_disparity_encodes_on_the_pi_and_says_why(tmp_path, argv):
-    vio, stream = mock_depth_vio(tmp_path, "--depth-stream-encoding", "disparity", *argv)
-    meta = stream.meta()
-    assert (meta["variant"], meta["requested_variant"], meta["encoded_on"]) == ("host_jpeg", "disparity", "pi")
-    assert meta["fallback"]["at_start"] and meta["fallback"]["reason"].startswith("disparity is RAW16")
-    assert meta["source"] == "stereo.depth" and meta["disparity_format"]["type"] == "RAW16"
-    stream.close()
-
-
 def test_the_mock_auto_streams_the_rectified_left_image_on_the_camera(tmp_path):
     import cv2
     vio, stream = mock_depth_vio(tmp_path)  # the saved settings: auto, subpixel and speckle on
@@ -325,9 +315,7 @@ def test_the_mock_auto_streams_the_rectified_left_image_on_the_camera(tmp_path):
 
 
 @pytest.mark.parametrize("encoding, variant, argv", [
-    ("auto", "mono_features", []), ("mono_features", "mono_features", []),
-    ("disparity", "disparity", ["--no-stereo-subpixel", "--no-stereo-speckle-filter"]),
-    ("disparity", "disparity", ["--no-stereo-subpixel", "--stereo-median-last"])])
+    ("auto", "mono_features", []), ("mono_features", "mono_features", [])])
 def test_the_mock_reports_the_camera_variant_and_its_debug_log(tmp_path, encoding, variant, argv):
     vio, stream = mock_depth_vio(tmp_path, "--depth-stream-encoding", encoding, "--depth-stream-debug", *argv)
     meta = stream.meta()

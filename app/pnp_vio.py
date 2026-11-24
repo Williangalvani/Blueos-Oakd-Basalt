@@ -40,8 +40,8 @@ from pnp_odometry import (Intrinsics, PnPOdometry, PnPParams, camera_to_body_frd
                           matrix_to_rotvec, refracted_intrinsics)
 from rectified_intrinsics import StereoCalibration, as_list, choose_intrinsics, rectified_for_settings
 from stereo_config import (DEFAULT_LEVER_ARM_M, DEFAULT_REFRACTIVE_INDEX, INTRINSICS_SOURCES, add_stereo_arguments,
-                           apply_stereo_config, disparity_format, effective_stereo_config, parse_depth_scale,
-                           parse_intrinsics_override, parse_lever_arm, parse_refractive_index, read_back,
+                           apply_stereo_config, effective_stereo_config, parse_depth_scale,
+                           parse_intrinsics_override, parse_lever_arm, parse_refractive_index,
                            resolve_stereo_settings, stereo_warnings)
 from tracking_recovery import FeatureTrackerReinit, TrackingRecovery, feature_id_counts
 from vio_log import LOG_ONLY_BANNER, env_forces_log_only, open_vio_log, resolve_log_only, setup_autopilot_output
@@ -158,9 +158,7 @@ def parse_args(argv=None):
     parser.add_argument('--depth-stream-encoding', choices=depth_stream.VARIANTS, default=depth_stream.DEFAULT_VARIANT,
                         help='What the live stream shows and where it is encoded (see depth_stream.py): '
                              'mono_features (the rectified-left camera image the features are tracked on, '
-                             'straight into the camera encoder; the browser draws the features), disparity (the '
-                             'StereoDepth disparity straight into the camera encoder; needs a RAW8 disparity: '
-                             'subpixel and extended off and no filter after the median), '
+                             'straight into the camera encoder; the browser draws the features), '
                              'host_jpeg (the Pi encodes the depth), auto (mono_features, then host_jpeg '
                              'if the camera sends no or blank frames)')
     parser.add_argument('--depth-stream-debug', action=argparse.BooleanOptionalAction, default=False,
@@ -448,7 +446,7 @@ def configure_feature_tracker(config, args, maintainer=True):
 
 
 def create_feature_tracker(p, args):
-    """The VIO's FeatureTracker (stereo_probe.py's mjpeg_loss mode uses it too); link stereo.rectifiedLeft to it."""
+    """The VIO's FeatureTracker; link stereo.rectifiedLeft to it."""
     feature_tracker = p.create(dai.node.FeatureTracker)
     feature_tracker.setHardwareResources(1, 2)
     configure_feature_tracker(feature_tracker.initialConfig, args)
@@ -588,11 +586,9 @@ def build_depth_stream(p, stereo, args, stereo_settings):
     """
     Script node gate (depth_stream.device_script) feeding an MJPEG VideoEncoder, the Script waiting on its
     control input until the host enables it, then passing every n-th frame on:
-    - mono_features (auto at the start): stereo.rectifiedLeft (RAW8, the image the FeatureTracker sees) ->
-      the Script forwards the frame unchanged -> VideoEncoder;
-    - disparity (explicit, only with a RAW8 disparity: stereo_config.disparity_format of the applied config):
-      stereo.disparity -> the Script forwards it -> VideoEncoder. Both encode StereoDepth's own pooled frames,
-      which the encoder takes as RAW8 (test14); RAW16 would be dropped, so it runs as host_jpeg instead.
+    mono_features (auto at the start): stereo.rectifiedLeft (RAW8, the image the FeatureTracker sees) -> the
+    Script forwards the frame unchanged (StereoDepth's own pooled frame, which the encoder takes as RAW8:
+    test14) -> VideoEncoder.
     The encoder and host queues are non-blocking, so a slow consumer only drops stream frames. The Script's 'status' output carries its errors and timing
     (depth_stream.parse_device_status). host_jpeg adds nothing on the camera (the queues are None).
 
@@ -603,12 +599,7 @@ def build_depth_stream(p, stereo, args, stereo_settings):
     min_mm, max_mm = stereo_settings["stereo_depth_min_mm"], stereo_settings["stereo_depth_max_mm"]
     requested = args.depth_stream_encoding
     problem = depth_stream.size_problem(args.width, args.height)
-    fmt = disparity_format(read_back(stereo.initialConfig), stereo_settings)
-    disparity_problem = depth_stream.disparity_problem(fmt)
-    decimation = int(stereo_settings.get("stereo_decimation") or 1)
-    if not disparity_problem and decimation > 1:
-        disparity_problem = depth_stream.size_problem(args.width // decimation, args.height // decimation)
-    variant, reason = depth_stream.resolve_variant(requested, disparity_problem, problem)
+    variant, reason = depth_stream.resolve_variant(requested, problem)
     shift = depth_stream.depth_shift(max_mm)
     info = {"encoding": depth_stream.encoding_for(variant), "codec": "mjpeg", "fps_target": fps, "every": every,
             "camera_fps": args.fps, "quality": args.depth_stream_quality, "image_size": [args.width, args.height],
@@ -616,21 +607,17 @@ def build_depth_stream(p, stereo, args, stereo_settings):
             "gray_far": depth_stream.GRAY_FAR, "gray_near": depth_stream.GRAY_NEAR,
             "gray_invalid_below": depth_stream.GRAY_INVALID_BELOW, "requested_variant": requested,
             "variant": variant or depth_stream.HOST_JPEG, "variant_reason": reason, "size_problem": problem,
-            "source": depth_stream.source_for(variant or depth_stream.HOST_JPEG), "disparity_format": fmt,
-            "disparity_problem": disparity_problem}
+            "source": depth_stream.source_for(variant or depth_stream.HOST_JPEG)}
     if variant is None:
         return None, None, None, info, ()
 
     script = p.create(dai.node.Script)
-    sources = {depth_stream.MONO_FEATURES: stereo.rectifiedLeft, depth_stream.DISPARITY: stereo.disparity}
-    sources[variant].link(script.inputs["depth"])
+    stereo.rectifiedLeft.link(script.inputs["depth"])
     script.inputs["depth"].setBlocking(False)
     script.inputs["depth"].setMaxSize(1)
     script.inputs["control"].setBlocking(False)
     script.inputs["control"].setMaxSize(4)
     script.setScript(depth_stream.device_script(every))
-    if variant == depth_stream.DISPARITY:
-        info["disparity_max"] = int(fmt["max_disparity"])
 
     encoder = p.create(dai.node.VideoEncoder)
     encoder.setDefaultProfilePreset(fps, dai.VideoEncoderProperties.Profile.MJPEG)
@@ -1183,12 +1170,6 @@ def run_session(device, args, log_only, data_log, stereo_settings, telemetry, ma
                 handles.depth_stream_control_queue.send(control)
 
             info = handles.depth_stream_info
-            if info and info.get("variant") == depth_stream.DISPARITY:
-                # The camera's depth = rectified fx * baseline / disparity
-                focal = (rectified or calibration.raw).fx
-                info["disparity"] = depth_stream.disparity_scale(
-                    focal, calibration.baseline_m, *info["depth_range_mm"],
-                    info.get("disparity_max", depth_stream.DISPARITY_MAX))
             points_mode = handles.depth_transport == depth_points.POINTS
             if info:
                 on_camera = handles.depth_stream_control_queue is not None

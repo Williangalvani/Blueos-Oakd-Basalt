@@ -13,20 +13,15 @@ Encoding variants (depth_stream_encoding, VARIANTS; the StereoDepth output each 
                VideoEncoder. The camera image the FeatureTracker runs on (RAW8, full 0..255), so the page
                draws the tracked features (feature_stream) on it; MONO_ENCODING. Works with any stereo
                setting
-    disparity  stereo.disparity -> Script (gate only) -> VideoEncoder. Needs an 8-bit (RAW8) disparity:
-               subpixel off, extended off and no post-processing filter after the median
-               (stereo_config.disparity_format; with the speckle filter on after the median it is RAW16);
-               image: the disparity itself (DISPARITY_ENCODING, see "Disparity encoding" below)
     host_jpeg  nothing extra on the camera: the VIO process converts the depth frame it already has and
                JPEG-encodes it on a worker thread (HostJpegEncoder), capped at HOST_CPU_BUDGET of a core
     auto       (default) mono_features; host_jpeg from the start if the image size does not suit the
                encoder; switches to host_jpeg for the rest of the run (with the reason in the metadata's
-               fallback) if the encoder stalls or its frames are blank. auto never picks disparity: it
-               depends on the stereo settings, so it is only built when asked for
+               fallback) if the encoder stalls or its frames are blank
 
 Why only StereoDepth's own frames work on the camera (firmware a406121b strings, depthai-core v3.3.0
 source, test12, test13 and the stereo probe on an OAK-D-W, test14, depthai 3.3.0, 640x400 @ 10 fps), and
-why the earlier Script-built depth variants (manip, nv12, yuv400p) were removed:
+why the earlier Script-built depth variants (manip, nv12, yuv400p) and the disparity one were removed:
 - A Script's new ImgFrame comes from a DynamicPool of size 0. ImageManip (PlgImageManipV2) needs an input
   pool of at least 2 ("Pool size of the input message is too small... Currently it is 0") and then sends a
   constant image (test12: every JPEG 4668 bytes, every pixel 1). The VideoEncoder drops pool-less frames
@@ -35,20 +30,12 @@ why the earlier Script-built depth variants (manip, nv12, yuv400p) were removed:
   raises it), and a Script that forwards the frame it received (the same object) keeps that pool
   (test13: no pool error).
 - RAW8 frames go straight into the VideoEncoder (test14: the RAW8 disparity and rectifiedLeft /
-  rectifiedRight, 640x400 stride 640, encoded directly into 6.8-32 kB JPEGs), so these variants have no
+  rectifiedRight, 640x400 stride 640, encoded directly into 6.8-32 kB JPEGs), so mono_features has no
   ImageManip. A RAW16 frame (stereo.depth, the subpixel disparity, and the disparity with a filter after the
   median) gets "Arrived frame type (14) is not either NV12 or YUV400p (8-bit Gray)" from the encoder and no
   JPEG, and through ImageManip "Processing failed, potentially unsupported config" and a constant image
-  (test14 cases A and E: 4671-byte JPEGs, gray 1).
-The disparity output carries the same threshold and post-processing filters as stereo.depth (depthai
-applies them in the disparity domain before converting to depth).
-
-Disparity encoding (DISPARITY_ENCODING, disparity_scale): gray = disparity in pixels, 0..max_disparity
-(95), invalid = 0, so depth_mm = focal_px * baseline_mm / gray. Near is bright; far is dark and coarse
-(each gray level is one pixel of disparity: at 4 m and 75 mm baseline with fx 440, about 0.5 m per level;
-test14's scene used 0..34 of 95). The page stretches the display (colours or gray by depth) and labels its
-legend from the scale in the metadata; GRAY_INVALID_BELOW for this encoding is DISPARITY_INVALID_BELOW (3),
-as JPEG rings around 0.
+  (test14 cases A and E: 4671-byte JPEGs, gray 1). The disparity is RAW8 only with subpixel off and no
+  filter after the median, never with the production stereo settings (subpixel and speckle on).
 
 Mono encoding (MONO_ENCODING): gray = the rectified-left camera image, not depth. The tracked features'
 positions are on its pixel grid (scaled to the depth grid if decimated, feature_stream.py), and the VIO
@@ -151,28 +138,18 @@ EXPECT_GRAY_STD_MIN = 3.0
 WIDTH_ALIGN = 32
 HEIGHT_ALIGN = 2
 
-AUTO, MONO_FEATURES, DISPARITY, HOST_JPEG = "auto", "mono_features", "disparity", "host_jpeg"
-VARIANTS = (AUTO, MONO_FEATURES, DISPARITY, HOST_JPEG)
+AUTO, MONO_FEATURES, HOST_JPEG = "auto", "mono_features", "host_jpeg"
+VARIANTS = (AUTO, MONO_FEATURES, HOST_JPEG)
 DEFAULT_VARIANT = AUTO
 # The variants that run on the camera: the Script forwards the StereoDepth frame unchanged into the encoder
-CAMERA_VARIANTS = (MONO_FEATURES, DISPARITY)
+CAMERA_VARIANTS = (MONO_FEATURES,)
 # The StereoDepth output each variant shows (info "source")
-SOURCES = {MONO_FEATURES: "rectifiedLeft", DISPARITY: "disparity", HOST_JPEG: "depth"}
+SOURCES = {MONO_FEATURES: "rectifiedLeft", HOST_JPEG: "depth"}
 # What the gray values mean (info "encoding")
-DEPTH_ENCODING, DISPARITY_ENCODING, MONO_ENCODING = "gray8-depth-linear", "gray8-disparity", "gray8-mono-rectified-left"
-# StereoDepth's disparity search range without subpixel and extended disparity (stereo_config sets
-# extended off): RAW8 0..95, 0 = invalid
-DISPARITY_MAX = 95
-# Disparity gray below this is invalid (0) or JPEG ringing around it: under 3 px is > 10 m on an OAK-D
-DISPARITY_INVALID_BELOW = 3
+DEPTH_ENCODING, MONO_ENCODING = "gray8-depth-linear", "gray8-mono-rectified-left"
 # host_jpeg: at most this fraction of one Pi core on average
 HOST_CPU_BUDGET = 0.25
 HOST_STATS_EVERY = 50
-# ImageManip output buffers (depthai-core ImageManipImpl: DEPTHAI_STRIDE/HEIGHT/PLANE_ALIGNMENT)
-MANIP_STRIDE_ALIGN = 128
-MANIP_HEIGHT_ALIGN = 32
-MANIP_PLANE_ALIGN = 128 * 32
-MANIP_FRAMES_POOL = 3
 DEVICE_LOG_LINES = 30
 DEVICE_LOG_OTHER_LINES = 10
 DEVICE_LOG_MAX_CHARS = 300
@@ -187,35 +164,19 @@ def device_variant(variant):
     return variant if variant in CAMERA_VARIANTS else None
 
 
-def disparity_problem(disparity_format):
-    """
-    Why the disparity variant can't run, or None: it needs a RAW8 disparity (stereo_config.disparity_format of the
-    applied stereo config). RAW16 neither goes into the encoder nor through ImageManip (test14).
-    """
-    if disparity_format is None:
-        return "the disparity format is unknown"
-    if disparity_format.get("raw8"):
-        return None
-    return f"{disparity_format.get('reason') or 'disparity is RAW16'}; or use mono_features"
-
-
-def resolve_variant(requested, disparity_problem=None, problem=None):
+def resolve_variant(requested, problem=None):
     """
     (variant built at the start, None for host_jpeg; why it is not the requested one, or None). auto:
-    mono_features, or host_jpeg straight away if the size does not suit the encoder (problem). An explicit
-    disparity request runs as host_jpeg when the disparity is not RAW8 (disparity_problem, with the reason);
-    mono_features and host_jpeg are built as asked.
+    mono_features, or host_jpeg straight away if the size does not suit the encoder (problem); mono_features
+    and host_jpeg are built as asked.
     """
-    variant = device_variant(requested)
     if requested == AUTO and problem:
         return None, problem
-    if variant == DISPARITY and disparity_problem:
-        return None, disparity_problem
-    return variant, None
+    return device_variant(requested), None
 
 
 def encoding_for(variant):
-    return {DISPARITY: DISPARITY_ENCODING, MONO_FEATURES: MONO_ENCODING}.get(variant, DEPTH_ENCODING)
+    return MONO_ENCODING if variant == MONO_FEATURES else DEPTH_ENCODING
 
 
 def source_for(variant):
@@ -224,48 +185,12 @@ def source_for(variant):
     return None if output is None else f"stereo.{output}"
 
 
-def disparity_scale(focal_px, baseline_m, min_mm, max_mm, max_disparity=DISPARITY_MAX):
-    """
-    The disparity variant's gray scale: gray = disparity in pixels (0 invalid), depth_mm = depth_times_disparity
-    / gray, as the camera computes depth (rectified focal length x baseline). gray_far / gray_near are the
-    disparities at max_mm / min_mm (near clamped to max_disparity, the closest the search range reaches).
-    """
-    k = float(focal_px) * float(baseline_m) * 1000.0
-    if not (k > 0):
-        return None
-    return {"focal_px": round(float(focal_px), 3), "baseline_m": round(float(baseline_m), 5),
-            "depth_times_disparity": round(k, 1), "max_disparity": int(max_disparity),
-            "gray_far": round(k / max(float(max_mm), 1.0), 2),
-            "gray_near": round(min(k / max(float(min_mm), 1.0), float(max_disparity)), 2),
-            "nearest_mm": round(k / max_disparity), "gray_invalid_below": DISPARITY_INVALID_BELOW}
-
-
-def gray_disparity_reference(depth_mm, focal_px, baseline_m, max_disparity=DISPARITY_MAX):
-    """The disparity variant's image for a uint16 depth image (numpy): round(f * B / depth), 0 invalid."""
-    depth = np.asarray(depth_mm, dtype=np.float64)
-    k = float(focal_px) * float(baseline_m) * 1000.0
-    with np.errstate(divide="ignore"):
-        disparity = np.where(depth > 0, np.round(k / np.maximum(depth, 1.0)), 0)
-    return np.clip(disparity, 0, max_disparity).astype(np.uint8)
-
-
 def size_problem(width, height):
     """Why the MJPEG encoder would refuse width x height, or None."""
     if width % WIDTH_ALIGN or height % HEIGHT_ALIGN:
         return (f"{width}x{height}: the camera's MJPEG encoder needs a width that is a multiple of {WIDTH_ALIGN} "
                 f"and an even height")
     return None
-
-
-def _align(value, alignment):
-    return (value + alignment - 1) // alignment * alignment
-
-
-def manip_output_size(width, height):
-    """Bytes of ImageManip's NV12 output frame (depthai-core getAlignedOutputFrameSize for NV12)."""
-    stride = _align(width, MANIP_STRIDE_ALIGN)
-    return (_align(stride * _align(height, MANIP_HEIGHT_ALIGN), MANIP_PLANE_ALIGN)
-            + _align(stride * _align(height // 2, MANIP_HEIGHT_ALIGN // 2), MANIP_PLANE_ALIGN))
 
 
 def depth_shift(max_mm):

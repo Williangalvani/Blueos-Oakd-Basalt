@@ -26,12 +26,10 @@ import depth_probe
 import depth_stream
 import dvl_source
 import feature_stream
-import mjpeg_loss
 import param_checker as param_checker_module
 import pose_stream
 import mock_mode
 import snapshots
-import stereo_probe
 import system_stats
 import viewers
 import vio_log
@@ -69,10 +67,6 @@ WIDGET_STATUS_INTERVAL_S = 1.0
 AUTOPILOT_TIMEOUT = 1.0
 AUTOPILOT_ATTEMPTS = 2
 HEARTBEAT_WAIT = 2.5
-# POST /api/stereo_probe: stereo_probe.py stops starting cases after its own budget (about 90 s); it is
-# killed after this. The response keeps this much of its stderr.
-STEREO_PROBE_TIMEOUT_S = 150.0
-STEREO_PROBE_STDERR_CHARS = 4000
 # Mock mode (mock_mode.py): no camera, no autopilot; set by OAKD_MOCK=1 or --mock (enable_mock_mode)
 MOCK = False
 
@@ -278,8 +272,6 @@ vehicle_state = {"armed": None, "detail": "not read yet", "checked_at": None}
 vehicle_state_lock = threading.Lock()
 # Mock mode's in-memory autopilot (enable_mock_mode)
 mock_autopilot = None
-# One stereo probe at a time: it has the camera to itself while the VIO is stopped
-stereo_probe_lock = threading.Lock()
 
 
 def enable_mock_mode(directory=None):
@@ -1006,144 +998,6 @@ def post_focal_check(tolerance: float = Query(0.15, gt=0.0, lt=1.0)):
              "does not check fy, cx or cy. It uses the in-air camera matrix: the device depth is computed with the "
              "in-air focal length, so the refractive index cancels out and the check holds in water too.")
     return JSONResponse(result, headers={"Cache-Control": "no-store"})
-
-
-def stereo_probe_command(config: dict, output: Path, cases: list, mode: str = stereo_probe.CASES_MODE,
-                         seconds: Optional[float] = None, qualities: Optional[list] = None) -> list:
-    """stereo_probe.py's command line: the camera and stereo settings the VIO gets from the saved config."""
-    cmd = [
-        "python", "-u", "/app/stereo_probe.py",
-        "--fps", str(config["fps"]),
-        "--width", str(config["resolution_width"]),
-        "--height", str(config["resolution_height"]),
-    ]
-    if mode == stereo_probe.MJPEG_LOSS:
-        cmd += ["--mode", mode, "--seconds", str(seconds), "--qualities", ",".join(map(str, qualities)),
-                "--num-features", str(config["num_features"]),
-                "--max-features", str(int(config.get("max_features", DEFAULT_CONFIG["max_features"])))]
-    else:
-        cmd += ["--quality", str(saved_number(config, "depth_stream_quality")), "--cases", ",".join(cases)]
-    return [*cmd, "--output", str(output), *stereo_command_args(config)]
-
-
-def _text(data) -> str:
-    if data is None:
-        return ""
-    return data.decode(errors="replace") if isinstance(data, bytes) else data
-
-
-def run_stereo_probe_process(cmd: list, timeout: float):
-    """(exit code, stdout, stderr) of the probe in the VIO's environment; exit code None if killed on timeout."""
-    try:
-        done = subprocess.run(cmd, env=camera_process_env(), cwd="/app", capture_output=True, text=True,
-                              timeout=timeout)
-    except subprocess.TimeoutExpired as e:
-        return None, _text(e.stdout), _text(e.stderr)
-    return done.returncode, done.stdout, done.stderr
-
-
-def read_probe_document(output: Path, stdout: str):
-    """The probe's JSON: its --output file (also written part-way), else the last JSON line of its stdout."""
-    try:
-        return json.loads(output.read_text())
-    except (OSError, ValueError):
-        pass
-    for line in reversed(stdout.splitlines()):
-        if line.startswith("{"):
-            try:
-                return json.loads(line)
-            except ValueError:
-                return None
-    return None
-
-
-def run_stereo_probe(cases: list, mode: str = stereo_probe.CASES_MODE, seconds: Optional[float] = None,
-                     qualities: Optional[list] = None) -> tuple:
-    """Stop the VIO, run stereo_probe.py, restart the VIO whatever happened; (HTTP status, saved body)."""
-    config = load_config()
-    started = time.time()
-    loss = mode == stereo_probe.MJPEG_LOSS
-    output = CONFIG_FILE.parent / "probe" / f"{'mjpeg_loss' if loss else 'stereo'}-{int(started)}.json"
-    output.parent.mkdir(parents=True, exist_ok=True)
-    cmd = stereo_probe_command(config, output, cases, mode, seconds, qualities)
-    timeout = stereo_probe.mjpeg_loss_timeout(seconds, len(qualities)) if loss else STEREO_PROBE_TIMEOUT_S
-    returncode, stdout, stderr, error, restart_error, timed_out = None, "", "", None, None, False
-    try:
-        stop_vio()
-        returncode, stdout, stderr = run_stereo_probe_process(cmd, timeout)
-        if returncode is None:
-            timed_out = True
-            error = f"the probe did not finish within {timeout:.0f} s and was killed"
-        elif returncode != 0:
-            error = f"the probe exited with code {returncode}"
-    except Exception as e:
-        error = f"the probe could not run: {e}"
-    finally:
-        try:
-            start_vio()
-        except Exception as e:
-            restart_error = str(e)
-    probe = read_probe_document(output, stdout)
-    if error is None and not (isinstance(probe, dict) and probe.get("complete")):
-        error = "the probe printed no complete result"
-    body = {"probe": probe, "error": error, "mode": mode, "cases": cases, "returncode": returncode,
-            "timed_out": timed_out, **({"seconds": seconds, "qualities": qualities} if loss else {}),
-            "started_at": started, "duration_s": round(time.time() - started, 2),
-            "vio_restarted": restart_error is None, "vio_restart_error": restart_error,
-            "stderr_tail": stderr[-STEREO_PROBE_STDERR_CHARS:], "saved_to": str(output)}
-    if probe is None:
-        body["stdout_tail"] = stdout[-STEREO_PROBE_STDERR_CHARS:]
-    snapshots.atomic_write(output, json.dumps(body, indent=1).encode())
-    status = 200 if error is None else 504 if timed_out else 502
-    return status, body
-
-
-def stereo_probe_request(mode: str, cases: Optional[str], seconds: Optional[float], qualities: Optional[str]) -> dict:
-    """run_stereo_probe's arguments for a request; ValueError for anything it can't run."""
-    if mode not in stereo_probe.MODES:
-        raise ValueError(f"unknown mode {mode!r}; the modes are {', '.join(stereo_probe.MODES)}")
-    if mode == stereo_probe.CASES_MODE:
-        if seconds is not None or qualities is not None:
-            raise ValueError("seconds and qualities only apply to mode=mjpeg_loss")
-        return {"cases": stereo_probe.parse_case_names(cases), "mode": mode}
-    if cases is not None:
-        raise ValueError("cases only apply to mode=cases")
-    low, high = stereo_probe.LOSS_SECONDS_RANGE
-    seconds = stereo_probe.LOSS_SECONDS if seconds is None else seconds
-    if not (math.isfinite(seconds) and low <= seconds <= high):
-        raise ValueError(f"seconds must be between {low:g} and {high:g}, got {seconds}")
-    return {"cases": None, "mode": mode, "seconds": float(seconds), "qualities": mjpeg_loss.parse_qualities(qualities)}
-
-
-@app.post("/api/stereo_probe", include_in_schema=False)
-def post_stereo_probe(cases: Optional[str] = None, mode: str = stereo_probe.CASES_MODE,
-                      seconds: Optional[float] = None, qualities: Optional[str] = None):
-    """
-    Diagnostics of StereoDepth's outputs and the camera's MJPEG encoder (stereo_probe.py): stops the VIO, runs
-    short pipelines with several stereo configurations (cases A-G, or a comma-separated subset in `cases`) for
-    about 90 s, then restarts the VIO, also after a failure or a timeout. Returns the probe's JSON plus the end
-    of its stderr, also saved as probe/stereo-<unix time>.json in the data directory. 409 while one runs; 403
-    in mock mode (no camera).
-
-    mode=mjpeg_loss (optional `seconds` per run, 3-30, default 10, and `qualities`, default 70,85,95,100): how
-    much depth the MJPEG encoding of the RAW8 disparity loses at the tracked features, and what subpixel off
-    costs; about 40-60 s (2-3 min if the encoders do not all run at once). Saved as probe/mjpeg_loss-<unix
-    time>.json.
-    """
-    if MOCK:
-        return JSONResponse({"detail": "the stereo probe needs the camera; mock mode has none", "mock": True},
-                            status_code=403)
-    try:
-        request = stereo_probe_request(mode, cases, seconds, qualities)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    if not stereo_probe_lock.acquire(blocking=False):
-        raise HTTPException(status_code=409, detail="a stereo probe is already running")
-    try:
-        status, body = run_stereo_probe(**request)
-    finally:
-        stereo_probe_lock.release()
-    return JSONResponse(body, status_code=status, headers={"Cache-Control": "no-store"})
 
 
 def make_autopilot() -> AutopilotParams:
