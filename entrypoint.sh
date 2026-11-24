@@ -1,7 +1,5 @@
 #!/bin/bash
 
-export PYTHONPATH=/app/depthai-python
-
 echo "🚀 Starting OAK-D VIO Extension"
 echo "📋 Web UI available at http://localhost:8095"
 

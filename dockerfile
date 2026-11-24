@@ -1,43 +1,37 @@
 # =============================================================================
-# Runtime image: the depthai Python module and the two libraries it links, copied
-# out of a prebuilt builder image (dockerfile.builder), plus the app.
+# Runtime image: Debian, depthai 3.3.0 from PyPI (the official manylinux aarch64
+# wheel, which bundles libdepthaicore, libusb, libgomp, FFmpeg and
+# libdynamic_calibration) and the app.
 #
 #   docker buildx build --platform linux/arm64 \
-#     --build-arg BUILDER_IMAGE=williangalvani/blueos-oakd-basalt-builder:arm64-rtabmap \
 #     -t williangalvani/blueos-oakd-basalt:arm64-rtabmap .
-# =============================================================================
-ARG BUILDER_IMAGE=blueos-oakd-basalt-builder
-
-FROM ${BUILDER_IMAGE} AS builder
-
-# =============================================================================
-# Runtime stage - minimal image
 # =============================================================================
 FROM debian:trixie-slim
 
 WORKDIR /app
 
-# depthai.so NEEDS libgomp, libusb-1.0.so and libdynamic_calibration.so (both copied below) and libc/libstdc++.
+# The depthai wheel needs only libc, libstdc++ and libgcc_s from the system, all in trixie-slim.
 # Its embedded TBB dlopens libtbbmalloc.so.2 when present; the hardware-tested images had it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-venv \
-    libusb-1.0-0 libudev1 \
-    libgomp1 libtbbmalloc2 \
+    libtbbmalloc2 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-
-COPY --from=builder /app/depthai-core/build/bindings/python/depthai.cpython-313-aarch64-linux-gnu.so /app/depthai-python/
-COPY --from=builder /app/depthai-core/build/vcpkg_installed/arm64-linux/lib/libusb-1.0.so /usr/local/lib/
-COPY --from=builder /app/depthai-core/build/_deps/dynamic_calibration-src/lib/libdynamic_calibration.so /usr/local/lib/
-RUN ldconfig
 
 # Create virtual environment and install Python deps
 RUN python3 -m venv /app/venv
 ENV PATH="/app/venv/bin:$PATH"
-ENV PYTHONPATH="/app/depthai-python"
 
+# The depthai wheel carries its extension module for every CPython from 3.9 to 3.14 (about 10 MB each);
+# only this Python's is kept, and ldd checks that everything it links resolves. Not `python -c "import
+# depthai"`: depthai's firmware unpack threads can abort a process that exits right after the import.
 COPY requirements.txt /app/requirements.txt
-RUN /app/venv/bin/pip install --no-cache-dir -r /app/requirements.txt
+RUN /app/venv/bin/pip install --no-cache-dir -r /app/requirements.txt \
+    && so=$(/app/venv/bin/python -c "import sysconfig; print(sysconfig.get_path('platlib') + '/depthai' + sysconfig.get_config_var('EXT_SUFFIX'))") \
+    && find "${so%/*}" -maxdepth 1 -name 'depthai.cpython-*.so' ! -path "$so" -delete \
+    && ldd "$so" > /tmp/depthai-ldd \
+    && ! grep 'not found' /tmp/depthai-ldd \
+    && rm /tmp/depthai-ldd
 
 # Copy application code
 COPY app /app

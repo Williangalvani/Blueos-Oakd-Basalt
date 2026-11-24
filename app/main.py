@@ -231,10 +231,9 @@ def build_vio_command(config: dict) -> list:
 
 
 def camera_process_env() -> dict:
-    """Environment of the processes that use the camera (the VIO, the stereo probe): depthai on the path."""
+    """Environment of the processes that use the camera (the VIO, the stereo probe)."""
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
-    env["PYTHONPATH"] = "/app/depthai-python"
     return env
 
 
