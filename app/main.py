@@ -11,6 +11,7 @@ import math
 import subprocess
 import threading
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
@@ -69,7 +70,20 @@ HEARTBEAT_WAIT = 2.5
 # Mock mode (mock_mode.py): no camera, no autopilot; set by OAKD_MOCK=1 or --mock (enable_mock_mode)
 MOCK = False
 
-app = FastAPI(title="OAK-D VIO Configuration")
+
+@asynccontextmanager
+async def lifespan(_app):
+    """Start VIO and the background parameter check with the server; stop them (and the supervisor) after."""
+    start_vio()
+    param_checker.start()
+    try:
+        yield
+    finally:
+        supervisor.shutdown()
+        param_checker.stop()
+
+
+app = FastAPI(title="OAK-D VIO Configuration", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # Configuration file path (persistent across restarts)
@@ -1046,20 +1060,6 @@ async def api_reset():
     save_config(DEFAULT_CONFIG.copy())
     start_vio()
     return {"status": "ok"}
-
-
-@app.on_event("startup")
-async def startup_event():
-    """Start VIO and the background parameter check on server startup"""
-    start_vio()
-    param_checker.start()
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Stop VIO, the supervisor thread and the parameter check on server shutdown"""
-    supervisor.shutdown()
-    param_checker.stop()
 
 
 if mock_mode.enabled():
