@@ -4,7 +4,7 @@ Mock mode: the web page and the Cockpit widget on a PC without an OAK-D or an au
 OAKD_MOCK=1 in the environment (or main.py --mock) makes main.py:
 - keep its data (config.json, snapshots, telemetry, logs) under OAKD_MOCK_DIR (default
   <tmp>/oakd-vio-mock-<uid>), and start from a PnP configuration there;
-- launch mock_vio.py instead of pnp_vio.py / basalt_configurable.py, through the same VIOSupervisor. The
+- launch mock_vio.py instead of pnp_vio.py, through the same VIOSupervisor. The
   fake VIO publishes through the real telemetry, depth stream, feature stream, snapshot and depth probe
   services, so every web server code path runs as with a camera;
 - use one MockAutopilot for the parameter checker and the ArduPilot panel: a disarmed HEARTBEAT (ARMED with
@@ -33,8 +33,8 @@ DIR_ENV = "OAKD_MOCK_DIR"
 TRUE_VALUES = {"1", "true", "yes", "on"}
 APP_DIR = Path(__file__).resolve().parent
 MOCK_VIO = APP_DIR / "mock_vio.py"
-# Saved on first start in mock mode: the PnP algorithm at a resolution the widget shows well
-INITIAL_CONFIG = {"algorithm": "pnp", "fps": 10, "resolution_width": 640, "resolution_height": 400}
+# Saved on first start in mock mode: a lower frame rate than the camera's, to spare the PC's CPU
+INITIAL_CONFIG = {"fps": 10}
 AUTOPILOT_URL = "mock://autopilot"
 # OAKD_MOCK_ARMED=1: the mock autopilot reports ARMED, so the page's writes are refused
 ARMED_ENV = "OAKD_MOCK_ARMED"
@@ -74,8 +74,7 @@ def data_dir(environ=None):
 
 def vio_command(command, snapshot_dir, log_dir, python=sys.executable):
     """main.build_vio_command's command line, running mock_vio.py instead (it ignores the options it lacks)."""
-    algorithm = "pnp" if command[2].endswith("pnp_vio.py") else "basalt"
-    return [python, "-u", str(MOCK_VIO), "--algorithm", algorithm, *command[3:],
+    return [python, "-u", str(MOCK_VIO), *command[3:],
             "--snapshot-dir", str(snapshot_dir), "--log-dir", str(log_dir)]
 
 

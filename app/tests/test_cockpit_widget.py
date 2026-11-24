@@ -160,7 +160,7 @@ def test_cockpit_discovery_through_the_blueos_proxy(client):
 
 def test_widget_page_is_self_contained_and_relative(client):
     main, http = client
-    response = http.get("/widget/depth")  # VIO stopped and Basalt selected: still 200 for Cockpit's check
+    response = http.get("/widget/depth")  # VIO stopped: still 200 for Cockpit's check
     assert response.status_code == 200 and response.headers["content-type"].startswith("text/html")
     assert response.headers["cache-control"] == "no-cache"
     page = response.text
@@ -206,9 +206,9 @@ def test_widget_icon_is_served(client):
 # --- widget status --------------------------------------------------------------------------------
 
 def test_widget_problem():
-    pnp, up = {"algorithm": "pnp"}, {"running": True}
+    pnp, up = {}, {"running": True}
     fresh = {"stale": False, "phase": "running"}
-    assert "PnP" in cockpit_widget.widget_problem({"algorithm": "basalt"}, up, fresh)
+    assert cockpit_widget.widget_problem(pnp, up, fresh) is None
     assert cockpit_widget.widget_problem(pnp, {"running": False}, fresh) == "VIO stopped"
     assert "waiting" in cockpit_widget.widget_problem(pnp, up, None)
     assert "waiting" in cockpit_widget.widget_problem(pnp, up, {"stale": True, "phase": "running"})
@@ -292,10 +292,7 @@ def test_feature_stream_without_the_vio_explains_why(client, tmp_path):
     assert response.headers["cache-control"] == "no-store" and response.headers["x-accel-buffering"] == "no"
     assert response.content.startswith(b"retry: 3000\n\n")
     ((kind, status),) = sse_events(response.content)
-    assert kind == "status" and "PnP" in status["problem"]
-    save_config(tmp_path, algorithm="pnp")
-    ((_, status),) = sse_events(http.get("/api/stream/features?events=1").content)
-    assert status["problem"] == "VIO stopped"
+    assert kind == "status" and status["problem"] == "VIO stopped"
     # Asking still takes the leases, so a VIO that starts publishes right away
     assert (vio_telemetry.DEFAULT_DIR / feature_stream.LEASE_FILE).exists()
     assert (vio_telemetry.DEFAULT_DIR / vio_telemetry.STATUS_LEASE).exists()
@@ -331,7 +328,7 @@ def publishing_vio():
 
 def test_feature_stream_forwards_the_vio_features(client, tmp_path, publishing_vio):
     main, http = client
-    save_config(tmp_path, algorithm="pnp", log_only=True)
+    save_config(tmp_path, log_only=True)
     running(http)
     response = http.get("/api/stream/features?events=4")
     events = sse_events(response.content)
@@ -379,7 +376,7 @@ def test_features_one_shot(client, tmp_path):
     main, http = client
     response = http.get("/api/features")
     assert response.status_code == 503 and "PnP" in response.json()["detail"]
-    save_config(tmp_path, algorithm="pnp")
+    save_config(tmp_path)
     running(http)
     response = http.get("/api/features")
     assert response.status_code == 404 and "retry" in response.json()["detail"]

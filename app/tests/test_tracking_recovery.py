@@ -707,7 +707,7 @@ def test_build_pipeline_encodes_the_depth_stream_on_the_camera(pnp_vio):
     manip.inputImage.setMaxSize.assert_called_with(1)
     code = stream_script.setScript.call_args[0][0]
     compile(code, "depth_stream_script", "exec")
-    assert "every = 3" in code and "ImgFrame.Type.GRAY8" in code
+    assert "every = 6" in code and "ImgFrame.Type.GRAY8" in code
     encoder.setDefaultProfilePreset.assert_called_once_with(5.0, dai.VideoEncoderProperties.Profile.MJPEG)
     encoder.setQuality.assert_called_once_with(70)
     encoder.input.setBlocking.assert_called_with(False)
@@ -720,7 +720,7 @@ def test_build_pipeline_encodes_the_depth_stream_on_the_camera(pnp_vio):
     assert handles.depth_stream_queue is encoder.out.createOutputQueue.return_value
     assert handles.depth_stream_status_queue is stream_script.outputs["status"].createOutputQueue.return_value
     info = handles.depth_stream_info
-    assert info["fps_target"] == 5.0 and info["every"] == 3 and info["quality"] == 70
+    assert info["fps_target"] == 5.0 and info["every"] == 6 and info["quality"] == 70
     assert info["depth_range_mm"][1] == 4000 and info["quantization_mm"] == 16
     assert info["image_size"] == [640, 400]
     assert info["requested_variant"] == "manip" and info["variant"] == "manip" and info["size_problem"] is None
@@ -783,7 +783,7 @@ def test_build_pipeline_without_the_depth_stream(pnp_vio):
     (encoder,) = stream_encoders(pnp_vio, created)
     encoder.setDefaultProfilePreset.assert_called_once_with(1.0, dai.VideoEncoderProperties.Profile.MJPEG)
     encoder.setQuality.assert_called_once_with(55)
-    assert handles.depth_stream_info["every"] == 15
+    assert handles.depth_stream_info["every"] == 30
 
 
 def test_run_streams_depth_only_while_a_client_watches(pnp_vio, monkeypatch, tmp_path):
@@ -1641,7 +1641,7 @@ def test_run_points_pairs_each_frame_and_a_missing_one_has_no_depth(pnp_vio, mon
     assert [m.getSequenceNum() for m in sent[0::2]] == list(range(8)) and not handles.rois_queue.tags
     assert all(isinstance(m, pnp_vio.dai.SpatialLocationCalculatorConfig) for m in sent[1::2])
     assert status["requested_ahead_max"] == 1 and status["host_behind_dropped"] == 0
-    assert status["wait_limit_ms"] == round(depth_points.wait_s(15) * 1000.0, 1)
+    assert status["wait_limit_ms"] == round(depth_points.wait_s(30) * 1000.0, 1)
     # The gate: told "off" once, nothing forwarded
     assert [m.getSequenceNum() for m in handles.full_depth_control_queue.sent] == [0]
 

@@ -40,7 +40,7 @@ Published through the real services, at the configured fps:
   depth of that frame; the depth probe and the host_jpeg stream get full depth frames only through the gate;
 - the camera's load (vio_telemetry.read_camera_load on MockCameraLoad: Leon CPU and memory, synthetic);
 - a JSONL data log under --log-dir.
-Nothing is sent anywhere. --algorithm basalt only idles, as Basalt publishes none of this.
+Nothing is sent anywhere.
 """
 
 import argparse
@@ -90,7 +90,6 @@ MOCK_LINK_BACKGROUND_UP = 800.0
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Fake PnP VIO (mock mode)", allow_abbrev=False)
-    parser.add_argument("--algorithm", choices=("pnp", "basalt"), default="pnp")
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=400)
@@ -933,15 +932,6 @@ class FakeVio:
             stop.wait(max(0.0, next_time - now))
 
 
-def idle(stop):
-    """Basalt in mock mode: a running process that publishes nothing, like basalt_configurable.py."""
-    print("Mock Basalt VIO: idle (mock mode publishes live data for PnP only)", flush=True)
-    parent = os.getppid()
-    while not stop.wait(0.5):
-        if os.getppid() != parent:
-            return
-
-
 def main(argv=None):
     import threading
     args = parse_args(argv)
@@ -952,9 +942,6 @@ def main(argv=None):
 
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
-    if args.algorithm == "basalt":
-        idle(stop)
-        return 0
     rng = np.random.default_rng(args.seed)
     FakeVio(args, rng).run(stop)
     return 0

@@ -271,15 +271,14 @@ def test_log_only_config_and_env_reach_command_and_status(client, monkeypatch):
     status = http.get("/api/status").json()
     assert status["log_only"] is False and status["log_only_forced_by_env"] is False
 
-    main.save_config({**config, "log_only": True, "algorithm": "pnp"})
+    main.save_config({**config, "log_only": True})
     assert "--log-only" in main.build_vio_command(main.load_config())
     assert http.get("/api/status").json()["log_only"] is True
 
-    # The env var wins over a saved log_only=False, for both algorithms
+    # The env var wins over a saved log_only=False
     monkeypatch.setenv(vio_log.LOG_ONLY_ENV, "1")
-    for algorithm in ("pnp", "basalt"):
-        config = {**main.DEFAULT_CONFIG, "algorithm": algorithm, "log_only": False}
-        assert main.build_vio_command(config)[-1] == "--log-only"
+    config = {**main.DEFAULT_CONFIG, "log_only": False}
+    assert main.build_vio_command(config)[-1] == "--log-only"
     main.save_config({**main.DEFAULT_CONFIG})
     status = http.get("/api/status").json()
     assert status["log_only"] is True and status["log_only_forced_by_env"] is True

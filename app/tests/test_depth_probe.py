@@ -319,7 +319,7 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "start_vio", lambda: None)
     monkeypatch.setattr(main.supervisor, "status", lambda: {"running": True, "pid": 1, "restart_count": 0,
                                                             "last_exit_code": None, "restart_in": None})
-    main.save_config({**main.DEFAULT_CONFIG, "algorithm": "pnp", "fps": 15,
+    main.save_config({**main.DEFAULT_CONFIG, "fps": 15,
                       "resolution_width": 640, "resolution_height": 400})
     return main, fastapi_testclient.TestClient(main.app)
 
@@ -378,9 +378,6 @@ def test_api_depth_probe_needs_pnp_running(client, monkeypatch):
     monkeypatch.setattr(main.supervisor, "status", lambda: {"running": False})
     response = http.post("/api/depth_probe")
     assert response.status_code == 503 and "stopped" in response.json()["detail"]
-    main.save_config({**main.DEFAULT_CONFIG, "algorithm": "basalt"})
-    response = http.post("/api/depth_probe")
-    assert response.status_code == 503 and "PnP algorithm" in response.json()["detail"]
 
 
 def test_api_depth_probe_times_out_without_vio(client, monkeypatch, tmp_path):

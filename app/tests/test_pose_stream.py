@@ -205,14 +205,14 @@ def test_pose_stream_without_the_vio_explains_why(client, tmp_path):
     assert response.status_code == 200 and response.headers["content-type"].startswith("text/event-stream")
     assert response.headers["cache-control"] == "no-store" and response.headers["x-accel-buffering"] == "no"
     ((kind, status),) = sse_events(response.content)
-    assert kind == "status" and "PnP" in status["problem"]
+    assert kind == "status" and status["problem"] == "VIO stopped"
     assert (vio_telemetry.DEFAULT_DIR / pose_stream.LEASE_FILE).exists()
     assert http.get("/api/pose").status_code == 503
 
 
 def test_pose_stream_forwards_the_vio_pose(client, tmp_path, publishing_pose):
     main, http = client
-    save_config(tmp_path, algorithm="pnp", log_only=True)
+    save_config(tmp_path, log_only=True)
     running(http)
     events = sse_events(http.get("/api/stream/pose?events=6").content)
     kinds = [kind for kind, _ in events]
@@ -239,7 +239,7 @@ def test_pose_endpoints_stay_out_of_the_openapi_schema(client):
 
 def test_pose_widget_page_is_relative_and_self_contained(client):
     main, http = client
-    response = http.get("/widget/pose")  # VIO stopped and Basalt selected: still 200 for Cockpit's check
+    response = http.get("/widget/pose")  # VIO stopped: still 200 for Cockpit's check
     assert response.status_code == 200 and response.headers["content-type"].startswith("text/html")
     assert response.headers["cache-control"] == "no-cache"
     page = response.text

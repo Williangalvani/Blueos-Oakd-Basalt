@@ -93,7 +93,7 @@ def parse_stream_quality(text):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description='BlueOS OAK-D PnP VIO')
 
-    parser.add_argument('--fps', type=int, default=15)
+    parser.add_argument('--fps', type=int, default=30)
     parser.add_argument('--camera-angle', type=float, default=0.0)
     parser.add_argument('--width', type=int, default=640)
     parser.add_argument('--height', type=int, default=400)

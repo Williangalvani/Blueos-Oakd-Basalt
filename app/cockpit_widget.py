@@ -72,8 +72,6 @@ def cockpit_extras():
 
 def widget_problem(config, process, telemetry):
     """Why the widget can't show live features right now, or None."""
-    if config.get("algorithm") != "pnp":
-        return f"needs the PnP algorithm (current: {config.get('algorithm')})"
     if not process.get("running"):
         return "VIO stopped"
     if telemetry is None or telemetry.get("stale"):

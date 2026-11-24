@@ -91,13 +91,11 @@ VIOConfig = config_schema.ConfigModel
 
 
 def load_config() -> dict:
-    """Load configuration from file or return defaults"""
+    """Load configuration from file or return defaults (an older file: see config_schema.migrate_saved)"""
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE) as f:
-                config = json.load(f)
-                # Merge with defaults for any missing keys
-                return {**DEFAULT_CONFIG, **config}
+                return config_schema.migrate_saved(json.load(f))
         except Exception as e:
             print(f"Error loading config: {e}")
     return DEFAULT_CONFIG.copy()
@@ -193,57 +191,41 @@ def saved_depth_stream_encoding(config: dict) -> str:
 
 
 def build_vio_command(config: dict) -> list:
-    """VIO command line for a configuration"""
-    common_args = [
+    """PnP VIO command line for a configuration"""
+    cmd = [
+        "python", "-u", "/app/pnp_vio.py",
         "--fps", str(config["fps"]),
         "--camera-angle", str(config["camera_angle"]),
         "--vehicle-ip", config["vehicle_ip"],
         "--quality-rate", str(config["quality_rate"]),
         "--width", str(config["resolution_width"]),
         "--height", str(config["resolution_height"]),
+        "--num-features", str(config["num_features"]),
+        "--max-features", str(int(config.get("max_features", DEFAULT_CONFIG["max_features"]))),
+        "--min-inliers", str(int(config.get("min_inliers", DEFAULT_CONFIG["min_inliers"]))),
+        "--recovery-frames", str(int(config["tracking_recovery_frames"])),
+        "--max-reference-age", str(float(config["max_reference_age"])),
+        "--snapshots" if config["snapshots"] else "--no-snapshots",
+        "--snapshot-encoding", saved_choice(config, "snapshot_encoding"),
+        "--depth-stream" if config.get("depth_stream", True) else "--no-depth-stream",
+        "--depth-stream-fps", str(saved_number(config, "depth_stream_fps")),
+        "--depth-stream-quality", str(saved_number(config, "depth_stream_quality")),
+        "--depth-stream-encoding", saved_depth_stream_encoding(config),
+        "--depth-stream-debug" if config.get("depth_stream_debug") else "--no-depth-stream-debug",
+        "--pose-attitude-source", saved_choice(config, "pose_attitude_source"),
+        "--depth-transport", saved_choice(config, "depth_transport"),
+        "--depth-points-rois", saved_choice(config, "depth_points_rois"),
+        "--telemetry-dir", str(telemetry_dir()),
+        "--intrinsics-from", config.get("intrinsics_from") or "rectified",
+        "--depth-scale", str(float(config.get("depth_scale", 1.0))),
+        "--refractive-index", str(clamp_refractive_index(config.get("refractive_index", DEFAULT_REFRACTIVE_INDEX))),
+        "--lever-arm" if config.get("lever_arm_enabled") else "--no-lever-arm",
+        # One token: argparse would take a value starting with "-" (negative x) for an option
+        f"--lever-arm-m={format_lever_arm(saved_lever_arm(config))}",
+        *stereo_command_args(config),
     ]
-    if config["algorithm"] == "pnp":
-        cmd = [
-            "python", "-u", "/app/pnp_vio.py",
-            *common_args,
-            "--num-features", str(config["num_features"]),
-            "--max-features", str(int(config.get("max_features", DEFAULT_CONFIG["max_features"]))),
-            "--min-inliers", str(int(config.get("min_inliers", DEFAULT_CONFIG["min_inliers"]))),
-            "--recovery-frames", str(int(config["tracking_recovery_frames"])),
-            "--max-reference-age", str(float(config["max_reference_age"])),
-            "--snapshots" if config["snapshots"] else "--no-snapshots",
-            "--snapshot-encoding", saved_choice(config, "snapshot_encoding"),
-            "--depth-stream" if config.get("depth_stream", True) else "--no-depth-stream",
-            "--depth-stream-fps", str(saved_number(config, "depth_stream_fps")),
-            "--depth-stream-quality", str(saved_number(config, "depth_stream_quality")),
-            "--depth-stream-encoding", saved_depth_stream_encoding(config),
-            "--depth-stream-debug" if config.get("depth_stream_debug") else "--no-depth-stream-debug",
-            "--pose-attitude-source", saved_choice(config, "pose_attitude_source"),
-            "--depth-transport", saved_choice(config, "depth_transport"),
-            "--depth-points-rois", saved_choice(config, "depth_points_rois"),
-            "--telemetry-dir", str(telemetry_dir()),
-            "--intrinsics-from", config.get("intrinsics_from") or "rectified",
-            "--depth-scale", str(float(config.get("depth_scale", 1.0))),
-            "--refractive-index", str(clamp_refractive_index(config.get("refractive_index", DEFAULT_REFRACTIVE_INDEX))),
-            "--lever-arm" if config.get("lever_arm_enabled") else "--no-lever-arm",
-            # One token: argparse would take a value starting with "-" (negative x) for an option
-            f"--lever-arm-m={format_lever_arm(saved_lever_arm(config))}",
-            *stereo_command_args(config),
-        ]
-        if config.get("intrinsics_override"):
-            cmd += ["--intrinsics-override", str(config["intrinsics_override"])]
-    else:
-        cmd = [
-            "python", "-u", "/app/basalt_configurable.py",
-            *common_args,
-            "--grid-size", str(config["optical_flow_grid_size"]),
-            "--flow-iterations", str(config["optical_flow_max_iterations"]),
-            "--flow-levels", str(config["optical_flow_levels"]),
-            "--max-states", str(config["vio_max_states"]),
-            "--max-kfs", str(config["vio_max_kfs"]),
-            "--vio-iterations", str(config["vio_max_iterations"]),
-            "--skip-frames", str(config["optical_flow_skip_frames"]),
-        ]
+    if config.get("intrinsics_override"):
+        cmd += ["--intrinsics-override", str(config["intrinsics_override"])]
     if log_only_status(config)["log_only"]:
         cmd.append("--log-only")
     return cmd
@@ -277,7 +259,7 @@ def launch_vio() -> subprocess.Popen:
         cwd=cwd
     )
     mode = (" (LOG-ONLY)" if "--log-only" in cmd else "") + (" (MOCK)" if MOCK else "")
-    print(f"Started {config['algorithm']} VIO process with PID {process.pid}{mode}", flush=True)
+    print(f"Started PnP VIO process with PID {process.pid}{mode}", flush=True)
     return process
 
 
@@ -474,7 +456,7 @@ def live_telemetry(process_status: dict, now: float) -> Optional[dict]:
 
 
 def camera_connected(telemetry: Optional[dict]):
-    """True/False from fresh telemetry, None when unknown (VIO stopped, Basalt, or nothing published yet)."""
+    """True/False from fresh telemetry, None when unknown (VIO stopped or nothing published yet)."""
     if telemetry is None or telemetry["stale"]:
         return None
     if telemetry.get("phase") != "running":
@@ -508,7 +490,7 @@ def depth_stream_status(config: dict, process_status: dict, now: float) -> dict:
             "fallback": None, "device_log": None, **meta,
             "configured_encoding": saved_depth_stream_encoding(config),
             "debug_configured": bool(config.get("depth_stream_debug")),
-            "enabled": bool(config.get("depth_stream", True)) and config.get("algorithm") == "pnp",
+            "enabled": bool(config.get("depth_stream", True)),
             "streaming": bool(meta.get("streaming")) and not stale, "stale": stale,
             "age_s": now - float(meta["unix_time"]) if meta.get("unix_time") else None}
 
@@ -551,7 +533,7 @@ def image_streams_status(config: dict, depth: dict, telemetry: Optional[dict], p
                      if on_pi and depth.get("depth_frames") == "every_frame" else None),
             "fallback": f"{HOST_JPEG_FALLBACK}: {reason}" if on_pi and not depth.get("stale") else None})
     shots = snapshots.read_encoding_status(SNAPSHOT_DIR) if process_status.get("running") else None
-    if config.get("snapshots", True) and config.get("algorithm") == "pnp":
+    if config.get("snapshots", True):
         live = (shots or {}).get("streams") or {}
         for stream in snapshots.STREAMS:
             entry = live.get(stream)
@@ -606,7 +588,6 @@ def get_status():
         **process,
         **log_only_status(config),
         "camera": snapshots.read_camera_status(SNAPSHOT_DIR),
-        "algorithm": config.get("algorithm"),
         "depth_stream": depth,
         "depth_transport": depth_transport_status(config, telemetry),
         "image_streams": image_streams_status(config, depth, telemetry, process, viewers),
@@ -736,7 +717,7 @@ def get_snapshot(stream: Literal[snapshots.STREAMS], raw: bool = False, crosshai
     except snapshots.SnapshotUnavailable as e:
         raise HTTPException(status_code=404, detail=str(e))
     except snapshots.SnapshotTimeout as e:
-        raise HTTPException(status_code=504, detail=f"{e}; snapshots need the PnP algorithm running")
+        raise HTTPException(status_code=504, detail=f"{e}; snapshots need the PnP VIO running")
     headers = {
         "Cache-Control": "no-store",
         "X-Snapshot-Unix-Time": str(meta.get("unix_time")),
@@ -766,8 +747,6 @@ def get_snapshot(stream: Literal[snapshots.STREAMS], raw: bool = False, crosshai
 
 def require_pnp_running(what):
     config = load_config()
-    if config.get("algorithm") != "pnp":
-        raise HTTPException(status_code=503, detail=f"{what} needs the PnP algorithm (current: {config.get('algorithm')})")
     if not supervisor.status().get("running"):
         raise HTTPException(status_code=503, detail=f"{what} needs the PnP VIO running; it is stopped")
     return config
@@ -1009,7 +988,7 @@ def post_focal_check(tolerance: float = Query(0.15, gt=0.0, lt=1.0)):
         except snapshots.SnapshotUnavailable as e:
             raise HTTPException(status_code=404, detail=str(e))
         except snapshots.SnapshotTimeout as e:
-            raise HTTPException(status_code=504, detail=f"{e}; the focal check needs the PnP algorithm running")
+            raise HTTPException(status_code=504, detail=f"{e}; the focal check needs the PnP VIO running")
         images[stream] = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED)
 
     fx_K = float(camera["intrinsics"][0])

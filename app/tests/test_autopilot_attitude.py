@@ -375,7 +375,7 @@ def test_pose_attitude_source_reaches_the_vio_command(client, tmp_path):
     import config_schema
     main, http = client
     assert config_schema.POSE_ATTITUDE_SOURCES == pose_stream.ATTITUDE_MODES
-    pnp = {**main.DEFAULT_CONFIG, "algorithm": "pnp"}
+    pnp = {**main.DEFAULT_CONFIG}
     assert pnp["pose_attitude_source"] == "autopilot"
     command = main.build_vio_command(pnp)
     assert command[command.index("--pose-attitude-source") + 1] == "autopilot"
@@ -383,7 +383,6 @@ def test_pose_attitude_source_reaches_the_vio_command(client, tmp_path):
     assert command[command.index("--pose-attitude-source") + 1] == "gyro"
     command = main.build_vio_command({**pnp, "pose_attitude_source": "compass"})  # hand-edited
     assert command[command.index("--pose-attitude-source") + 1] == "autopilot"
-    assert "--pose-attitude-source" not in main.build_vio_command({**main.DEFAULT_CONFIG, "algorithm": "basalt"})
     assert http.post("/api/config", json={**pnp, "pose_attitude_source": "compass"}).status_code == 422
     assert http.post("/api/config", json={**pnp, "pose_attitude_source": "gyro"}).status_code == 200
     assert http.get("/api/status").json()["pose"] == {"configured_source": "gyro"}

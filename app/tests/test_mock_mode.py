@@ -128,7 +128,8 @@ def test_mock_mode_imports_without_depthai(tmp_path):
     out = subprocess.run([sys.executable, "-c", code], cwd=APP, env=env, capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip().splitlines()[-1] == str(tmp_path / "config.json")
-    assert json.loads((tmp_path / "config.json").read_text())["algorithm"] == "pnp"
+    saved = json.loads((tmp_path / "config.json").read_text())
+    assert saved["fps"] == 10 and "algorithm" not in saved
 
 
 def test_enabled_and_data_dir():
@@ -138,23 +139,21 @@ def test_enabled_and_data_dir():
     assert mock_mode.data_dir({}).name == f"oakd-vio-mock-{os.getuid()}"
 
 
-@pytest.mark.parametrize("algorithm", ["pnp", "basalt"])
-def test_the_mock_vio_takes_the_real_command_line(algorithm, tmp_path):
+def test_the_mock_vio_takes_the_real_command_line(tmp_path):
     import main
     import mock_vio
-    config = {**main.DEFAULT_CONFIG, "algorithm": algorithm, "fps": 12, "resolution_width": 480,
+    config = {**main.DEFAULT_CONFIG, "fps": 12, "resolution_width": 480,
               "resolution_height": 300, "stereo_depth_min_mm": 400, "stereo_depth_max_mm": 3500, "log_only": True,
               "lever_arm_enabled": True, "intrinsics_override": "300,300,240,150", "camera_angle": -30}
     command = mock_mode.vio_command(main.build_vio_command(config), tmp_path / "snapshots", tmp_path / "logs",
                                     python="python3")
     assert command[:3] == ["python3", "-u", str(mock_mode.MOCK_VIO)]
-    assert "/app/pnp_vio.py" not in command and "/app/basalt_configurable.py" not in command
+    assert "/app/pnp_vio.py" not in command
     args = mock_vio.parse_args(command[3:])
-    assert args.algorithm == algorithm and args.fps == 12 and (args.width, args.height) == (480, 300)
+    assert args.fps == 12 and (args.width, args.height) == (480, 300)
     assert args.log_only and args.snapshot_dir == tmp_path / "snapshots" and args.log_dir == tmp_path / "logs"
-    if algorithm == "pnp":
-        assert (args.stereo_depth_min_mm, args.stereo_depth_max_mm) == (400, 3500)
-        assert args.telemetry_dir == main.telemetry_dir()
+    assert (args.stereo_depth_min_mm, args.stereo_depth_max_mm) == (400, 3500)
+    assert args.telemetry_dir == main.telemetry_dir()
 
 
 MOCK_MISMATCHES = ["VISO_POS_X", "VISO_POS_Y", "VISO_POS_Z", "EK3_SRC1_POSXY"]
@@ -477,7 +476,7 @@ def test_the_synthetic_stereo_is_consistent_with_its_depth():
 def test_status_shows_mock_and_a_running_vio(server):
     port, root, _ = server
     status, s = get_json(port, "/api/status")
-    assert status == 200 and s["mock"] is True and s["running"] and s["algorithm"] == "pnp"
+    assert status == 200 and s["mock"] is True and s["running"]
     t = s["telemetry"]
     assert t["phase"] == "running" and not t["stale"] and t["pid"] == s["pid"]
     recent = t["recent"]

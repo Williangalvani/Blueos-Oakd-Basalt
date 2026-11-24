@@ -463,7 +463,8 @@ def test_api_snapshot_times_out_without_vio(client, monkeypatch):
 
 def test_api_snapshot_crosshair(client, fake_vio):
     main, http = client
-    # Without a running VIO's camera status, coordinates are on the saved config grid (default 320x200)
+    # Without a running VIO's camera status, coordinates are on the saved config grid (here 320x200)
+    main.save_config({**main.DEFAULT_CONFIG, "resolution_width": 320, "resolution_height": 200})
     halved = decode(http.get("/api/snapshot?stream=rect_left&crosshair=1&x=50&y=25&w=10&h=6").content)
     assert tuple(halved[50, 100]) == (255, 0, 255)
     snapshots.write_camera_status({"image_size": [640, 400]}, main.SNAPSHOT_DIR)

@@ -193,7 +193,7 @@ def test_config_cross_field_and_range_checks(client):
 
 def test_valid_config_is_saved_and_restarts_vio(client, tmp_path):
     main, http = client
-    response = http.post("/api/config", json={**main.DEFAULT_CONFIG, "algorithm": "pnp", "min_inliers": 25,
+    response = http.post("/api/config", json={**main.DEFAULT_CONFIG, "min_inliers": 25,
                                               "dvl_source": "off", "lever_arm_m": "0.1, 0, 0.2"})
     assert response.status_code == 200 and http.started == [True]
     saved = json.loads((tmp_path / "config.json").read_text())
@@ -202,6 +202,39 @@ def test_valid_config_is_saved_and_restarts_vio(client, tmp_path):
     command = main.build_vio_command(saved)
     assert command[command.index("--min-inliers") + 1] == "25"
     assert command[command.index("--telemetry-dir") + 1] == str(vio_telemetry.DEFAULT_DIR)
+
+
+# A config.json saved by an earlier version: settings and choices that no longer exist
+OLD_CONFIG = {
+    "algorithm": "basalt", "fps": 3, "resolution_width": 320, "resolution_height": 200, "min_inliers": 25,
+    "optical_flow_grid_size": 80, "optical_flow_max_iterations": 3, "optical_flow_levels": 2,
+    "optical_flow_skip_frames": 1, "vio_max_states": 2, "vio_max_kfs": 4, "vio_max_iterations": 3,
+    "dvl_source": "no_such_source", "stereo_median": "9x9",
+}
+
+
+def test_an_older_saved_config_loads_without_the_removed_settings(client, tmp_path):
+    main, http = client
+    (tmp_path / "config.json").write_text(json.dumps(OLD_CONFIG))
+    config = main.load_config()
+    assert set(config) == set(main.DEFAULT_CONFIG)
+    # Kept settings keep their value; a removed choice falls back to the default
+    assert (config["fps"], config["resolution_width"], config["resolution_height"]) == (3, 320, 200)
+    assert config["min_inliers"] == 25 and config["dvl_source"] == "auto" and config["stereo_median"] == "7x7"
+    command = main.build_vio_command(config)
+    assert command[:3] == ["python", "-u", "/app/pnp_vio.py"]
+    assert http.get("/api/config").json() == config
+    # The page posts back what it loaded
+    assert http.post("/api/config", json=http.get("/api/config").json()).status_code == 200
+    assert json.loads((tmp_path / "config.json").read_text()) == config
+
+
+def test_the_defaults_are_the_production_setup(client):
+    main, http = client
+    config = main.DEFAULT_CONFIG
+    assert "algorithm" not in config and not any(key.startswith(("optical_flow", "vio_max")) for key in config)
+    assert (config["fps"], config["resolution_width"], config["resolution_height"]) == (30, 640, 400)
+    assert config["depth_transport"] == "points"
 
 
 def test_log_only_toggle_persists_and_restarts(client, tmp_path):
@@ -221,7 +254,7 @@ def test_status_without_vio(client):
     status = http.get("/api/status").json()
     assert status["running"] is False and status["telemetry"] is None
     assert status["camera_connected"] is None and status["chip_temperature_c"] is None
-    assert status["algorithm"] == "basalt" and status["uptime_s"] is None
+    assert "algorithm" not in status and status["uptime_s"] is None
     assert "cpu_percent" in status and status["vehicle"]["armed"] is None
     assert status["autopilot_params"]["checked_at"] is None and status["autopilot_params"]["ok"] is False
     # The page's request asks the VIO process to publish
@@ -360,10 +393,10 @@ def test_depth_stream_needs_the_pnp_vio_running(client, tmp_path):
     main, http = client
     response = http.get("/api/stream/depth")
     assert response.status_code == 503 and "PnP" in response.json()["detail"]
-    save_config(tmp_path, algorithm="pnp")
+    save_config(tmp_path)
     assert "stopped" in http.get("/api/stream/depth").json()["detail"]
     running(http)
-    save_config(tmp_path, algorithm="pnp", depth_stream=False)
+    save_config(tmp_path, depth_stream=False)
     response = http.get("/api/stream/depth")
     assert response.status_code == 503 and "off in the settings" in response.json()["detail"]
     assert not (vio_telemetry.DEFAULT_DIR / depth_stream.LEASE_FILE).exists()
@@ -417,7 +450,7 @@ def test_depth_stream_forwards_the_camera_jpegs(client, tmp_path, streaming_vio)
     import cv2
     main, http = client
     service, controls = streaming_vio
-    save_config(tmp_path, algorithm="pnp")
+    save_config(tmp_path)
     running(http)
     assert not service.enabled
     response = http.get("/api/stream/depth?frames=3")
@@ -459,18 +492,18 @@ def test_depth_stream_forwards_the_camera_jpegs(client, tmp_path, streaming_vio)
 def test_status_depth_stream_without_vio(client, tmp_path):
     main, http = client
     status = http.get("/api/status").json()["depth_stream"]
-    assert status == {"enabled": False, "streaming": False, "stale": True, "age_s": None, "errors": 0,
+    assert status == {"enabled": True, "streaming": False, "stale": True, "age_s": None, "errors": 0,
                       "last_error": None, "encoder_stalled": False, "variant": None, "encoded_on": None,
                       "fallback": None, "device_log": None, "configured_encoding": "auto",
                       "debug_configured": False}
-    save_config(tmp_path, algorithm="pnp")
-    assert http.get("/api/status").json()["depth_stream"]["enabled"] is True
+    save_config(tmp_path, depth_stream=False)
+    assert http.get("/api/status").json()["depth_stream"]["enabled"] is False
 
 
 def test_status_shows_the_camera_scripts_errors(client, tmp_path, streaming_vio):
     main, http = client
     service, _ = streaming_vio
-    save_config(tmp_path, algorithm="pnp")
+    save_config(tmp_path)
     running(http)
     status = http.get("/api/status").json()["depth_stream"]
     assert status["errors"] == 0 and status["last_error"] is None
@@ -486,7 +519,7 @@ def test_status_shows_the_camera_scripts_errors(client, tmp_path, streaming_vio)
 
 def test_depth_stream_settings_reach_the_vio_command(client):
     main, http = client
-    pnp = {**main.DEFAULT_CONFIG, "algorithm": "pnp"}
+    pnp = {**main.DEFAULT_CONFIG}
     command = main.build_vio_command(pnp)
     assert "--depth-stream" in command
     assert command[command.index("--depth-stream-fps") + 1] == "5.0"
@@ -506,7 +539,7 @@ def test_depth_stream_encoding_and_debug_reach_the_vio_command(client, tmp_path)
     import depth_stream
     main, http = client
     assert config_schema.DEPTH_STREAM_ENCODINGS == depth_stream.VARIANTS
-    pnp = {**main.DEFAULT_CONFIG, "algorithm": "pnp"}
+    pnp = {**main.DEFAULT_CONFIG}
     assert (pnp["depth_stream_encoding"], pnp["depth_stream_debug"]) == ("auto", False)
     command = main.build_vio_command(pnp)
     assert command[command.index("--depth-stream-encoding") + 1] == "auto" and "--no-depth-stream-debug" in command
@@ -635,7 +668,7 @@ def test_depth_transport_settings_reach_the_vio_command(client):
     main, http = client
     assert config_schema.DEPTH_TRANSPORTS == depth_points.TRANSPORTS
     assert config_schema.DEPTH_POINTS_ROIS == depth_points.ROI_SOURCES
-    pnp = {**main.DEFAULT_CONFIG, "algorithm": "pnp"}
+    pnp = {**main.DEFAULT_CONFIG}
     assert (pnp["depth_transport"], pnp["depth_points_rois"]) == ("points", "host")
     command = main.build_vio_command(pnp)
     assert command[command.index("--depth-transport") + 1] == "points"
@@ -650,7 +683,7 @@ def test_depth_transport_settings_reach_the_vio_command(client):
 
 def test_max_features_reaches_the_vio_command(client):
     main, http = client
-    pnp = {**main.DEFAULT_CONFIG, "algorithm": "pnp"}
+    pnp = {**main.DEFAULT_CONFIG}
     assert pnp["max_features"] == 0
     command = main.build_vio_command(pnp)
     assert command[command.index("--max-features") + 1] == "0"
@@ -667,7 +700,7 @@ def test_max_features_reaches_the_vio_command(client):
 
 def test_status_reports_the_live_depth_transport_and_camera_load(client, tmp_path):
     main, http = client
-    save_config(tmp_path, algorithm="pnp")
+    save_config(tmp_path)
     running(http)
     live = {"transport": "points", "paired_percent": 99.5, "missing": 2, "last_problem": None,
             "full_depth": {"on": False}}
@@ -712,7 +745,7 @@ def test_a_one_shot_request_s_lease_survives_the_viewers_linger_ending(client, t
 
 def test_status_lists_every_image_stream_and_flags_the_raw_fallbacks(client, tmp_path):
     main, http = client
-    save_config(tmp_path, algorithm="pnp")
+    save_config(tmp_path)
     stopped = http.get("/api/status").json()["image_streams"]
     # Not running: the settings only
     assert [s["name"] for s in stopped["streams"]] == ["live_stream"] + [f"snapshot_{s}" for s in snapshots.STREAMS]
@@ -747,7 +780,7 @@ def test_status_lists_every_image_stream_and_flags_the_raw_fallbacks(client, tmp
 def test_snapshot_encoding_setting_reaches_the_vio_command(client):
     main, http = client
     assert config_schema.SNAPSHOT_ENCODINGS == snapshots.ENCODINGS
-    pnp = {**main.DEFAULT_CONFIG, "algorithm": "pnp"}
+    pnp = {**main.DEFAULT_CONFIG}
     command = main.build_vio_command(pnp)
     assert command[command.index("--snapshot-encoding") + 1] == "camera_jpeg"
     command = main.build_vio_command({**pnp, "snapshot_encoding": "raw"})

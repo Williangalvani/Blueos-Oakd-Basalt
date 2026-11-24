@@ -88,7 +88,7 @@ def served(monkeypatch, tmp_path):
     monkeypatch.setattr(vio_log, "LOG_DIR", tmp_path / "logs")
     monkeypatch.setattr(main, "CONFIG_FILE", tmp_path / "config.json")
     monkeypatch.setattr(main, "SNAPSHOT_DIR", tmp_path / "snapshots")
-    (tmp_path / "config.json").write_text(json.dumps({**main.DEFAULT_CONFIG, "algorithm": "pnp",
+    (tmp_path / "config.json").write_text(json.dumps({**main.DEFAULT_CONFIG,
                                                       "vehicle_ip": "fake-vehicle"}))
     (tmp_path / "logs").mkdir()
     (tmp_path / "logs" / "vio_20261123_120000.jsonl").write_text('{"type": "event"}\n')

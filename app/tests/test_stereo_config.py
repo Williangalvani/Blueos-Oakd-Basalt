@@ -111,23 +111,20 @@ def test_unset_optionals_on_the_command_line():
 
 def test_main_command_passes_stereo_recovery_and_snapshot_args(client, pnp_vio):
     main, _ = client
-    config = {**main.DEFAULT_CONFIG, "algorithm": "pnp", **CUSTOM, "tracking_recovery_frames": 7, "snapshots": False,
+    config = {**main.DEFAULT_CONFIG, **CUSTOM, "tracking_recovery_frames": 7, "snapshots": False,
               "max_reference_age": 0.5}
     cmd = main.build_vio_command(config)
     assert cmd[:3] == ["python", "-u", "/app/pnp_vio.py"]
     args = pnp_vio.parse_args(cmd[3:])
     assert resolve_stereo_settings(args) == resolve_stereo_settings(CUSTOM)
     assert args.recovery_frames == 7 and args.snapshots is False and args.max_reference_age == 0.5
-    assert pnp_vio.parse_args(main.build_vio_command(main.DEFAULT_CONFIG | {"algorithm": "pnp"})[3:]
+    assert pnp_vio.parse_args(main.build_vio_command(main.DEFAULT_CONFIG)[3:]
                               ).max_reference_age == 1.0
-
-    basalt = main.build_vio_command({**config, "algorithm": "basalt"})
-    assert not any(token.startswith("--stereo") for token in basalt)
 
 
 def test_config_api_validates_and_persists_stereo_settings(client):
     main, http = client
-    body = {**main.DEFAULT_CONFIG, "algorithm": "pnp", **CUSTOM}
+    body = {**main.DEFAULT_CONFIG, **CUSTOM}
     assert http.post("/api/config", json=body).status_code == 200
     saved = main.load_config()
     for key, value in CUSTOM.items():
@@ -140,7 +137,7 @@ def test_config_api_validates_and_persists_stereo_settings(client):
 
 def test_old_config_files_get_stereo_defaults(client):
     main, _ = client
-    main.save_config({"algorithm": "pnp", "fps": 10})
+    main.save_config({"fps": 10})
     config = main.load_config()
     assert config["stereo_confidence_threshold"] == 50 and config["tracking_recovery_frames"] == 20
     assert config["max_reference_age"] == 1.0
@@ -232,20 +229,18 @@ def test_every_setting_has_a_flag_and_label():
 
 def test_main_command_passes_intrinsics_and_depth_scale(client, pnp_vio):
     main, _ = client
-    default = pnp_vio.parse_args(main.build_vio_command({**main.DEFAULT_CONFIG, "algorithm": "pnp"})[3:])
+    default = pnp_vio.parse_args(main.build_vio_command({**main.DEFAULT_CONFIG})[3:])
     assert default.intrinsics_from == "rectified" and default.intrinsics_override is None and default.depth_scale == 1.0
-    cmd = main.build_vio_command({**main.DEFAULT_CONFIG, "algorithm": "pnp", "intrinsics_from": "frame",
+    cmd = main.build_vio_command({**main.DEFAULT_CONFIG, "intrinsics_from": "frame",
                                   "intrinsics_override": "163.1,237.1,329.4,199.0", "depth_scale": 1.33})
     args = pnp_vio.parse_args(cmd[3:])
     assert args.intrinsics_from == "frame" and args.depth_scale == 1.33
     assert args.intrinsics_override == (163.1, 237.1, 329.4, 199.0)
-    basalt = main.build_vio_command({**main.DEFAULT_CONFIG, "algorithm": "basalt"})
-    assert "--depth-scale" not in basalt and "--intrinsics-from" not in basalt
 
 
 def test_config_api_validates_intrinsics_and_depth_scale(client):
     main, http = client
-    body = {**main.DEFAULT_CONFIG, "algorithm": "pnp"}
+    body = {**main.DEFAULT_CONFIG}
     assert http.post("/api/config", json={**body, "intrinsics_override": " 160,230,330,199 ",
                                           "depth_scale": 1.2}).status_code == 200
     saved = main.load_config()
@@ -298,19 +293,18 @@ def test_clamp_refractive_index(value, clamped):
 def test_main_command_passes_the_refractive_index_clamped(client, pnp_vio):
     main, _ = client
     assert main.DEFAULT_CONFIG["refractive_index"] == 1.333
-    pnp = {**main.DEFAULT_CONFIG, "algorithm": "pnp"}
+    pnp = {**main.DEFAULT_CONFIG}
     assert pnp_vio.parse_args(main.build_vio_command(pnp)[3:]).refractive_index == 1.333
     assert pnp_vio.parse_args(main.build_vio_command({**pnp, "refractive_index": 1.0})[3:]).refractive_index == 1.0
     # A hand-edited config.json out of range must not crash-loop the VIO process on its arguments
     assert pnp_vio.parse_args(main.build_vio_command({**pnp, "refractive_index": 7})[3:]).refractive_index == 2.0
     config = {key: value for key, value in pnp.items() if key != "refractive_index"}
     assert pnp_vio.parse_args(main.build_vio_command(config)[3:]).refractive_index == 1.333
-    assert "--refractive-index" not in main.build_vio_command({**main.DEFAULT_CONFIG, "algorithm": "basalt"})
 
 
 def test_config_api_validates_the_refractive_index_and_the_form_shows_it(client):
     main, http = client
-    body = {**main.DEFAULT_CONFIG, "algorithm": "pnp"}
+    body = {**main.DEFAULT_CONFIG}
     assert http.post("/api/config", json={**body, "refractive_index": 1.0}).status_code == 200
     assert main.load_config()["refractive_index"] == 1.0
     assert 'name="refractive_index" value="1.0"' in http.get("/").text
@@ -337,7 +331,7 @@ def test_parse_lever_arm_rejects(value):
 
 def test_main_command_passes_the_lever_arm(client, pnp_vio):
     main, _ = client
-    pnp = {**main.DEFAULT_CONFIG, "algorithm": "pnp"}
+    pnp = {**main.DEFAULT_CONFIG}
     assert pnp["lever_arm_enabled"] is False and pnp["lever_arm_m"] == [0.1655, -0.0069, 0.18]
     args = pnp_vio.parse_args(main.build_vio_command(pnp)[3:])
     assert args.lever_arm is False and args.lever_arm_m == (0.1655, -0.0069, 0.18)
@@ -348,12 +342,11 @@ def test_main_command_passes_the_lever_arm(client, pnp_vio):
     # Unusable hand-edited values fall back to the default
     args = pnp_vio.parse_args(main.build_vio_command({**pnp, "lever_arm_m": "bogus"})[3:])
     assert args.lever_arm_m == (0.1655, -0.0069, 0.18)
-    assert "--lever-arm" not in main.build_vio_command({**main.DEFAULT_CONFIG, "algorithm": "basalt"})
 
 
 def test_config_api_and_form_for_the_lever_arm(client):
     main, http = client
-    body = {**main.DEFAULT_CONFIG, "algorithm": "pnp"}
+    body = {**main.DEFAULT_CONFIG}
     # The form posts the text field as it is
     assert http.post("/api/config", json={**body, "lever_arm_enabled": True,
                                           "lever_arm_m": " 0.2, -0.01, 0.15 "}).status_code == 200

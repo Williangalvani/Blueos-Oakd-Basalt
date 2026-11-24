@@ -131,7 +131,6 @@ function statusMessage(s, t) {
     }
     return ['VIO stopped: values below are from its last run (if any). Start it with Start or Apply.', ''];
   }
-  if (s.algorithm !== 'pnp') return ['Live telemetry needs the PnP algorithm (current: ' + s.algorithm + ')', 'info'];
   if (!t) return ['Waiting for the VIO process to publish…', 'info'];
   if (t.stale) return ['VIO not publishing (last update ' + fmt(t.age_s, 0) + ' s ago)', ''];
   if (t.phase === 'opening_device') return ['Opening the camera…', 'info'];
@@ -154,7 +153,6 @@ function renderStatus(s) {
   if (s.log_only) pill('pill-output', 'LOG-ONLY (no MAVLink output)', 'y');
   else if (s.mock) pill('pill-output', 'mock output (nothing sent)', 'dim');
   else pill('pill-output', 'sending MAVLink', 'g');
-  pill('pill-algorithm', 'algorithm: ' + s.algorithm, 'dim');
 
   const vehicle = s.vehicle || {};
   const armed = vehicle.armed === true ? 'ARMED' : vehicle.armed === false ? 'DISARMED' : '?';
@@ -841,7 +839,6 @@ function toggleStreamColor() {
 
 function depthStreamProblem(s) {
   const d = s.depth_stream || {};
-  if (s.algorithm !== 'pnp') return 'the live stream needs the PnP algorithm (current: ' + s.algorithm + ')';
   if (!d.enabled) return 'the live stream is off in the settings (Live depth stream)';
   if (!s.running) return 'VIO stopped';
   if (d.stale) return 'waiting for the VIO process…';

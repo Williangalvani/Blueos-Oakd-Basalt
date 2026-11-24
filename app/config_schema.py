@@ -34,7 +34,6 @@ GROUPS = (
     ("camera", "Camera"),
     ("stereo", "Stereo depth (PnP)"),
     ("output", "MAVLink output"),
-    ("basalt", "Basalt VIO"),
 )
 
 
@@ -154,14 +153,12 @@ CONFIG_FIELDS = (
                 "more than 3 s old; gyro = gyro-integrated only. The VIO output does not use it",
                 choices=POSE_ATTITUDE_SOURCES),
 
-    ConfigField("algorithm", "choice", "basalt", "Algorithm", "PnP ignores the Basalt tuning", "camera",
-                choices=("basalt", "pnp")),
-    ConfigField("fps", "int", 3, "FPS", "Lower = less CPU usage", "camera", 1, 60, step=1),
+    ConfigField("fps", "int", 30, "FPS", "Camera frame rate; lower = less camera and Pi CPU", "camera", 1, 60, step=1),
     ConfigField("camera_angle", "float", 0.0, "Camera Angle (°)", "0 = forward, 90 = down", "camera", -180.0, 180.0,
                 step=0.1),
-    ConfigField("resolution_width", "int", 320, "Width", "Rectified-left image width (px)", "camera", 160, 1280,
+    ConfigField("resolution_width", "int", 640, "Width", "Rectified-left image width (px)", "camera", 160, 1280,
                 step=1),
-    ConfigField("resolution_height", "int", 200, "Height", "Rectified-left image height (px)", "camera", 100, 800,
+    ConfigField("resolution_height", "int", 400, "Height", "Rectified-left image height (px)", "camera", 100, 800,
                 step=1),
 
     *(_stereo_field(setting) for setting in STEREO_SETTINGS),
@@ -176,15 +173,6 @@ CONFIG_FIELDS = (
                 "auto: plot the VISION_POSITION_DELTA velocity of another MAVLink component (e.g. the Water Linked "
                 "DVL extension) dashed over the VIO velocity, read from mavlink2rest at <= 2 Hz while the page is "
                 "open; off: never poll", "output", choices=DVL_SOURCES),
-
-    ConfigField("optical_flow_grid_size", "int", 80, "Optical Flow Grid Size", "Higher = fewer features, faster",
-                "basalt", 20, 200, step=1),
-    ConfigField("optical_flow_max_iterations", "int", 3, "Flow Iterations", "", "basalt", 1, 10, step=1),
-    ConfigField("optical_flow_levels", "int", 2, "Pyramid Levels", "", "basalt", 1, 5, step=1),
-    ConfigField("optical_flow_skip_frames", "int", 1, "Skip Frames", "0 = process all frames", "basalt", 0, 10, step=1),
-    ConfigField("vio_max_states", "int", 2, "Max States", "", "basalt", 1, 10, step=1),
-    ConfigField("vio_max_kfs", "int", 4, "Max Keyframes", "", "basalt", 2, 20, step=1),
-    ConfigField("vio_max_iterations", "int", 3, "VIO Iterations", "", "basalt", 1, 10, step=1),
 )
 
 FIELDS_BY_KEY = {field.key: field for field in CONFIG_FIELDS}
@@ -193,6 +181,21 @@ FIELDS_BY_KEY = {field.key: field for field in CONFIG_FIELDS}
 def default_config() -> dict:
     return {field.key: list(field.default) if isinstance(field.default, tuple) else field.default
             for field in CONFIG_FIELDS}
+
+
+def migrate_saved(saved: dict) -> dict:
+    """
+    A config.json from any earlier version as a full config: keys of removed settings (e.g. algorithm, the Basalt
+    tuning) are dropped, missing ones get their default, and a choice that no longer exists gets the default.
+    """
+    config = default_config()
+    for key, value in saved.items():
+        field = FIELDS_BY_KEY.get(key)
+        if field is None:
+            continue
+        removed_choice = field.kind == "choice" and value not in field.choices and not (value is None and field.nullable)
+        config[key] = field.default if removed_choice else value
+    return config
 
 
 def schema() -> dict:
