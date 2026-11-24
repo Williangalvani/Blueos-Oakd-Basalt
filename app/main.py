@@ -26,6 +26,7 @@ import depth_probe
 import depth_stream
 import dvl_source
 import feature_stream
+import mjpeg_loss
 import pose_stream
 import mock_mode
 import snapshots
@@ -1021,18 +1022,22 @@ def post_focal_check(tolerance: float = Query(0.15, gt=0.0, lt=1.0)):
     return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
 
-def stereo_probe_command(config: dict, output: Path, cases: list) -> list:
+def stereo_probe_command(config: dict, output: Path, cases: list, mode: str = stereo_probe.CASES_MODE,
+                         seconds: Optional[float] = None, qualities: Optional[list] = None) -> list:
     """stereo_probe.py's command line: the camera and stereo settings the VIO gets from the saved config."""
-    return [
+    cmd = [
         "python", "-u", "/app/stereo_probe.py",
         "--fps", str(config["fps"]),
         "--width", str(config["resolution_width"]),
         "--height", str(config["resolution_height"]),
-        "--quality", str(saved_number(config, "depth_stream_quality")),
-        "--cases", ",".join(cases),
-        "--output", str(output),
-        *stereo_command_args(config),
     ]
+    if mode == stereo_probe.MJPEG_LOSS:
+        cmd += ["--mode", mode, "--seconds", str(seconds), "--qualities", ",".join(map(str, qualities)),
+                "--num-features", str(config["num_features"]),
+                "--max-features", str(int(config.get("max_features", DEFAULT_CONFIG["max_features"])))]
+    else:
+        cmd += ["--quality", str(saved_number(config, "depth_stream_quality")), "--cases", ",".join(cases)]
+    return [*cmd, "--output", str(output), *stereo_command_args(config)]
 
 
 def _text(data) -> str:
@@ -1066,20 +1071,23 @@ def read_probe_document(output: Path, stdout: str):
     return None
 
 
-def run_stereo_probe(cases: list) -> tuple:
+def run_stereo_probe(cases: list, mode: str = stereo_probe.CASES_MODE, seconds: Optional[float] = None,
+                     qualities: Optional[list] = None) -> tuple:
     """Stop the VIO, run stereo_probe.py, restart the VIO whatever happened; (HTTP status, saved body)."""
     config = load_config()
     started = time.time()
-    output = CONFIG_FILE.parent / "probe" / f"stereo-{int(started)}.json"
+    loss = mode == stereo_probe.MJPEG_LOSS
+    output = CONFIG_FILE.parent / "probe" / f"{'mjpeg_loss' if loss else 'stereo'}-{int(started)}.json"
     output.parent.mkdir(parents=True, exist_ok=True)
-    cmd = stereo_probe_command(config, output, cases)
+    cmd = stereo_probe_command(config, output, cases, mode, seconds, qualities)
+    timeout = stereo_probe.mjpeg_loss_timeout(seconds, len(qualities)) if loss else STEREO_PROBE_TIMEOUT_S
     returncode, stdout, stderr, error, restart_error, timed_out = None, "", "", None, None, False
     try:
         stop_vio()
-        returncode, stdout, stderr = run_stereo_probe_process(cmd, STEREO_PROBE_TIMEOUT_S)
+        returncode, stdout, stderr = run_stereo_probe_process(cmd, timeout)
         if returncode is None:
             timed_out = True
-            error = f"the probe did not finish within {STEREO_PROBE_TIMEOUT_S:.0f} s and was killed"
+            error = f"the probe did not finish within {timeout:.0f} s and was killed"
         elif returncode != 0:
             error = f"the probe exited with code {returncode}"
     except Exception as e:
@@ -1092,8 +1100,8 @@ def run_stereo_probe(cases: list) -> tuple:
     probe = read_probe_document(output, stdout)
     if error is None and not (isinstance(probe, dict) and probe.get("complete")):
         error = "the probe printed no complete result"
-    body = {"probe": probe, "error": error, "cases": cases, "returncode": returncode,
-            "timed_out": timed_out,
+    body = {"probe": probe, "error": error, "mode": mode, "cases": cases, "returncode": returncode,
+            "timed_out": timed_out, **({"seconds": seconds, "qualities": qualities} if loss else {}),
             "started_at": started, "duration_s": round(time.time() - started, 2),
             "vio_restarted": restart_error is None, "vio_restart_error": restart_error,
             "stderr_tail": stderr[-STEREO_PROBE_STDERR_CHARS:], "saved_to": str(output)}
@@ -1104,26 +1112,49 @@ def run_stereo_probe(cases: list) -> tuple:
     return status, body
 
 
+def stereo_probe_request(mode: str, cases: Optional[str], seconds: Optional[float], qualities: Optional[str]) -> dict:
+    """run_stereo_probe's arguments for a request; ValueError for anything it can't run."""
+    if mode not in stereo_probe.MODES:
+        raise ValueError(f"unknown mode {mode!r}; the modes are {', '.join(stereo_probe.MODES)}")
+    if mode == stereo_probe.CASES_MODE:
+        if seconds is not None or qualities is not None:
+            raise ValueError("seconds and qualities only apply to mode=mjpeg_loss")
+        return {"cases": stereo_probe.parse_case_names(cases), "mode": mode}
+    if cases is not None:
+        raise ValueError("cases only apply to mode=cases")
+    low, high = stereo_probe.LOSS_SECONDS_RANGE
+    seconds = stereo_probe.LOSS_SECONDS if seconds is None else seconds
+    if not (math.isfinite(seconds) and low <= seconds <= high):
+        raise ValueError(f"seconds must be between {low:g} and {high:g}, got {seconds}")
+    return {"cases": None, "mode": mode, "seconds": float(seconds), "qualities": mjpeg_loss.parse_qualities(qualities)}
+
+
 @app.post("/api/stereo_probe", include_in_schema=False)
-def post_stereo_probe(cases: Optional[str] = None):
+def post_stereo_probe(cases: Optional[str] = None, mode: str = stereo_probe.CASES_MODE,
+                      seconds: Optional[float] = None, qualities: Optional[str] = None):
     """
     Diagnostics of StereoDepth's outputs and the camera's MJPEG encoder (stereo_probe.py): stops the VIO, runs
     short pipelines with several stereo configurations (cases A-G, or a comma-separated subset in `cases`) for
     about 90 s, then restarts the VIO, also after a failure or a timeout. Returns the probe's JSON plus the end
     of its stderr, also saved as probe/stereo-<unix time>.json in the data directory. 409 while one runs; 403
     in mock mode (no camera).
+
+    mode=mjpeg_loss (optional `seconds` per run, 3-30, default 10, and `qualities`, default 70,85,95,100): how
+    much depth the MJPEG encoding of the RAW8 disparity loses at the tracked features, and what subpixel off
+    costs; about 40-60 s (2-3 min if the encoders do not all run at once). Saved as probe/mjpeg_loss-<unix
+    time>.json.
     """
     if MOCK:
         return JSONResponse({"detail": "the stereo probe needs the camera; mock mode has none", "mock": True},
                             status_code=403)
     try:
-        names = stereo_probe.parse_case_names(cases)
+        request = stereo_probe_request(mode, cases, seconds, qualities)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     if not stereo_probe_lock.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="a stereo probe is already running")
     try:
-        status, body = run_stereo_probe(names)
+        status, body = run_stereo_probe(**request)
     finally:
         stereo_probe_lock.release()
     return JSONResponse(body, status_code=status, headers={"Cache-Control": "no-store"})

@@ -227,6 +227,7 @@ The page is backed by a small HTTP API:
 | POST | `/api/depth_probe?x=&y=&w=&h=&frames=` | PnP only: depth statistics in an ROI over the next frames. See [Depth probe](#depth-probe-pnp). |
 | POST | `/api/focal_check?tolerance=` | PnP only: checks fx against the focal length the device depth implies. See [Focal check](#focal-check-pnp). |
 | POST | `/api/stereo_probe?cases=` | Diagnostics (`app/stereo_probe.py`): stops the VIO for about 90 s, runs StereoDepth/encoder test cases A–G (or a comma-separated subset; each case reports `disparity_format`) on the camera, restarts the VIO. Returns the JSON and saves it as `probe/stereo-<unix time>.json` in the data directory. 409 while one runs, 403 in mock mode. Not in the OpenAPI schema. |
+| POST | `/api/stereo_probe?mode=mjpeg_loss[&seconds=][&qualities=]` | [MJPEG loss probe](#mjpeg-loss-probe-pnp): how much depth the MJPEG encoding of the RAW8 disparity loses at the tracked features, and what subpixel off costs. Stops the VIO for about 40–60 s (2–3 min if the encoders do not all run at once), restarts it. Saved as `probe/mjpeg_loss-<unix time>.json`. Same 409 / 403 rules. |
 | GET | `/api/stream/depth` | PnP only: the live stream as `multipart/x-mixed-replace` MJPEG (grayscale: the rectified left camera image with `mono_features`, else depth or disparity; encoded on the camera, or on the Pi with `host_jpeg`); 503 when PnP is stopped or the stream is off. `?frames=N` ends after N frames. See [Live depth stream](#live-depth-stream). |
 | GET | `/api/stream/pose` | Server-sent events for the [3D pose viewer](#3d-pose-viewer): `pose` (at most 10 per second), `trail` (once per connection, and again after a VIO restart) and `status` (once a second). Always 200. `?events=N` ends after N events. |
 | GET | `/api/pose` | PnP only: the latest `pose` object once; 404 until the VIO process has published one (it starts on request) |
@@ -318,6 +319,36 @@ python app/tools/check_rectified_focal.py rect_left.png rect_right.png depth_raw
 ```
 
 The arguments are the baseline in cm, then optionally the fx to check. `depth_raw.png` is the `raw=1` depth snapshot.
+
+### MJPEG loss probe (PnP)
+
+A diagnostic for one question: how much depth do we lose if the camera sends its disparity as MJPEG instead of the depth the VIO uses? It is not part of the VIO. It runs `stereo_probe.py --mode mjpeg_loss`; the analysis is in `app/mjpeg_loss.py`.
+
+```sh
+curl -sS -X POST 'http://<vehicle>:8095/api/stereo_probe?mode=mjpeg_loss' -o mjpeg-loss.json   # 10 s per run, q 70,85,95,100
+curl -sS -X POST 'http://<vehicle>:8095/api/stereo_probe?mode=mjpeg_loss&seconds=15&qualities=80,95' | jq -r .probe.summary_table
+```
+
+Keep the camera **still**, looking at a static, textured scene with depth between 0.3 and 4 m. The VIO and its MAVLink output are off while it runs, and it restarts afterwards whatever happened.
+
+- **Run A** uses the saved stereo settings with subpixel off and the median last (speckle on; stereo probe case G), so `stereo.disparity` is RAW8 (0–95 px, 0 = invalid). The same disparity frames go to the Pi raw and into one MJPEG encoder per quality. The VIO's own FeatureTracker runs on `rectifiedLeft` (`pnp_vio.create_feature_tracker`, with the saved feature settings), so the points are the VIO's. Every n-th `stereo.depth` frame is kept as well.
+- **Run B**, right after: the saved settings as the VIO runs them (subpixel on, 3 bits). Every n-th RAW16 depth frame and the features.
+- **Encoders at once:** the firmware's only limit is the total rate (about 450 MPix/s for JPEG; four 640×400 streams at 15 fps are 15 MPix/s). If a quality's JPEGs still come with fewer than half of run A's frames, that quality is measured again in its own run with one encoder, on the same static scene. `encoders.note` says which qualities ran at once and which ran in sequence.
+- **On the Pi:**
+  - Depth is `fx·B / disparity`, using the rectified fx and the baseline the VIO uses for its disparity stream (`calibration`).
+  - It is sampled at every tracked feature with the VIO's rules: `points` (the default transport: the camera SLC's average of the in-range pixels in the 5×5 window, at least 30 % valid), `full_frame` (the 5×5 median, `lookup_depth`) and `centre` (the feature's pixel).
+  - Each JPEG is compared with the raw frame it came from, paired by sequence number and checked by device timestamp (by timestamp alone if the encoder numbers its own frames).
+  - JPEG gray is decoded two ways: `zero` (0 is invalid, the raw rule) and `viewer` (below 3 is invalid, the depth stream page's rule against JPEG ringing).
+- **Output (`probe` in the response):**
+  - `mjpeg.<quality>`: JPEG bytes per frame and Mbps at the camera fps (`rate`); the gray-level error at the features and over the frame; and per decode and sampling rule the per-point error in mm and % (median, p95, max), the bias, the valid→invalid and invalid→valid flips, all of it again `by_distance` (<0.5, 0.5–1, 1–2, 2–4, ≥4 m).
+  - `raw_rates_mbps`: the uncompressed RAW8 disparity and RAW16 depth.
+  - `conversion_check`: the camera's own depth × disparity against the host's fx·B, which should be about 1.
+  - `subpixel`: run A's integer-disparity depth against run B's subpixel depth.
+  - `quantisation`: theory and the measured integer step.
+  - `summary_table`: the same as a compact text table, also logged to stderr.
+- **Subpixel method and its limits:** runs A and B are different frames, and the FeatureTracker ids restart with each run, so points cannot be matched by id. Each run is reduced to per-pixel temporal medians (about 20 frames). The medians are compared at the features of run B's frames (`median_maps`), and so is each B frame against A's median (`per_frame`, which includes B's noise). Anything that moved between the runs, or an exposure change, counts as error. The medians hide each run's noise, which is reported in `noise`.
+- **Quantisation:** one disparity pixel moves the depth by about z²/(fx·B), 8 times less with 3 subpixel bits. With fx 163 px and B 75 mm (fx·B ≈ 12.2 m·px) that is about 82 mm at 1 m and 330 mm at 2 m (integer), or 10 mm and 41 mm with subpixel.
+- **Cost:** run A sends about 31 Mbps of raw disparity plus 61 Mbps of RAW16 depth at 640×400 and 15 fps (for the conversion check; only every n-th depth frame is kept). The Pi holds up to 300 raw disparity frames (about 77 MB at 640×400) until the run ends.
 
 ## Web UI (PnP)
 
@@ -719,6 +750,8 @@ The image is built in two stages so that the slow part only runs once:
 | `app/rectified_intrinsics.py` | PnP rectified-left camera matrix: computing it from the calibration, choosing the source, and the focal check |
 | `app/depth_probe.py` | Depth probe requests (`main.py`), serving them in the VIO loop, and the crosshair overlay |
 | `app/tools/check_rectified_focal.py` | Offline focal check on snapshot PNGs |
+| `app/stereo_probe.py` | `POST /api/stereo_probe`: StereoDepth/encoder cases on the camera, and the `mjpeg_loss` mode's camera runs |
+| `app/mjpeg_loss.py` | The `mjpeg_loss` analysis: JPEG vs raw disparity at the features with the VIO's depth rules, subpixel loss, quantisation |
 | `app/stereo_config.py` | PnP stereo settings: defaults, web form, command line and `StereoDepth` configuration |
 | `app/snapshots.py` | Snapshot requests (`main.py`) and serving them from the VIO process (camera JPEGs, raw fallback, encoding status) |
 | `app/depth_points.py` | `depth_transport: points`: SLC windows and configs, the camera Scripts, decoding, pairing by sequence number, the receiver and the full depth gate |

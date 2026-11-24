@@ -18,13 +18,22 @@ One device open per case: depthai v3 closes the device when a pipeline stops. A 
 exception and the next case runs. The JSON goes to --output after every case (a killed probe leaves the
 cases so far) and once to stdout at the end; everything else goes to stderr.
 
+--mode mjpeg_loss (run_mjpeg_loss; the analysis is mjpeg_loss.py): how much depth the MJPEG encoding of the RAW8
+disparity loses. Run A: case G's settings (subpixel off, median last, speckle on), the raw disparity and one MJPEG
+encoder per --qualities on the same frames, the VIO's FeatureTracker (pnp_vio.create_feature_tracker) and every
+n-th stereo.depth frame; then run B: the saved settings (the VIO's, subpixel on), every n-th depth frame and the
+features. A quality whose JPEGs do not come with run A's frames (the encoders did not all run at once) is measured
+again alone in its own run afterwards.
+
 Run in the container while the VIO is stopped (POST /api/stereo_probe does that), or by hand:
     PYTHONPATH=/app/depthai-python python /app/stereo_probe.py --width 640 --height 400 --fps 15 --cases A,E
+    PYTHONPATH=/app/depthai-python python /app/stereo_probe.py --mode mjpeg_loss --qualities 70,95 --seconds 10
 The pure helpers below need neither depthai nor a camera.
 """
 
 import argparse
 import json
+import math
 import sys
 import time
 import traceback
@@ -34,11 +43,16 @@ from pathlib import Path
 import numpy as np
 
 import depth_stream
+import mjpeg_loss
 import snapshots
+from pnp_odometry import PnPParams
+from rectified_intrinsics import as_dict, rectified_for_settings
 from stereo_config import (FILTER_RUNS, FILTERING_ORDER_MEDIAN_LAST, add_stereo_arguments,  # noqa: F401
                            apply_stereo_config, disparity_format, enum_name, executed_filters,
                            predicted_max_disparity, read_back, resolve_stereo_settings)
 
+CASES_MODE, MJPEG_LOSS = "cases", "mjpeg_loss"
+MODES = (CASES_MODE, MJPEG_LOSS)
 SAMPLE_SECONDS = 4.5
 WARMUP_S = 1.0
 SAMPLES = 3
@@ -55,6 +69,23 @@ MAX_SIZES = 60
 LOG_LINES = 400
 LOG_DISTINCT = 40
 POLL_S = 0.02
+
+# mjpeg_loss: capture time per run (after WARMUP_S), and the range POST /api/stereo_probe accepts
+LOSS_SECONDS = 10.0
+LOSS_SECONDS_RANGE = (3.0, 30.0)
+# Per run on top of the warmup and the capture: device open, pipeline start, analysis (opens take 2-10 s)
+RUN_OVERHEAD_S = 15.0
+# A quality ran alongside the others when its JPEGs pair with at least this share of run A's raw frames
+ENCODER_MIN_SHARE = 0.5
+LOSS_QUEUE_SIZE = 8
+# The disparity feeds the host queue and one encoder per quality, each holding a frame
+LOSS_STEREO_POOL = 4
+# Raw disparity frames kept for the JPEG comparison (about 256 kB each at 640x400), and depth frames for the
+# temporal medians of the subpixel comparison and the conversion check (every n-th frame)
+MAX_FRAMES = 300
+REFERENCE_FRAMES = 20
+# What the VIO gets from main.py by default (pnp_vio.parse_args; corner detector and depth range are not saved)
+CORNER_DETECTOR_CHOICES = ("harris", "shi-tomasi")
 
 DISPARITY = "disparity"
 STREAMS = (DISPARITY, "depth", "rectifiedLeft", "rectifiedRight")
@@ -364,19 +395,394 @@ def run_case(case, saved, args, dai, open_device, clock=time.monotonic, sleep=ti
     return result
 
 
+# --- mjpeg_loss mode ------------------------------------------------------------------------------------
+
+def run_cost_s(seconds):
+    return WARMUP_S + seconds + RUN_OVERHEAD_S
+
+
+def mjpeg_loss_budget(seconds, qualities):
+    """No run starts later than this: runs A and B, and one run per quality if the encoders do not run at once."""
+    return (2 + qualities) * run_cost_s(seconds)
+
+
+def mjpeg_loss_timeout(seconds, qualities):
+    """When POST /api/stereo_probe kills the probe: the budget, a last run with a slow open, and some margin."""
+    return mjpeg_loss_budget(seconds, qualities) + OPEN_TIMEOUT_S + WARMUP_S + seconds + 30.0
+
+
+def reference_every(fps, seconds, frames=REFERENCE_FRAMES):
+    """Keep the depth frames whose sequence number is a multiple of this: about `frames` of them per run."""
+    return max(1, int(round(fps * seconds / frames)))
+
+
+def calibration_info(calibration, rectified, problem):
+    """The fx (rectified, else raw: as the VIO's disparity stream) and baseline the depth conversion uses."""
+    focal = rectified or calibration.raw
+    return {"fx": float(focal.fx), "fx_source": "rectified" if rectified is not None else f"raw ({problem})",
+            "rectified": as_dict(rectified), "raw": as_dict(calibration.raw), "baseline_m": calibration.baseline_m,
+            "baseline_spec_m": calibration.baseline_spec_m,
+            "depth_times_disparity_mm": mjpeg_loss.depth_times_disparity_mm(focal.fx, calibration.baseline_m)}
+
+
+def _device_seconds(msg):
+    try:
+        return msg.getTimestampDevice().total_seconds()
+    except Exception:
+        return None
+
+
+def _record(msg, kind, keep_image):
+    record = {"seq": int(msg.getSequenceNum()), "ts": _device_seconds(msg)}
+    if kind == "features":
+        features = list(msg.trackedFeatures)
+        record["ids"] = np.array([int(f.id) for f in features], dtype=np.int64)
+        record["uv"] = np.array([(f.position.x, f.position.y) for f in features], dtype=np.float64).reshape(-1, 2)
+    elif kind == "jpeg":
+        record["data"] = bytes(msg.getData())
+    else:
+        record["type"] = enum_name(msg.getType())
+        record["image"] = None
+        if keep_image:
+            record["image"] = frame_array(msg.getData(), record["type"], int(msg.getWidth()), int(msg.getHeight()),
+                                          int(msg.getStride()))
+    return record
+
+
+def capture_run(name, description, settings, args, dai, open_device, vio, qualities=(), disparity=True,
+                clock=time.monotonic, sleep=time.sleep):
+    """
+    One mjpeg_loss pipeline run on a freshly opened device: StereoDepth with `settings`, the VIO's FeatureTracker
+    on rectifiedLeft, and to the host the features, every n-th depth frame and (disparity) every disparity frame,
+    raw and through one MJPEG encoder per quality. Returns (result, records); records holds what came after the
+    warmup.
+    """
+    result = {"name": name, "description": description, "settings": settings, "qualities": list(qualities),
+              "error": None}
+    records = {"disparity": [], "depth": [], "features": [], "jpeg": {q: [] for q in qualities}}
+    every = reference_every(args.fps, args.seconds)
+    started = clock()
+    device = log_callback = None
+    device_log = depth_stream.DeviceLog(clock=time.time, max_lines=LOG_LINES, other_lines=LOG_LINES)
+    try:
+        device = open_device()
+        result["device_open_s"] = round(clock() - started, 2)
+        try:
+            result["device_name"] = device.getDeviceName()
+        except Exception:
+            pass
+        try:
+            device.setLogLevel(dai.LogLevel.WARN)
+            log_callback = device.addLogCallback(device_log.on_message)
+        except Exception as e:
+            result["device_log_error"] = str(e)
+        calibration = vio.load_calibration(device, argparse.Namespace(
+            width=args.width, height=args.height, intrinsics_from="rectified", gyro_gate=0))
+        rectified, problem = rectified_for_settings(calibration, settings, (args.width, args.height))
+        result["calibration"] = calibration_info(calibration, rectified, problem)
+        with dai.Pipeline(device) as p:
+            left = p.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B, sensorFps=float(args.fps))
+            right = p.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C, sensorFps=float(args.fps))
+            stereo = p.create(dai.node.StereoDepth)
+            apply_stereo_config(stereo, settings, dai)
+            stereo.setNumFramesPool(LOSS_STEREO_POOL + len(qualities))
+            left.requestOutput((args.width, args.height)).link(stereo.left)
+            right.requestOutput((args.width, args.height)).link(stereo.right)
+            tracker = vio.create_feature_tracker(p, args)
+            stereo.rectifiedLeft.link(tracker.inputImage)
+            result["applied"] = read_back(stereo.initialConfig)
+            result["executed_filters"] = executed_filters(result["applied"])
+            result["predicted_max_disparity"] = predicted_max_disparity(result["applied"])
+            result["disparity_format"] = disparity_format(result["applied"], settings)
+
+            queues = {"features": tracker.outputFeatures, "depth": stereo.depth}
+            if disparity:
+                queues["disparity"] = stereo.disparity
+            queues = {kind: out.createOutputQueue(maxSize=LOSS_QUEUE_SIZE, blocking=False)
+                      for kind, out in queues.items()}
+            encoders, nodes = {}, []
+            for quality in qualities:
+                encoder = p.create(dai.node.VideoEncoder)
+                encoder.setDefaultProfilePreset(float(args.fps), dai.VideoEncoderProperties.Profile.MJPEG)
+                encoder.setQuality(quality)
+                encoder.input.setBlocking(False)
+                encoder.input.setMaxSize(1)
+                stereo.disparity.link(encoder.input)
+                encoders[quality] = encoder.out.createOutputQueue(maxSize=LOSS_QUEUE_SIZE, blocking=False)
+                nodes.append(encoder)
+            device_log.nodes = {n for n in map(_node_name, nodes + [stereo, tracker]) if n}
+
+            p.start()
+            run_started = clock()
+            result["pipeline_start_s"] = round(run_started - started, 2)
+            warm_until = run_started + WARMUP_S
+            counts = {kind: 0 for kind in queues}
+            jpeg_counts = {quality: 0 for quality in qualities}
+            images = {"disparity": 0, "depth": 0}
+            while clock() < warm_until + args.seconds:
+                warm = clock() >= warm_until
+                for kind, queue in queues.items():
+                    for msg in queue.tryGetAll():
+                        counts[kind] += 1
+                        if not warm:
+                            continue
+                        keep = False
+                        if kind == "disparity":
+                            keep = images["disparity"] < MAX_FRAMES
+                        elif kind == "depth":
+                            keep = (msg.getSequenceNum() % every == 0
+                                    and images["depth"] < 2 * REFERENCE_FRAMES)
+                        record = _record(msg, kind, keep)
+                        if keep:
+                            images[kind] += 1
+                        records[kind].append(record)
+                for quality, queue in encoders.items():
+                    for msg in queue.tryGetAll():
+                        jpeg_counts[quality] += 1
+                        if warm:
+                            records["jpeg"][quality].append(_record(msg, "jpeg", False))
+                sleep(POLL_S)
+            result["received"] = {**counts, **{f"jpeg_q{q}": n for q, n in jpeg_counts.items()}}
+            result["captured"] = {kind: len(records[kind]) for kind in queues}
+            result["captured"].update({f"jpeg_q{q}": len(records["jpeg"][q]) for q in qualities})
+            result["fps"] = {kind: round(n / args.seconds, 2) for kind, n in result["captured"].items()}
+            result["images_kept"] = images
+            result["depth_every"] = every
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+        result["traceback"] = traceback.format_exc(limit=6)
+        _log(f"mjpeg_loss run {name} failed: {result['error']}")
+    finally:
+        if device is not None:
+            if log_callback is not None:
+                try:
+                    device.removeLogCallback(log_callback)
+                except Exception:
+                    pass
+            try:
+                device.close()
+            except Exception:
+                pass
+    lines = device_log.snapshot()
+    result["device_log"] = summarize_log(sorted(lines["stream"] + lines["other"],
+                                                key=lambda line: line.get("unix_time") or 0))
+    result["duration_s"] = round(clock() - started, 2)
+    return result, records
+
+
+def _analyse(result, function, *args):
+    """function(*args), or None with the exception recorded in result["analysis_error"]."""
+    try:
+        return function(*args)
+    except Exception as e:
+        result["analysis_error"] = f"{type(e).__name__}: {e}"
+        result["analysis_traceback"] = traceback.format_exc(limit=6)
+        _log(f"mjpeg_loss analysis of {result.get('name')} failed: {result['analysis_error']}")
+        return None
+
+
+def _references(records, kind, every):
+    """The kept frames of every n-th sequence number (the temporal medians' frames)."""
+    return [r for r in records[kind] if r.get("image") is not None and r["seq"] % every == 0][:REFERENCE_FRAMES]
+
+
+def encoded_share(analysis, quality):
+    """Share of the run's raw disparity frames that got a paired JPEG of this quality (0 without frames)."""
+    if not analysis:
+        return 0.0
+    frames = analysis["frames"]["disparity"]
+    paired = analysis["pairing"].get(f"q{quality}", {}).get("paired", 0)
+    return paired / frames if frames else 0.0
+
+
+def run_summary(result):
+    parts = [f"{result['name']}: {result.get('captured', {})}"]
+    if result.get("disparity_format"):
+        parts.append(f"disparity raw8 {result['disparity_format'].get('raw8')}")
+    for key in ("error", "analysis_error"):
+        if result.get(key):
+            parts.append(f"{key}: {result[key]}")
+    return "; ".join(parts)
+
+
+def run_mjpeg_loss(args, saved, dai, open_device, vio, clock=time.monotonic, sleep=time.sleep, wall_clock=time.time):
+    """The mjpeg_loss document; written to --output after every run."""
+    qualities = mjpeg_loss.parse_qualities(args.qualities)
+    budget = args.budget if args.budget is not None else mjpeg_loss_budget(args.seconds, len(qualities))
+    params = PnPParams(min_depth_m=args.min_depth, max_depth_m=args.max_depth)
+    image_size = (args.width, args.height)
+    period = 1.0 / max(float(args.fps), 1.0)
+    every = reference_every(args.fps, args.seconds)
+    settings_a = case_settings(saved, CASES_BY_NAME["G"])
+    started = clock()
+    document = {
+        "probe": "stereo", "mode": MJPEG_LOSS, "version": 1, "started_at": wall_clock(), "complete": False,
+        "depthai_version": getattr(dai, "__version__", None),
+        "camera": {"sockets": ["CAM_B", "CAM_C"], "width": args.width, "height": args.height, "fps": args.fps},
+        "qualities": qualities, "seconds": args.seconds, "warmup_s": WARMUP_S, "budget_s": budget,
+        "feature_tracker": {"num_features": args.num_features, "max_features": args.max_features,
+                            "corner_detector": args.corner_detector},
+        "depth_rules": {"rules": list(mjpeg_loss.RULES), "primary": mjpeg_loss.PRIMARY_RULE,
+                        "range_m": [args.min_depth, args.max_depth],
+                        "window": 2 * mjpeg_loss.depth_points.WINDOW_RADIUS + 1,
+                        "min_valid_fraction": params.min_valid_depth_fraction,
+                        "decode_invalid_below": mjpeg_loss.DECODE_RULES, "primary_decode": mjpeg_loss.PRIMARY_DECODE},
+        "saved_stereo": saved, "calibration": None, "runs": [], "skipped": [], "mjpeg": {},
+        "raw_rates_mbps": {"disparity_raw8": mjpeg_loss.raw_mbps(args.width, args.height, 1, args.fps),
+                           "depth_raw16": mjpeg_loss.raw_mbps(args.width, args.height, 2, args.fps)},
+    }
+    write_output(args.output, document)
+
+    def time_left():
+        return budget - (clock() - started)
+
+    def run(name, description, settings, run_qualities, with_disparity):
+        _log(f"Stereo probe mjpeg_loss: run {name} ({description})")
+        result, records = capture_run(name, description, settings, args, dai, open_device, vio, run_qualities,
+                                      with_disparity, clock=clock, sleep=sleep)
+        if document["calibration"] is None and result.get("calibration", {}).get("depth_times_disparity_mm"):
+            document["calibration"] = result["calibration"]
+        document["runs"].append(result)
+        return result, records
+
+    def k_mm(result):
+        return (result.get("calibration") or {}).get("depth_times_disparity_mm") \
+            or (document["calibration"] or {}).get("depth_times_disparity_mm")
+
+    def analyse_a(result, records, run_qualities):
+        k = k_mm(result)
+        if result["error"] or not k:
+            if not result["error"]:
+                result["analysis_error"] = "no fx * baseline from the calibration"
+            return None
+        analysis = _analyse(result, mjpeg_loss.analyse_mjpeg, records, run_qualities, k, image_size, params, args.fps)
+        if analysis:
+            result["frames"], result["pairing"] = analysis["frames"], analysis["pairing"]
+            result["raw"] = analysis["raw"]
+        return analysis
+
+    def store(analysis, result, quality, alone):
+        entry = analysis["qualities"][quality]
+        document["mjpeg"][str(quality)] = {"run": result["name"], "encoders_in_run": len(result["qualities"]),
+                                           "alone": alone, **entry}
+
+    a_result, a_records = run("A", "case G settings (subpixel off, median last): raw disparity + MJPEG per quality",
+                              settings_a, qualities, True)
+    a_analysis = analyse_a(a_result, a_records, qualities)
+    reference = {"result": a_result, "disparity": _references(a_records, "disparity", every),
+                 "depth": _references(a_records, "depth", every)}
+    raw8 = bool(a_analysis) and a_analysis["frames"]["disparity_types"] == ["RAW8"]
+    parallel = [q for q in qualities if encoded_share(a_analysis, q) >= ENCODER_MIN_SHARE]
+    for quality in parallel:
+        store(a_analysis, a_result, quality, len(qualities) == 1)
+    del a_records
+    write_output(args.output, document)
+
+    b_result, b_records = run("B", "saved settings (the VIO's): RAW16 depth + features", saved, (), False)
+    b_depth, b_features = _references(b_records, "depth", every), b_records["features"]
+    del b_records
+    write_output(args.output, document)
+
+    failed = [q for q in qualities if q not in parallel]
+    sequential = []
+    if failed and a_result["error"] is None and a_analysis and not raw8:
+        document["skipped"] += [{"name": f"A-q{q}", "reason": "run A's disparity was not RAW8, so no encoder "
+                                                               "takes it; another run would not help"} for q in failed]
+        failed = []
+    for quality in failed:
+        name = f"A-q{quality}"
+        if time_left() < run_cost_s(args.seconds):
+            document["skipped"].append({"name": name, "reason": f"time budget: {time_left():.1f} s left"})
+            continue
+        result, records = run(name, f"run A with only the q{quality} encoder", settings_a, [quality], True)
+        analysis = analyse_a(result, records, [quality])
+        if analysis and analysis["frames"]["disparity"]:
+            store(analysis, result, quality, True)
+            sequential.append(quality)
+            if not reference["disparity"]:
+                reference = {"result": result, "disparity": _references(records, "disparity", every),
+                             "depth": _references(records, "depth", every)}
+        del records
+        write_output(args.output, document)
+
+    document["encoders"] = encoders_info(qualities, parallel, sequential, a_result, a_analysis)
+    k = (document["calibration"] or {}).get("depth_times_disparity_mm")
+    if k:
+        if reference["disparity"] and reference["depth"]:
+            document["conversion_check"] = _analyse(reference["result"], mjpeg_loss.conversion_check,
+                                                    reference["disparity"], reference["depth"], k, period)
+        holder = {"name": "subpixel"}
+        document["subpixel"] = _analyse(holder, mjpeg_loss.subpixel_loss, reference["disparity"], reference["depth"],
+                                        b_depth, b_features, k, image_size, params, period) or holder
+        document["subpixel"].update(
+            reference_run=reference["result"]["name"], b_run_error=b_result["error"],
+            subpixel=b_result["settings"].get("stereo_subpixel"),
+            method="camera at rest: per-pixel temporal medians of run A (integer disparity, fx*B/d on the host; and "
+                   "A's own depth output) and run B (the VIO's subpixel depth) over about "
+                   f"{REFERENCE_FRAMES} frames each, compared at the features of B's kept frames (B = reference). "
+                   "per_frame: each B frame vs A's median map (B's noise included). Limits: different frames and "
+                   "auto-exposure; feature ids restart with each run so they cannot be matched by id; anything "
+                   "that moved between the runs shows up as error; the medians hide A's and B's noise "
+                   "(reported separately).")
+        bits = b_result["settings"].get("stereo_subpixel_bits", 3)
+        document["quantisation"] = {
+            "subpixel_bits": bits, "formula": "dz ~ z^2 / (fx * B) per disparity pixel; / 2^bits with subpixel",
+            "theory": mjpeg_loss.quantisation_table(k, bits),
+            "measured_integer": (reference["result"].get("raw") or {}).get("steps")}
+    for result in document["runs"]:
+        result["summary"] = run_summary(result)
+    document["summary_table"] = "\n".join(mjpeg_loss.summary_lines(document))
+    document["complete"] = True
+    document["duration_s"] = round(clock() - started, 2)
+    write_output(args.output, document)
+    return document
+
+
+def encoders_info(qualities, parallel, sequential, a_result, a_analysis):
+    """How many encoders ran at once and which qualities were measured alone (in sequence, same static scene)."""
+    shares = {f"q{q}": round(encoded_share(a_analysis, q), 3) for q in qualities}
+    if len(parallel) == len(qualities):
+        note = f"all {len(qualities)} encoders ran at once on run A's frames"
+    else:
+        reason = a_result["error"] or f"JPEG share of the raw frames {shares}"
+        note = (f"{len(parallel)} of {len(qualities)} encoders ran at once on run A ({reason}); "
+                f"measured alone, one run each in sequence on the same static scene: {sequential or 'none'}")
+    return {"requested": qualities, "parallel": parallel, "sequential": sequential, "jpeg_share_run_a": shares,
+            "min_share": ENCODER_MIN_SHARE, "note": note}
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Stereo/encoder probe on the OAK-D (stop the VIO first)")
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=400)
-    parser.add_argument("--quality", type=int, default=70, help="MJPEG quality, 1-100")
+    parser.add_argument("--mode", choices=MODES, default=CASES_MODE,
+                        help="cases: the StereoDepth/encoder cases; mjpeg_loss: how much depth MJPEG loses")
+    parser.add_argument("--quality", type=int, default=70, help="MJPEG quality, 1-100 (cases)")
     parser.add_argument("--cases", default=None, help=f"Comma-separated, default all: {','.join(CASES_BY_NAME)}")
-    parser.add_argument("--seconds", type=float, default=SAMPLE_SECONDS, help="Sampling time per case")
-    parser.add_argument("--budget", type=float, default=TIME_BUDGET_S, help="No case starts after this many seconds")
+    parser.add_argument("--qualities", default=None,
+                        help=f"mjpeg_loss: comma-separated MJPEG qualities, default "
+                             f"{','.join(map(str, mjpeg_loss.DEFAULT_QUALITIES))}")
+    parser.add_argument("--seconds", type=float, default=None,
+                        help=f"Sampling time per case ({SAMPLE_SECONDS}) or per mjpeg_loss run ({LOSS_SECONDS})")
+    parser.add_argument("--budget", type=float, default=None,
+                        help=f"No case or run starts after this many seconds (cases: {TIME_BUDGET_S}; mjpeg_loss: "
+                             "mjpeg_loss_budget)")
     parser.add_argument("--device-timeout", type=float, default=OPEN_TIMEOUT_S)
     parser.add_argument("--output", type=Path, default=None, help="Also write the JSON here (after every case)")
+    # mjpeg_loss: the VIO's FeatureTracker and depth range (pnp_vio.py's options and defaults)
+    parser.add_argument("--num-features", type=int, default=300)
+    parser.add_argument("--max-features", type=int, default=0)
+    parser.add_argument("--corner-detector", choices=CORNER_DETECTOR_CHOICES, default="harris")
+    parser.add_argument("--min-depth", type=float, default=0.2, help="m")
+    parser.add_argument("--max-depth", type=float, default=15.0, help="m")
     add_stereo_arguments(parser)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.seconds is None:
+        args.seconds = LOSS_SECONDS if args.mode == MJPEG_LOSS else SAMPLE_SECONDS
+    if args.budget is None and args.mode == CASES_MODE:
+        args.budget = TIME_BUDGET_S
+    return args
 
 
 def write_output(path, document):
@@ -389,9 +795,14 @@ def write_output(path, document):
         _log(f"Probe output not written to {path}: {e}")
 
 
-def main(argv=None, dai=None, open_device=None, clock=time.monotonic, sleep=time.sleep, wall_clock=time.time):
+def main(argv=None, dai=None, open_device=None, clock=time.monotonic, sleep=time.sleep, wall_clock=time.time,
+         vio=None):
     args = parse_args(argv)
     try:
+        if args.mode == MJPEG_LOSS:
+            mjpeg_loss.parse_qualities(args.qualities)
+            if not (math.isfinite(args.seconds) and args.seconds > 0):
+                raise ValueError(f"--seconds must be above 0, got {args.seconds}")
         names = parse_case_names(args.cases)
     except ValueError as e:
         _log(str(e))
@@ -404,6 +815,14 @@ def main(argv=None, dai=None, open_device=None, clock=time.monotonic, sleep=time
 
         def open_device():
             return open_oak_device(args.device_timeout, log=_log)
+
+    if args.mode == MJPEG_LOSS:
+        if vio is None:
+            import pnp_vio as vio
+        document = run_mjpeg_loss(args, saved, dai, open_device, vio, clock=clock, sleep=sleep, wall_clock=wall_clock)
+        _log("Stereo probe mjpeg_loss:\n" + document["summary_table"])
+        print(json.dumps(document), flush=True)
+        return 0
 
     started = clock()
     document = {"probe": "stereo", "version": 1, "started_at": wall_clock(), "complete": False,

@@ -454,6 +454,14 @@ def configure_feature_tracker(config, args, maintainer=True):
     return config
 
 
+def create_feature_tracker(p, args):
+    """The VIO's FeatureTracker (stereo_probe.py's mjpeg_loss mode uses it too); link stereo.rectifiedLeft to it."""
+    feature_tracker = p.create(dai.node.FeatureTracker)
+    feature_tracker.setHardwareResources(1, 2)
+    configure_feature_tracker(feature_tracker.initialConfig, args)
+    return feature_tracker
+
+
 def snapshot_script(available, encoders=None):
     """
     Device-side gate: forward one frame of the requested stream per request message (snapshots.request_number):
@@ -722,7 +730,7 @@ def build_pipeline(p, device, args, stereo_settings):
     right = p.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C, sensorFps=float(args.fps))
     imu = p.create(dai.node.IMU)
     stereo = p.create(dai.node.StereoDepth)
-    feature_tracker = p.create(dai.node.FeatureTracker)
+    feature_tracker = create_feature_tracker(p, args)
     points = args.depth_transport == depth_points.POINTS
 
     imu.enableIMUSensor([dai.IMUSensor.ACCELEROMETER_RAW, dai.IMUSensor.GYROSCOPE_RAW], 200)
@@ -730,9 +738,6 @@ def build_pipeline(p, device, args, stereo_settings):
     imu.setMaxBatchReports(10)
 
     apply_stereo_config(stereo, stereo_settings, dai)
-
-    feature_tracker.setHardwareResources(1, 2)
-    configure_feature_tracker(feature_tracker.initialConfig, args)
 
     left.requestOutput((args.width, args.height)).link(stereo.left)
     right.requestOutput((args.width, args.height)).link(stereo.right)
