@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-A fake mavlink2rest for tests and the UI demo server: an autopilot with parameters, a HEARTBEAT (armed
+A fake mavlink2rest for tests: an autopilot with parameters, a HEARTBEAT (armed
 or not) and a SYSTEM_TIME (reboot() restarts its time_boot_ms), our own VISION_POSITION_DELTA (system 1, component 195) and optionally a DVL's
 VISION_POSITION_DELTA, in mavlink2rest's REST shapes:
 
@@ -10,7 +10,7 @@ VISION_POSITION_DELTA, in mavlink2rest's REST shapes:
 
 Every posted message is kept in FakeVehicle.posted. Two ways to use it, neither touches a real host:
   - in-process: patch urllib.request.urlopen with vehicle.urlopen (only http://<vehicle.host>/... answers)
-  - HTTP on 127.0.0.1: serve(vehicle) (the demo server); `python fake_mavlink2rest.py --port 8088`
+  - HTTP on 127.0.0.1: serve(vehicle); `python fake_mavlink2rest.py --port 8088`
 """
 
 import argparse

@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
 Screenshots of the web UI with headless Chrome over the DevTools protocol (needs websocket-client), against
-a local server, normally tools/ui_demo_server.py:
+a mock server (main.py --mock: synthetic camera, mock autopilot, nothing leaves the PC), from app/:
 
-    python app/tools/ui_demo_server.py --port 8099 &
-    python app/tools/ui_demo_server.py --port 8098 --armed &
-    python app/tools/ui_screenshots.py --url http://127.0.0.1:8099/ --out ~/oakd-stage1/ui-impl
-    python app/tools/ui_screenshots.py --url http://127.0.0.1:8098/ --out ~/oakd-stage1/ui-impl --scenario armed
+    OAKD_MOCK_DIR=/tmp/oakd-ui python main.py --mock --host 127.0.0.1 --port 8099 &
+    OAKD_MOCK_DIR=/tmp/oakd-ui-armed OAKD_MOCK_ARMED=1 python main.py --mock --host 127.0.0.1 --port 8098 &
+    python tools/ui_screenshots.py --url http://127.0.0.1:8099/ --out ~/oakd-stage1/ui-impl
+    python tools/ui_screenshots.py --url http://127.0.0.1:8098/ --out ~/oakd-stage1/ui-impl --scenario armed
 
 main: the full page with live views refreshed and a depth probe (main.png), the parameter write confirm
-dialog (confirm-dialog.png), its result after confirming against the fake autopilot (write-result.png), a
+dialog (confirm-dialog.png), its result after confirming against the mock autopilot (write-result.png), a
 settings validation error (settings-error.png) and the page after Stop (vio-stopped.png).
-armed: the confirm dialog and the server's refusal while the fake autopilot is armed (armed-refusal.png).
-live: against a mock server (main.py --mock), the Live camera panel streaming with the tracked features
-drawn on it (live-camera.png) and the Cockpit widget (widget-camera.png).
-link: against a mock server, the status panel with the Camera link box and its per-stream table while the
+armed: the confirm dialog and the server's refusal while the mock autopilot is armed (armed-refusal.png).
+live: the Live camera panel streaming with the tracked features drawn on it (live-camera.png) and the Cockpit
+widget (widget-camera.png).
+link: the status panel with the Camera link box and its per-stream table while the
 live stream runs (link-panel.png), and the widget's status line with the link (widget-link.png).
 """
 
@@ -213,7 +213,7 @@ def main():
     args = parser.parse_args()
     host = urllib.parse.urlparse(args.url).hostname
     if host not in ("127.0.0.1", "localhost"):
-        raise SystemExit("screenshots are only taken of a local (demo) server")
+        raise SystemExit("screenshots are only taken of a local (mock) server")
     args.out = args.out.expanduser()
     args.out.mkdir(parents=True, exist_ok=True)
     browser = Browser(args.chrome, args.debug_port)
