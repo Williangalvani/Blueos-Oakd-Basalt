@@ -2,7 +2,7 @@
 Camera matrix of the rectified-left grid that the PnP features and depth are on, how it is chosen,
 and a check of it against the device's own depth. numpy/OpenCV only, no depthai.
 
-What the device does (depthai-core sources; NOTES_OPTION_D.md has the file:line references):
+What the device does (depthai-core sources; the README's Camera matrix section has the file:line references):
 - enableDistortionCorrection(True) selects mesh rectification, generated on the device like
   cv::initUndistortRectifyMap from the first 8 distortion coefficients of the calibration.
 - setAlphaScaling(alpha) is OpenCV's getOptimalNewCameraMatrix free scaling parameter.

@@ -108,7 +108,7 @@ def parse_args(argv=None):
                         help='Rectified-left camera matrix: "rectified" computes it from the CAM_B calibration and the '
                              'stereo alpha (what the device rectifies to), "frame" reads the depth frame (which '
                              'carries the raw calibration on RVC2), cam_b/cam_c use the raw calibration '
-                             '(see NOTES_OPTION_D.md)')
+                             '(see README, Camera matrix)')
     parser.add_argument('--intrinsics-override', type=_argument_type(parse_intrinsics_override), default=None,
                         metavar='FX,FY,CX,CY',
                         help='Camera matrix in pixels on the width x height grid; wins over --intrinsics-from')
