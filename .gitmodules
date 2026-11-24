@@ -1,6 +1,0 @@
-# Pinned by the gitlink to 4d4a8c15987e62c4bdd463a97f721f583208bd30: four local commits (metrics, python
-# bindings, the OpenCV-off build fix) on top of luxonis fa1ae8626 (PR #1632). That commit is not on luxonis
-# upstream; until it is pushed somewhere reachable, `git submodule update --init` cannot fetch it.
-[submodule "depthai-core"]
-	path = depthai-core
-	url = https://github.com/luxonis/depthai-core.git

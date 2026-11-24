@@ -1,5 +1,4 @@
-# Runtime image context (dockerfile): only what it COPYs. dockerfile.builder uses
-# dockerfile.builder.dockerignore instead (BuildKit), which lets depthai-core through.
+# Image context (dockerfile): only what it COPYs.
 *
 !requirements.txt
 !entrypoint.sh

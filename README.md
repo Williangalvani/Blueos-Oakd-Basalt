@@ -198,7 +198,7 @@ PnP back-projects each feature with the camera matrix (K) of the rectified-left 
 
 The depth frame's own matrix turned out to be the raw one; with it, lateral translation came out at 0.57× and vertical at 0.83× the true value. The device depth confirms the rectified matrix: on a stage-1 snapshot f = Z·d/B is 167.7 px (39 SIFT matches; a dense estimate gives 166.9), 3 % from 163.1 and 41 % from 285.1. The baseline is 7.496 cm calibrated, 7.5 cm by design.
 
-Where this comes from in depthai-core (`4d4a8c159`; the RVC2 stereo firmware is closed, so these are its documented contracts and depthai-core's own model of the output):
+Where this comes from in depthai-core (v3.3.0; the RVC2 stereo firmware is closed, so these are its documented contracts and depthai-core's own model of the output):
 
 | Where | What |
 |---|---|
@@ -532,23 +532,11 @@ Then use the upload option in BlueOS's extension manager (BlueOS versions with K
 
 ## Building
 
-The image is built in two stages so that the slow part only runs once:
+One [`dockerfile`](dockerfile), no compiling: Debian trixie-slim (Python 3.13), the Python requirements from PyPI and `app/` without `tests/` and `tools/` (`.dockerignore`). depthai is the official `depthai==3.3.0` manylinux aarch64 wheel, which bundles its own libraries (depthai-core, libusb, libgomp, FFmpeg, dynamic calibration); of its extension modules for CPython 3.9 to 3.14 only the 3.13 one is kept. No system OpenCV: `cv2` comes from the `opencv-python-headless` wheel. Under QEMU this takes a few minutes.
 
-1. **Builder image** ([`dockerfile.builder`](dockerfile.builder)): compiles depthai-core (the `depthai-core` submodule, declared in `.gitmodules`) with its Python bindings. The gitlink pins `4d4a8c1`, four local commits (metrics, Python bindings, a fix for building with OpenCV off) on top of luxonis `fa1ae86`. That commit is not on luxonis upstream, so `git submodule update` only works once it has been pushed somewhere the submodule URL can reach. Built under QEMU for arm64 this takes hours, mostly compiling vcpkg dependencies. The prebuilt `williangalvani/blueos-oakd-basalt-builder:arm64-rtabmap` is what the runtime image uses; it was built with the Basalt, RTAB-Map and PCL options that the dockerfile no longer enables (the runtime copies none of their libraries).
-
-   ```bash
-   git submodule update --init depthai-core
-   docker buildx build --platform linux/arm64 -f dockerfile.builder \
-     -t williangalvani/blueos-oakd-basalt-builder:arm64-rtabmap --push .
-   ```
-
-2. **Runtime image** ([`dockerfile`](dockerfile)): a slim Debian image. From the builder it copies the depthai Python module (a single `depthai.cpython-313-aarch64-linux-gnu.so`) and the two libraries it links that Debian doesn't ship (`libusb-1.0.so` from vcpkg, `libdynamic_calibration.so`). It then adds the Python requirements and `app/` without `tests/` and `tools/` (`.dockerignore`). No system OpenCV: `cv2` comes from the `opencv-python-headless` wheel. This takes a few minutes. The builder has its own ignore file, `dockerfile.builder.dockerignore`, which BuildKit (`docker buildx`) uses so that only `depthai-core` goes into its context.
-
-   ```bash
-   docker buildx build --platform linux/arm64 \
-     --build-arg BUILDER_IMAGE=williangalvani/blueos-oakd-basalt-builder:arm64-rtabmap \
-     -t williangalvani/blueos-oakd-basalt:arm64-rtabmap --push .
-   ```
+```bash
+docker buildx build --platform linux/arm64 -t williangalvani/blueos-oakd-basalt:arm64-rtabmap --push .
+```
 
 Tests (on any machine, no camera): `python -m pytest app/tests` with `requirements.txt`, `pytest` and `httpx` installed; the JavaScript tests need `node`.
 
