@@ -143,7 +143,8 @@ def test_no_stream_or_side_effect_route_is_in_the_schema():
     assert {"/api/stream/depth", "/api/stream/features", "/api/snapshot", "/api/history", "/api/features"} <= hidden
     posts = {route.path for route in main.app.routes if isinstance(route, APIRoute) and "POST" in route.methods}
     gets = {route.path for route in main.app.routes if isinstance(route, APIRoute) and "GET" in route.methods}
-    for path in ("/api/depth_probe", "/api/focal_check", "/api/autopilot/params", "/api/autopilot/params/read"):
+    for path in ("/api/depth_probe", "/api/focal_check", "/api/autopilot/params", "/api/autopilot/params/read",
+                 "/api/stereo_probe"):
         assert path in posts and path not in gets
 
 

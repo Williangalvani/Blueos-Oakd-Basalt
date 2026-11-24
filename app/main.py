@@ -29,6 +29,7 @@ import feature_stream
 import pose_stream
 import mock_mode
 import snapshots
+import stereo_probe
 import system_stats
 import vio_log
 import vio_telemetry
@@ -66,6 +67,10 @@ WIDGET_STATUS_INTERVAL_S = 1.0
 AUTOPILOT_TIMEOUT = 1.0
 AUTOPILOT_ATTEMPTS = 2
 HEARTBEAT_WAIT = 2.5
+# POST /api/stereo_probe: stereo_probe.py stops starting cases after its own budget (about 90 s); it is
+# killed after this. The response keeps this much of its stderr.
+STEREO_PROBE_TIMEOUT_S = 150.0
+STEREO_PROBE_STDERR_CHARS = 4000
 # Mock mode (mock_mode.py): no camera, no autopilot; set by OAKD_MOCK=1 or --mock (enable_mock_mode)
 MOCK = False
 
@@ -199,18 +204,25 @@ def build_vio_command(config: dict) -> list:
     return cmd
 
 
+def camera_process_env() -> dict:
+    """Environment of the processes that use the camera (the VIO, the stereo probe): depthai on the path."""
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONPATH"] = "/app/depthai-python"
+    return env
+
+
 def launch_vio() -> subprocess.Popen:
     """Launch the VIO process for the saved configuration (mock_vio.py in mock mode)"""
     config = load_config()
     cmd = build_vio_command(config)
 
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
     if MOCK:
+        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
         cmd = mock_mode.vio_command(cmd, SNAPSHOT_DIR, vio_log.LOG_DIR)
         cwd = str(mock_mode.APP_DIR)
     else:
-        env["PYTHONPATH"] = "/app/depthai-python"
+        env = camera_process_env()
         cwd = "/app"
 
     # stdout/stderr are inherited so VIO logs reach the container output
@@ -238,6 +250,8 @@ dvl_poller = dvl_source.DvlPoller()
 # Armed state from the ArduPilot panel's last read or write (no polling of its own)
 vehicle_state = {"armed": None, "detail": "not read yet", "checked_at": None}
 vehicle_state_lock = threading.Lock()
+# One stereo probe at a time: it has the camera to itself while the VIO is stopped
+stereo_probe_lock = threading.Lock()
 
 
 def enable_mock_mode(directory=None):
@@ -872,6 +886,114 @@ def post_focal_check(tolerance: float = Query(0.15, gt=0.0, lt=1.0)):
              "does not check fy, cx or cy. It uses the in-air camera matrix: the device depth is computed with the "
              "in-air focal length, so the refractive index cancels out and the check holds in water too.")
     return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+
+def stereo_probe_command(config: dict, output: Path, cases: list) -> list:
+    """stereo_probe.py's command line: the camera and stereo settings the VIO gets from the saved config."""
+    return [
+        "python", "-u", "/app/stereo_probe.py",
+        "--fps", str(config["fps"]),
+        "--width", str(config["resolution_width"]),
+        "--height", str(config["resolution_height"]),
+        "--quality", str(saved_number(config, "depth_stream_quality")),
+        "--cases", ",".join(cases),
+        "--output", str(output),
+        *stereo_command_args(config),
+    ]
+
+
+def _text(data) -> str:
+    if data is None:
+        return ""
+    return data.decode(errors="replace") if isinstance(data, bytes) else data
+
+
+def run_stereo_probe_process(cmd: list, timeout: float):
+    """(exit code, stdout, stderr) of the probe in the VIO's environment; exit code None if killed on timeout."""
+    try:
+        done = subprocess.run(cmd, env=camera_process_env(), cwd="/app", capture_output=True, text=True,
+                              timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        return None, _text(e.stdout), _text(e.stderr)
+    return done.returncode, done.stdout, done.stderr
+
+
+def read_probe_document(output: Path, stdout: str):
+    """The probe's JSON: its --output file (also written part-way), else the last JSON line of its stdout."""
+    try:
+        return json.loads(output.read_text())
+    except (OSError, ValueError):
+        pass
+    for line in reversed(stdout.splitlines()):
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except ValueError:
+                return None
+    return None
+
+
+def run_stereo_probe(cases: list) -> tuple:
+    """Stop the VIO, run stereo_probe.py, restart the VIO whatever happened; (HTTP status, saved body)."""
+    config = load_config()
+    started = time.time()
+    output = CONFIG_FILE.parent / "probe" / f"stereo-{int(started)}.json"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    cmd = stereo_probe_command(config, output, cases)
+    returncode, stdout, stderr, error, restart_error, timed_out = None, "", "", None, None, False
+    try:
+        stop_vio()
+        returncode, stdout, stderr = run_stereo_probe_process(cmd, STEREO_PROBE_TIMEOUT_S)
+        if returncode is None:
+            timed_out = True
+            error = f"the probe did not finish within {STEREO_PROBE_TIMEOUT_S:.0f} s and was killed"
+        elif returncode != 0:
+            error = f"the probe exited with code {returncode}"
+    except Exception as e:
+        error = f"the probe could not run: {e}"
+    finally:
+        try:
+            start_vio()
+        except Exception as e:
+            restart_error = str(e)
+    probe = read_probe_document(output, stdout)
+    if error is None and not (isinstance(probe, dict) and probe.get("complete")):
+        error = "the probe printed no complete result"
+    body = {"probe": probe, "error": error, "cases": cases, "returncode": returncode,
+            "timed_out": timed_out,
+            "started_at": started, "duration_s": round(time.time() - started, 2),
+            "vio_restarted": restart_error is None, "vio_restart_error": restart_error,
+            "stderr_tail": stderr[-STEREO_PROBE_STDERR_CHARS:], "saved_to": str(output)}
+    if probe is None:
+        body["stdout_tail"] = stdout[-STEREO_PROBE_STDERR_CHARS:]
+    snapshots.atomic_write(output, json.dumps(body, indent=1).encode())
+    status = 200 if error is None else 504 if timed_out else 502
+    return status, body
+
+
+@app.post("/api/stereo_probe", include_in_schema=False)
+def post_stereo_probe(cases: Optional[str] = None):
+    """
+    Diagnostics of StereoDepth's outputs and the camera's MJPEG encoder (stereo_probe.py): stops the VIO, runs
+    short pipelines with several stereo configurations (cases A-F, or a comma-separated subset in `cases`) for
+    about 90 s, then restarts the VIO, also after a failure or a timeout. Returns the probe's JSON plus the end
+    of its stderr, also saved as probe/stereo-<unix time>.json in the data directory. 409 while one runs; 403
+    in mock mode (no camera).
+    """
+    if MOCK:
+        return JSONResponse({"detail": "the stereo probe needs the camera; mock mode has none", "mock": True},
+                            status_code=403)
+    try:
+        names = stereo_probe.parse_case_names(cases)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not stereo_probe_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="a stereo probe is already running")
+    try:
+        status, body = run_stereo_probe(names)
+    finally:
+        stereo_probe_lock.release()
+    return JSONResponse(body, status_code=status, headers={"Cache-Control": "no-store"})
 
 
 def make_autopilot() -> AutopilotParams:
