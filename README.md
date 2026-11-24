@@ -542,7 +542,7 @@ The image is built in two stages so that the slow part only runs once:
      -t williangalvani/blueos-oakd-basalt-builder:arm64-rtabmap --push .
    ```
 
-2. **Runtime image** ([`dockerfile`](dockerfile)): a slim Debian image that copies the depthai Python package (the compiled module and its Python files) and the shared libraries it links out of the builder, and adds the app. This takes a few minutes.
+2. **Runtime image** ([`dockerfile`](dockerfile)): a slim Debian image. From the builder it copies the depthai Python module (a single `depthai.cpython-313-aarch64-linux-gnu.so`) and the two libraries it links that Debian doesn't ship (`libusb-1.0.so` from vcpkg, `libdynamic_calibration.so`). It then adds the Python requirements and `app/` without `tests/` and `tools/` (`.dockerignore`). No system OpenCV: `cv2` comes from the `opencv-python-headless` wheel. This takes a few minutes. The builder has its own ignore file, `dockerfile.builder.dockerignore`, which BuildKit (`docker buildx`) uses so that only `depthai-core` goes into its context.
 
    ```bash
    docker buildx build --platform linux/arm64 \

@@ -1,0 +1,4 @@
+# Builder image context (dockerfile.builder, BuildKit): only the depthai-core sources.
+*
+!depthai-core
+depthai-core/build

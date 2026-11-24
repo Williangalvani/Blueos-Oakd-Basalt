@@ -1,0 +1,9 @@
+# Runtime image context (dockerfile): only what it COPYs. dockerfile.builder uses
+# dockerfile.builder.dockerignore instead (BuildKit), which lets depthai-core through.
+*
+!requirements.txt
+!entrypoint.sh
+!app
+app/tests
+app/tools
+**/__pycache__

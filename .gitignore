@@ -231,7 +231,6 @@ $RECYCLE.BIN/
 .nfs*
 
 # Docker
-.dockerignore
 docker-compose.override.yml
 
 # Logs

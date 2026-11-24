@@ -1,11 +1,10 @@
 # =============================================================================
-# Runtime image - uses pre-built builder image for fast iteration
-# 
-# First, build the builder image ONCE (takes ~1hr):
-#   docker build -f dockerfile.builder -t blueos-oakd-basalt-builder .
+# Runtime image: the depthai Python module and the two libraries it links, copied
+# out of a prebuilt builder image (dockerfile.builder), plus the app.
 #
-# Then build runtime image quickly:
-#   docker build -t blueos-oakd-basalt .
+#   docker buildx build --platform linux/arm64 \
+#     --build-arg BUILDER_IMAGE=williangalvani/blueos-oakd-basalt-builder:arm64-rtabmap \
+#     -t williangalvani/blueos-oakd-basalt:arm64-rtabmap .
 # =============================================================================
 ARG BUILDER_IMAGE=blueos-oakd-basalt-builder
 
@@ -18,30 +17,18 @@ FROM debian:trixie-slim
 
 WORKDIR /app
 
-# Install only runtime dependencies
+# depthai.so NEEDS libgomp, libusb-1.0.so and libdynamic_calibration.so (both copied below) and libc/libstdc++.
+# Its embedded TBB dlopens libtbbmalloc.so.2 when present; the hardware-tested images had it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv \
+    python3 python3-venv \
     libusb-1.0-0 libudev1 \
-    libopencv-core410 libopencv-imgproc410 libopencv-imgcodecs410 \
-    libboost-filesystem1.83.0 libboost-program-options1.83.0 \
-    libgomp1 \
-    tmux wget \
+    libgomp1 libtbbmalloc2 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Install ttyd
-COPY install_ttyd.sh .
-RUN ./install_ttyd.sh && rm install_ttyd.sh
-
-# Copy built depthai Python bindings from builder
-COPY --from=builder /app/depthai-core/build/bindings/python /app/depthai-python
-
-# Copy ALL shared libraries from the build (depthai, etc.)
-COPY --from=builder /app/depthai-core/build/*.so* /usr/local/lib/
-# Copy vcpkg-built shared libraries (rtabmap, pcl, etc.)
-COPY --from=builder /app/depthai-core/build/vcpkg_installed/arm64-linux/lib/*.so* /usr/local/lib/
-# Copy FetchContent dependencies (dynamic_calibration, etc.)
-COPY --from=builder /app/depthai-core/build/_deps/dynamic_calibration-src/lib/*.so* /usr/local/lib/
+COPY --from=builder /app/depthai-core/build/bindings/python/depthai.cpython-313-aarch64-linux-gnu.so /app/depthai-python/
+COPY --from=builder /app/depthai-core/build/vcpkg_installed/arm64-linux/lib/libusb-1.0.so /usr/local/lib/
+COPY --from=builder /app/depthai-core/build/_deps/dynamic_calibration-src/lib/libdynamic_calibration.so /usr/local/lib/
 RUN ldconfig
 
 # Create virtual environment and install Python deps
