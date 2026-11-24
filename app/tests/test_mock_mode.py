@@ -276,11 +276,22 @@ def test_the_mock_host_jpeg_variant_encodes_on_the_pi(tmp_path):
     stream.close()
 
 
-@pytest.mark.parametrize("encoding, variant", [("auto", "manip"), ("nv12", "nv12"), ("yuv400p", "yuv400p")])
+def test_the_mock_auto_with_subpixel_encodes_on_the_pi_and_says_why(tmp_path):
+    vio, stream = mock_depth_vio(tmp_path, "--depth-stream-encoding", "auto")
+    meta = stream.meta()
+    assert (meta["variant"], meta["requested_variant"], meta["encoded_on"]) == ("host_jpeg", "auto", "pi")
+    assert meta["fallback"]["reason"] == depth_stream.SUBPIXEL_PROBLEM and meta["fallback"]["at_start"]
+    stream.close()
+
+
+@pytest.mark.parametrize("encoding, variant", [("auto", "disparity"), ("disparity", "disparity"),
+                                               ("manip", "manip"), ("nv12", "nv12"), ("yuv400p", "yuv400p")])
 def test_the_mock_reports_the_camera_variant_and_its_debug_log(tmp_path, encoding, variant):
-    vio, stream = mock_depth_vio(tmp_path, "--depth-stream-encoding", encoding, "--depth-stream-debug")
+    vio, stream = mock_depth_vio(tmp_path, "--depth-stream-encoding", encoding, "--depth-stream-debug",
+                                 "--no-stereo-subpixel")
     meta = stream.meta()
     assert (meta["variant"], meta["requested_variant"], meta["encoded_on"]) == (variant, encoding, "camera")
+    assert meta["encoding"] == depth_stream.encoding_for(variant) and meta["fallback"] is None
     depth_stream.touch_lease(tmp_path / "telemetry")
     stream.tick()
     assert stream.enabled and vio.log_device.level == "DEBUG"
@@ -360,14 +371,22 @@ def test_the_pose_stream_follows_the_mock_survey(server):
     kinds = [lines[0][len("event: "):] for lines in events]
     poses = [json.loads(lines[1][len("data: "):]) for lines in events if lines[0] == "event: pose"]
     assert "status" in kinds and len(poses) >= 5
-    assert all(p["frame"] == "start-FRD" and len(p["q"]) == 4 for p in poses)
+    # The mock autopilot's ATTITUDE (no gap in the first 112 s): NED with its heading, in rad and deg
+    assert all(p["frame"] == "NED" and len(p["q"]) == 4 for p in poses)
+    assert all(p["attitude_source"] == "autopilot" and p["attitude_text"] == "ArduPilot ATTITUDE" for p in poses)
+    assert all(p["attitude_age_s"] < 3.0 and p["units"]["roll, pitch, yaw"] == "rad" for p in poses)
+    assert all(abs(p["yaw_deg"] - math.degrees(p["yaw"])) < 0.01 for p in poses)
     assert len({p["epoch"] for p in poses}) == 1 and poses[-1]["frames"] > poses[0]["frames"]
     moved = math.dist([poses[0][k] for k in "xyz"], [poses[-1][k] for k in "xyz"])
     assert moved > 0.01  # the survey moves at 0.15 - 0.35 m/s
     status, pose = get_json(port, "/api/pose")
     assert status == 200 and pose["epoch"] == poses[0]["epoch"]
     _, s = get_json(port, "/api/status")
-    assert s["depth_stream"]["variant"] == "manip" and s["depth_stream"]["configured_encoding"] == "auto"
+    assert s["pose"]["configured_source"] == "autopilot" and s["pose"]["attitude_source"] == "autopilot"
+    assert s["pose"]["autopilot"]["fresh"] and "mock autopilot ATTITUDE (gaps)" in s["pose"]["autopilot"]["description"]
+    # auto with the default stereo_subpixel: StereoDepth's disparity is RAW16, so the Pi encodes
+    assert s["depth_stream"]["variant"] == "host_jpeg" and s["depth_stream"]["configured_encoding"] == "auto"
+    assert s["depth_stream"]["fallback"]["reason"] == depth_stream.SUBPIXEL_PROBLEM
 
 
 def test_the_feature_stream_yields_events(server):

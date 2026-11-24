@@ -2,24 +2,44 @@
 3D pose of the PnP VIO for the pose viewer (the main page's panel and the /widget/pose Cockpit widget),
 published through files like feature_stream.py.
 
-Frame "start-FRD": the vehicle body frame at VIO start, x forward, y right, z down (m). With the vehicle
-level at the start it is NED with north turned to the initial heading; there is no absolute heading or
-gravity reference, so the attitude is relative to the start too. roll, pitch, yaw (rad) are the ZYX
-(aerospace) Euler angles of the body in that frame; q is the same rotation as a quaternion [w, x, y, z].
+Position: PoseIntegrator chains the displacements VISION_POSITION_DELTA carries (body FRD, expressed in the
+body frame of the current frame), rotated into the world frame by the attitude in use:
+    p <- p + R @ position_delta
+Frames without a delta (rejected, reference resets) add nothing, so the position drifts like any dead
+reckoning. The x-y trajectory panel (vio_telemetry.TrajectoryIntegrator) is a yaw-only gyro version.
 
-PoseIntegrator chains the deltas VISION_POSITION_DELTA carries, in body FRD: the rotation vector of the
-current body frame relative to the reference and the displacement expressed in the current body frame:
-    R <- R @ exp(rotation_delta)        p <- p + R @ position_delta
-It drifts, like any dead reckoning; frames without a delta (rejected, reference resets) add nothing. The
-x-y trajectory panel (vio_telemetry.TrajectoryIntegrator) is the yaw-only version of the same chain.
+Attitude R (body FRD -> world), from one of two sources (attitude_source):
+- "autopilot": ArduPilot's ATTITUDE (autopilot_attitude.AttitudeSource, read from mavlink2rest), while a
+  sample is at most autopilot_attitude.STALE_S old. Between samples (polled every 0.5 s) it is carried
+  forward with the frames' gyro rotation since the sample's time (CHAIN_HISTORY_S of them are kept), so the
+  view moves smoothly and the sample's age does not lag turns; each new sample replaces it.
+- "gyro": the frames' gyro rotation deltas chained, R <- R @ exp(rotation_delta). Drifts with the gyro bias
+  (about 0.65 deg/s on an OAK-D-W BMI270 at rest), and rotation during failed frames is not measured.
+Neither is a filter: no gyro bias estimate and no gravity correction.
+
+Frames:
+- "start-FRD": the body frame at VIO start, x forward, y right, z down (m); NED with north at the initial
+  heading if the vehicle started level. Used until the first autopilot sample (all the time without one).
+- "NED": x north, y east, z down (m), from the VIO start position, heading from the autopilot. The first
+  autopilot sample switches to it: the position and the trail so far are rotated about the start by
+  T = R_autopilot @ R_gyro^T (a re-expression of start-FRD in NED, as good as the gyro attitude was), and
+  the trail gets a new epoch so the viewers redraw it. With an autopilot from the start (the usual case:
+  it answers before the camera has opened) the trail is still at the origin and nothing moves.
+Switching sources later never moves the position or the trail: autopilot -> gyro (stale ATTITUDE) continues
+from the last autopilot attitude, so nothing jumps and the frame stays NED while the heading drifts;
+gyro -> autopilot snaps the attitude back by whatever the gyro drifted meanwhile (a few degrees after a
+short loss), and later displacements go in the right direction again.
+
+roll, pitch, yaw are the ZYX (aerospace) Euler angles of R in radians; roll_deg, pitch_deg, yaw_deg the same
+in degrees; q is R as a quaternion [w, x, y, z].
 
 VIO process side (PoseStreamService): record() once per frame, always, so the pose and the trail are
 current when a viewer opens. While main.py holds the lease (pose.lease, touched while a client is
 connected to /api/stream/pose) it writes pose.json at most RATE_HZ times a second, and pose_trail.json
 (the trail: [t, x, y, z] points TRAIL_STEP_M or TRAIL_STEP_S apart, at most TRAIL_POINTS, thinned to every
 other point when full) at most once a second when it changed, and every TRAIL_REFRESH_S anyway. main.py
-sends the trail once per connection (and again if the VIO restarted), then each pose; the viewer extends
-its own trail from the poses.
+sends the trail once per connection (and again if the VIO restarted or the frame changed), then each pose;
+the viewer extends its own trail from the poses. status() is the attitude part for /api/status.
 
 depthai-free so it can be unit tested.
 """
@@ -28,6 +48,7 @@ import json
 import math
 import os
 import time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -45,9 +66,21 @@ TRAIL_REFRESH_S = 2.0
 TRAIL_STEP_M = 0.05
 TRAIL_STEP_S = 2.0
 TRAIL_POINTS = 1500
-FRAME = "start-FRD"
-FRAME_TEXT = ("body frame at VIO start: x forward, y right, z down (m); NED with north at the initial heading "
-              "if the vehicle started level")
+# Gyro rotation kept to carry an autopilot sample forward from its own time
+CHAIN_HISTORY_S = 2.0
+FRAME_START, FRAME_NED = "start-FRD", "NED"
+FRAME = FRAME_START
+FRAME_TEXTS = {
+    FRAME_START: ("body frame at VIO start: x forward, y right, z down (m); NED with north at the initial heading "
+                  "if the vehicle started level"),
+    FRAME_NED: "NED from the VIO start position: x north, y east, z down (m), heading from the autopilot",
+}
+FRAME_TEXT = FRAME_TEXTS[FRAME_START]
+AUTOPILOT, GYRO = "autopilot", "gyro"
+ATTITUDE_MODES = (AUTOPILOT, GYRO)
+ATTITUDE_TEXTS = {AUTOPILOT: "ArduPilot ATTITUDE", GYRO: "gyro-integrated, drifting"}
+UNITS = {"x, y, z": "m", "roll, pitch, yaw": "rad", "roll_deg, pitch_deg, yaw_deg": "deg",
+         "attitude_age_s": "s"}
 
 
 def rotvec_to_matrix(rotvec):
@@ -84,15 +117,34 @@ def quaternion(R):
     return q if q[0] >= 0 else [-c for c in q]
 
 
+def _orthonormal(R):
+    u, _, vt = np.linalg.svd(R)
+    return u @ vt  # keep it a rotation as the steps accumulate
+
+
 class PoseIntegrator:
-    """Position (m) and attitude (body -> start-FRD rotation) from per-frame body FRD deltas."""
+    """
+    Position (m) and attitude (body -> world) from per-frame body FRD deltas and, when given, the autopilot's
+    attitude; see the module docstring. frame and source say which frame and attitude are in use.
+    """
 
-    def __init__(self):
+    def __init__(self, history_s=CHAIN_HISTORY_S):
         self.position = np.zeros(3)
-        self.rotation = np.eye(3)
+        self.rotation = np.eye(3)  # in use
+        self.gyro = np.eye(3)  # the gyro chain; continues from the last autopilot attitude
+        self.chain = np.eye(3)  # every delta since the start, never reset: only its differences are used
+        self.history = deque()  # (t, chain) of the last history_s
+        self.history_s = history_s
+        self.frame = FRAME_START
+        self.source = GYRO
+        self.anchor = None  # (autopilot sample, chain at its time)
+        self.realigned = None  # T of the change to NED, until the caller takes it
 
-    def step(self, position_delta, rotation_delta=None, yaw_delta=None):
-        """rotation_delta: body FRD rotation vector (rad); without it, a rotation of yaw_delta about body z."""
+    def step(self, position_delta, rotation_delta=None, yaw_delta=None, t=None, attitude=None):
+        """
+        rotation_delta: body FRD rotation vector (rad); without it, a rotation of yaw_delta about body z.
+        attitude: a fresh autopilot sample (autopilot_attitude.AttitudeSample) or None. t: wall time (s).
+        """
         if rotation_delta is not None:
             delta = np.asarray(rotation_delta, dtype=np.float64).reshape(3)
         elif yaw_delta is not None and math.isfinite(yaw_delta):
@@ -100,18 +152,56 @@ class PoseIntegrator:
         else:
             delta = np.zeros(3)
         if np.all(np.isfinite(delta)) and np.any(delta):
-            u, _, vt = np.linalg.svd(self.rotation @ rotvec_to_matrix(delta))
-            self.rotation = u @ vt  # keep it a rotation as the steps accumulate
+            D = rotvec_to_matrix(delta)
+            self.chain = _orthonormal(self.chain @ D)
+            self.gyro = _orthonormal(self.gyro @ D)
+            if t is not None:
+                self.history.append((float(t), self.chain))
+                while self.history and t - self.history[0][0] > self.history_s:
+                    self.history.popleft()
+        self.set_attitude(attitude)
         if position_delta is not None:
             d = np.asarray(position_delta, dtype=np.float64).reshape(3)
             if np.all(np.isfinite(d)):
                 self.position = self.position + self.rotation @ d
         return self.pose()
 
+    def _chain_at(self, t):
+        chain = self.chain
+        for when, value in reversed(self.history):
+            if when <= t:
+                return value
+            chain = value
+        return chain  # older than the history: the oldest kept
+
+    def set_attitude(self, attitude):
+        """Use a fresh autopilot sample, or the gyro chain if None (between frames too). Returns the source."""
+        if attitude is None:
+            self.source = GYRO
+            self.rotation = self.gyro
+            return self.source
+        if self.anchor is None or self.anchor[0] != attitude:
+            self.anchor = (attitude, self._chain_at(attitude.unix_time))
+        sample, chain_then = self.anchor
+        R = _orthonormal(sample.matrix() @ chain_then.T @ self.chain)
+        if self.frame == FRAME_START:
+            T = R @ self.gyro.T
+            self.position = T @ self.position
+            self.frame, self.realigned = FRAME_NED, T
+        self.source = AUTOPILOT
+        self.rotation = self.gyro = R
+        return self.source
+
+    def take_realignment(self):
+        T, self.realigned = self.realigned, None
+        return T
+
     def pose(self):
         roll, pitch, yaw = euler_zyx(self.rotation)
         x, y, z = (float(v) for v in self.position)
-        return {"x": x, "y": y, "z": z, "roll": roll, "pitch": pitch, "yaw": yaw, "q": quaternion(self.rotation)}
+        return {"x": x, "y": y, "z": z, "roll": roll, "pitch": pitch, "yaw": yaw,
+                "roll_deg": math.degrees(roll), "pitch_deg": math.degrees(pitch), "yaw_deg": math.degrees(yaw),
+                "q": quaternion(self.rotation)}
 
 
 def _lease_fresh(path, now, lease_s):
@@ -125,12 +215,22 @@ def _rounded(pose):
     return {key: ([round(c, 6) for c in value] if key == "q" else round(value, 4)) for key, value in pose.items()}
 
 
+def frame_text(frame, source):
+    text = FRAME_TEXTS[frame]
+    if frame == FRAME_NED and source == GYRO:
+        text += "; the autopilot attitude is lost, so the heading drifts with the gyro until it is back"
+    return text
+
+
 class PoseStreamService:
-    """VIO process side; see the module docstring."""
+    """
+    VIO process side; see the module docstring. attitude: an autopilot_attitude.AttitudeSource (its latest()
+    is read once per frame), or None for the gyro only (attitude_mode "gyro").
+    """
 
     def __init__(self, directory, camera_angle_deg=0.0, rate_hz=RATE_HZ, lease_s=LEASE_S, poll_interval=0.5,
                  trail_points=TRAIL_POINTS, trail_step_m=TRAIL_STEP_M, trail_step_s=TRAIL_STEP_S,
-                 trail_interval=TRAIL_INTERVAL_S, clock=time.time, log=print):
+                 trail_interval=TRAIL_INTERVAL_S, clock=time.time, log=print, attitude=None):
         self.directory = Path(directory)
         self.camera_angle_deg = float(camera_angle_deg)
         self.interval = 1.0 / rate_hz
@@ -142,8 +242,12 @@ class PoseStreamService:
         self.trail_interval = trail_interval
         self.clock = clock
         self.log = log
+        self.attitude = attitude
+        self.attitude_mode = AUTOPILOT if attitude is not None else GYRO
+        self.attitude_age = None
         self.integrator = PoseIntegrator()
-        self.epoch = f"{os.getpid()}-{int(clock() * 1000)}"
+        self._epoch_base = f"{os.getpid()}-{int(clock() * 1000)}"
+        self.epoch = self._epoch_base
         self.trail = []
         self.trail_changed = False
         self.frames = self.ok_frames = 0
@@ -151,6 +255,9 @@ class PoseStreamService:
         self.wanted = False
         self.published = 0
         self.errors = 0
+        self.switches = 0
+        self.last_switch = None
+        self.realigned = None
         self._last_poll = self._last_write = self._last_trail = float("-inf")
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
@@ -164,11 +271,49 @@ class PoseStreamService:
         """One VIO frame (t: wall time). Returns True if it wrote pose.json."""
         self.frames += 1
         self.last_ok = bool(ok)
+        sample = None
+        if self.attitude is not None:
+            sample, self.attitude_age = self.attitude.latest(t)
+        before = self.integrator.source
         if ok and position_delta is not None:
             self.ok_frames += 1
-            self.integrator.step(position_delta, rotation_delta, yaw_delta)
+            self.integrator.step(position_delta, rotation_delta, yaw_delta, t=t, attitude=sample)
+        else:
+            self.integrator.set_attitude(sample)
+        T = self.integrator.take_realignment()
+        if T is not None:
+            self._realign(T, t)
+        if self.integrator.source != before and self.attitude is not None:
+            self._switched(before, self.integrator.source, t, quiet=T is not None)
+        if ok and position_delta is not None:
             self._add_trail_point(t)
         return self.tick(t)
+
+    def _realign(self, T, t):
+        moved = any(any(point[1:]) for point in self.trail)
+        for point in self.trail:
+            point[1:] = [round(float(v), 3) for v in T @ np.asarray(point[1:], dtype=np.float64)]
+        self.realigned = {"unix_time": t, "yaw_deg": round(math.degrees(math.atan2(T[1, 0], T[0, 0])), 2),
+                          "trail_points": len(self.trail) if moved else 0}
+        if moved:  # the viewers' own trails are in start-FRD: a new epoch makes them take this one
+            self.epoch = f"{self._epoch_base}-ned"
+            self.trail_changed = True
+            self._last_trail = float("-inf")
+        turned = f" (the trail so far turned by {self.realigned['yaw_deg']:.1f} deg)" if moved else ""
+        self.log(f"Pose stream: autopilot attitude found, the pose is now in NED from the VIO start{turned}")
+
+    def _switched(self, before, now_source, t, quiet=False):
+        self.switches += 1
+        age = self.attitude_age
+        self.last_switch = {"unix_time": t, "from": before, "to": now_source,
+                            "attitude_age_s": None if age is None else round(age, 2)}
+        if quiet:
+            return
+        if now_source == GYRO:
+            self.log(f"Pose stream: autopilot ATTITUDE {'lost' if age is None else f'{age:.1f} s old'}; the attitude "
+                     f"is gyro-integrated from its last value and drifts until it is back")
+        else:
+            self.log("Pose stream: autopilot ATTITUDE back; the attitude follows the autopilot again")
 
     def _add_trail_point(self, t):
         x, y, z = (float(v) for v in self.integrator.position)
@@ -182,14 +327,25 @@ class PoseStreamService:
             self.trail = self.trail[:-1:2] + [self.trail[-1]]  # every other point, always keeping the newest
         self.trail_changed = True
 
+    def status(self, now=None):
+        """The attitude source for /api/status (telemetry "pose") and the viewers."""
+        now = self.clock() if now is None else now
+        source = self.integrator.source
+        age = self.attitude_age
+        return {"frame": self.integrator.frame, "frame_text": frame_text(self.integrator.frame, source),
+                "attitude_mode": self.attitude_mode, "attitude_source": source,
+                "attitude_text": ATTITUDE_TEXTS[source], "attitude_age_s": None if age is None else round(age, 2),
+                "switches": self.switches, "last_switch": self.last_switch, "realigned": self.realigned,
+                "autopilot": self.attitude.state(now) if self.attitude is not None else None}
+
     def payload(self, now):
-        return {"pid": os.getpid(), "epoch": self.epoch, "unix_time": now, "frame": FRAME,
+        return {"pid": os.getpid(), "epoch": self.epoch, "unix_time": now,
                 **_rounded(self.integrator.pose()), "ok": self.last_ok, "frames": self.frames,
                 "ok_frames": self.ok_frames, "rate_hz": round(1.0 / self.interval, 2),
-                "camera_angle_deg": self.camera_angle_deg}
+                "camera_angle_deg": self.camera_angle_deg, **self.status(now), "units": UNITS}
 
     def trail_payload(self, now):
-        return {"pid": os.getpid(), "epoch": self.epoch, "unix_time": now, "frame": FRAME,
+        return {"pid": os.getpid(), "epoch": self.epoch, "unix_time": now, "frame": self.integrator.frame,
                 "step_m": self.trail_step_m, "max_points": self.trail_points, "points": self.trail}
 
     def tick(self, now=None):
@@ -220,6 +376,10 @@ class PoseStreamService:
             return False
         self.published += 1
         return True
+
+    def close(self):
+        if self.attitude is not None:
+            self.attitude.close()
 
 
 # --- main.py side ---------------------------------------------------------------------------------

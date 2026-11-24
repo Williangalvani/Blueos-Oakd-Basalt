@@ -115,8 +115,8 @@ def diff_params(current: dict) -> list:
     return diff
 
 
-def _message_age(message, now):
-    """Seconds since mavlink2rest's status.time.last_update of a message, or None if it has none we can parse."""
+def message_time(message):
+    """Unix time of mavlink2rest's status.time.last_update of a message, or None if it has none we can parse."""
     try:
         text = message["status"]["time"]["last_update"]
         stamp = datetime.datetime.fromisoformat(str(text).replace("Z", "+00:00"))
@@ -124,7 +124,13 @@ def _message_age(message, now):
         return None
     if stamp.tzinfo is None:
         return None
-    return max(0.0, now - stamp.timestamp())
+    return stamp.timestamp()
+
+
+def _message_age(message, now):
+    """Seconds since mavlink2rest's status.time.last_update of a message, or None if it has none we can parse."""
+    stamp = message_time(message)
+    return None if stamp is None else max(0.0, now - stamp)
 
 
 def validate_param_values(values) -> list:
@@ -277,9 +283,13 @@ class AutopilotParams:
         with urllib.request.urlopen(request, timeout=self.timeout) as response:
             response.read()
 
+    def vehicle_message(self, name):
+        """The autopilot's latest `name` message as mavlink2rest keeps it ({"message", "status"}); raises on errors."""
+        return self._get(f"/mavlink/vehicles/{self.system_id}/components/{self.component_id}/messages/{name}")
+
     def _vehicle_message(self, name):
         try:
-            return self._get(f"/mavlink/vehicles/{self.system_id}/components/{self.component_id}/messages/{name}")
+            return self.vehicle_message(name)
         except Exception:
             return None
 

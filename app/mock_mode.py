@@ -9,7 +9,8 @@ OAKD_MOCK=1 in the environment (or main.py --mock) makes main.py:
   services, so every web server code path runs as with a camera;
 - use MockAutopilot for the ArduPilot panel: a disarmed HEARTBEAT and fixed parameter values, read only;
   POST /api/autopilot/params is refused before anything else;
-- feed the DVL overlay from dvl_fetch (a fake mavlink2rest answering in-process);
+- feed the DVL overlay from dvl_fetch (a fake mavlink2rest answering in-process), and the mock VIO's 3D pose
+  attitude from attitude_fetch (the same, in the VIO process; with gaps, OAKD_MOCK_ATTITUDE);
 - make urllib refuse every URL (block_network), so no request ever leaves the process.
 
 Nothing here imports depthai.
@@ -42,6 +43,16 @@ PARAM_VALUES = {
 }
 DVL_SYSTEM, DVL_COMPONENT = 1, 197
 DVL_RATE_HZ = 5.0
+# The mock autopilot's ATTITUDE (attitude_fetch): heading at the VIO start, rate, and (period, length) in s of
+# its gaps
+ATTITUDE_ENV = "OAKD_MOCK_ATTITUDE"
+ATTITUDE_MODES = ("gaps", "on", "off")
+ATTITUDE_HEADING_OFFSET = math.radians(30.0)
+ATTITUDE_RATE_HZ = 10.0
+ATTITUDE_GAP = (120.0, 8.0)
+# Gyro bias (rad/s, body z) the mock VIO adds to the 3D pose's rotation deltas, so the gyro-integrated
+# attitude drifts visibly like a real one (the VIO output and the trajectory panel do not get it)
+GYRO_BIAS = math.radians(0.3)
 
 
 def enabled(environ=None):
@@ -153,6 +164,39 @@ class MockAutopilot:
 
 def _iso(t):
     return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).isoformat()
+
+
+def attitude_mode(environ=None):
+    environ = os.environ if environ is None else environ
+    value = environ.get(ATTITUDE_ENV, "").strip().lower()
+    return value if value in ATTITUDE_MODES else ATTITUDE_MODES[0]
+
+
+def attitude_fetch(started, mode=None, clock=time.time):
+    """
+    The 3D pose's autopilot_attitude.AttitudeSource fetch in mock mode (in the mock VIO process): mavlink2rest's
+    ATTITUDE of the mock vehicle started at `started`, consistent with the motion the mock VIO measures:
+    yaw ATTITUDE_HEADING_OFFSET + heading(t) - heading(started), roll and pitch attitude(t - started). mode
+    (OAKD_MOCK_ATTITUDE): "gaps" freezes the message for the last ATTITUDE_GAP[1] s of every ATTITUDE_GAP[0] s
+    (stale: the viewer falls back to the gyro), "on" never does, "off" has none. Never touches the network.
+    """
+    mode = attitude_mode() if mode is None else mode
+
+    def fetch():
+        if mode == "off":
+            raise urllib.error.URLError("mock mavlink2rest: no ATTITUDE (OAKD_MOCK_ATTITUDE=off)")
+        since = max(0.0, clock() - started)
+        period, gap = ATTITUDE_GAP
+        if mode == "gaps" and since % period >= period - gap:
+            since -= since % period - (period - gap)
+        counter = int(since * ATTITUDE_RATE_HZ)
+        sample = counter / ATTITUDE_RATE_HZ
+        roll, pitch = attitude(sample)
+        yaw = math.remainder(ATTITUDE_HEADING_OFFSET + heading(started + sample) - heading(started), math.tau)
+        return {"message": {"type": "ATTITUDE", "time_boot_ms": int(sample * 1000), "roll": roll, "pitch": pitch,
+                            "yaw": yaw, "rollspeed": 0.0, "pitchspeed": 0.0, "yawspeed": 0.0},
+                "status": {"time": {"counter": counter, "last_update": _iso(started + sample)}}}
+    return fetch
 
 
 def dvl_fetch(url, timeout=None, clock=time.time):

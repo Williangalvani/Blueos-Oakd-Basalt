@@ -169,12 +169,14 @@
 </section>
 
 <section class="c12" id="panel-pose">
-  <h2>3D pose <span class="muted">(integrated VIO position and attitude, drifts; drag to orbit, wheel to zoom, right-drag to pan)</span></h2>
+  <h2>3D pose <span class="muted">(integrated VIO position, autopilot attitude; drag to orbit, wheel to zoom, right-drag to pan)</span></h2>
   <div id="pose-root"><div class="muted">loading the 3D viewer…</div></div>
-  <div class="hint">Frame: the body frame at VIO start (x forward, y right, z down; NED with north at the initial
-    heading if the vehicle started level). Red/green/blue = x/y/z, white = camera frustum, orange = trail, dashed
-    blue = depth below or above the start (grid = start depth, 1 m cells). Positions and roll/pitch/yaw are chained
-    from the VIO's deltas, so they drift. <a id="pose-widget-link" href="widget/pose" target="_blank" rel="noopener">3D
+  <div class="hint">Attitude: ArduPilot's ATTITUDE (read from mavlink2rest, "3D Pose Attitude" setting); while it
+    is missing or more than 3 s old, the gyro-integrated attitude, which drifts (the status line says so). Frame:
+    NED from the VIO start position (x north, y east, z down) once the autopilot's attitude has been read, else the
+    body frame at VIO start (start-FRD: x forward, y right, z down). Roll/pitch/yaw in degrees, positions in m.
+    Red/green/blue = x/y/z, white = camera frustum, orange = trail, dashed blue = depth below or above the start
+    (grid = start depth, 1 m cells). Positions are the VIO's deltas chained, so they drift. <a id="pose-widget-link" href="widget/pose" target="_blank" rel="noopener">3D
     pose widget</a>: the same view for Cockpit ("OAK-D VIO 3D pose") or a browser tab.</div>
 </section>
 

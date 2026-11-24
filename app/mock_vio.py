@@ -26,7 +26,9 @@ Published through the real services, at the configured fps:
   camera variants are emulated here; host_jpeg runs the real depth_stream.HostJpegEncoder. With
   --depth-stream-debug a stand-in device takes the log level and logs mock encoder lines;
 - feature_stream.FeatureStreamService: features.json while its lease is held;
-- pose_stream.PoseStreamService: pose.json and pose_trail.json while its lease is held;
+- pose_stream.PoseStreamService: pose.json and pose_trail.json while its lease is held; its attitude from
+  mock_mode.attitude_fetch (an in-process mavlink2rest ATTITUDE with gaps), and its gyro deltas carry
+  mock_mode.GYRO_BIAS so the fallback drifts;
 - snapshots.SnapshotService and depth_probe.DepthProbeService; camera.json;
 - a JSONL data log under --log-dir.
 Nothing is sent anywhere. --algorithm basalt only idles, as Basalt publishes none of this.
@@ -44,6 +46,7 @@ from pathlib import Path
 
 import numpy as np
 
+import autopilot_attitude
 import depth_probe
 import depth_stream
 import feature_stream
@@ -80,6 +83,7 @@ def parse_args(argv=None):
     parser.add_argument("--depth-stream-quality", type=int, default=70)
     parser.add_argument("--depth-stream-encoding", choices=depth_stream.VARIANTS, default=depth_stream.DEFAULT_VARIANT)
     parser.add_argument("--depth-stream-debug", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--pose-attitude-source", choices=pose_stream.ATTITUDE_MODES, default=pose_stream.AUTOPILOT)
     parser.add_argument("--camera-angle", type=float, default=0.0)
     parser.add_argument("--depth-scale", type=float, default=1.0)
     parser.add_argument("--refractive-index", type=float, default=1.333)
@@ -348,6 +352,7 @@ class FakeVio:
             yaw_delta = mock_mode.heading(t) - mock_mode.heading(t - delta_t)
             yaw_delta = (yaw_delta + math.pi) % (2.0 * math.pi) - math.pi
             rotation_delta = body_rotation_delta(t - delta_t - self.started, t - self.started, yaw_delta)
+            rotation_delta[2] += mock_mode.GYRO_BIAS * delta_t
             self.failed_run = 0
             self.last_ok_t = t
         elif reason != "no_reference":
@@ -392,34 +397,44 @@ class FakeVio:
         every = depth_stream.stream_divisor(self.args.fps, self.args.depth_stream_fps)
         min_mm, max_mm = self.depth_range
         requested = self.args.depth_stream_encoding
-        return {"encoding": "gray8-depth-linear", "codec": "mjpeg", "fps_target": self.args.fps / every,
-                "every": every, "camera_fps": self.args.fps, "quality": self.args.depth_stream_quality,
-                "image_size": [self.width, self.height], "depth_range_mm": [min_mm, max_mm],
-                "quantization_mm": 1 << depth_stream.depth_shift(max_mm), "gray_far": depth_stream.GRAY_FAR,
-                "gray_near": depth_stream.GRAY_NEAR, "gray_invalid_below": depth_stream.GRAY_INVALID_BELOW,
-                "requested_variant": requested,
-                "variant": depth_stream.device_variant(requested) or depth_stream.HOST_JPEG,
-                "size_problem": depth_stream.size_problem(self.width, self.height), "mock": True}
+        problem = depth_stream.size_problem(self.width, self.height)
+        variant, reason = depth_stream.resolve_variant(requested, bool(self.stereo["stereo_subpixel"]), problem)
+        info = {"encoding": depth_stream.encoding_for(variant), "codec": "mjpeg",
+                "fps_target": self.args.fps / every, "every": every, "camera_fps": self.args.fps,
+                "quality": self.args.depth_stream_quality, "image_size": [self.width, self.height],
+                "depth_range_mm": [min_mm, max_mm], "quantization_mm": 1 << depth_stream.depth_shift(max_mm),
+                "gray_far": depth_stream.GRAY_FAR, "gray_near": depth_stream.GRAY_NEAR,
+                "gray_invalid_below": depth_stream.GRAY_INVALID_BELOW, "requested_variant": requested,
+                "variant": variant or depth_stream.HOST_JPEG, "variant_reason": reason, "size_problem": problem,
+                "mock": True}
+        if variant == depth_stream.DISPARITY:
+            info["disparity_max"] = depth_stream.DISPARITY_MAX
+            info["disparity"] = depth_stream.disparity_scale(self.scene.fx, BASELINE_M, min_mm, max_mm)
+        return info
 
     def make_depth_stream(self):
         info = self.depth_stream_info()
         host = device_log = debug = None
-        if info["variant"] == depth_stream.HOST_JPEG:
+        if info["variant"] == depth_stream.HOST_JPEG or info["requested_variant"] == depth_stream.AUTO:
             host = depth_stream.HostJpegEncoder(*self.depth_range, self.args.depth_stream_quality, info["every"])
-        else:
+        if info["variant"] != depth_stream.HOST_JPEG:
             device_log = depth_stream.DeviceLog(("Script(4)", "VideoEncoder(5)", "ImageManip(6)"))
             if self.args.depth_stream_debug:
                 self.log_device = MockLogDevice(device_log)
                 debug = depth_stream.DeviceLogDebug(self.log_device, "DEBUG", log=print)
-        return depth_stream.DepthStreamService(self.telemetry_dir, lambda on: None, info, log=print,
-                                               host_encoder=host, device_log=device_log, debug=debug)
+        self.stream = depth_stream.DepthStreamService(self.telemetry_dir, lambda on: None, info, log=print,
+                                                      host_encoder=host, device_log=device_log, debug=debug)
+        return self.stream
 
     def encode_depth(self, t):
         """What the camera's Script + VideoEncoder produce, then the device's timing report every STATS_EVERY."""
         import cv2
         start = time.perf_counter()
         depth = self.scene.depth_image(t, self.offset, self.turbidity(t))
-        gray = depth_stream.gray_reference(depth, *self.depth_range)
+        if self.stream.variant == depth_stream.DISPARITY:
+            gray = depth_stream.gray_disparity_reference(depth, self.scene.fx, BASELINE_M)
+        else:
+            gray = depth_stream.gray_reference(depth, *self.depth_range)
         ok, jpeg = cv2.imencode(".jpg", gray, [cv2.IMWRITE_JPEG_QUALITY, int(self.args.depth_stream_quality)])
         self.last_depth = depth
         if not ok:
@@ -466,7 +481,14 @@ class FakeVio:
                 self.stream = stream = self.make_depth_stream()
             features_out = feature_stream.FeatureStreamService(self.telemetry_dir, (self.width, self.height),
                                                                log=print)
-            self.pose_out = pose_stream.PoseStreamService(self.telemetry_dir, args.camera_angle, log=print)
+            attitude = None
+            if args.pose_attitude_source == pose_stream.AUTOPILOT:
+                attitude = autopilot_attitude.AttitudeSource(
+                    mock_mode.attitude_fetch(self.started, clock=self.clock), clock=self.clock, log=print,
+                    description=f"mock autopilot ATTITUDE ({mock_mode.attitude_mode()})").start()
+            self.pose_out = pose_stream.PoseStreamService(self.telemetry_dir, args.camera_angle, log=print,
+                                                          attitude=attitude)
+            self.telemetry.pose_status = self.pose_out.status
             snapshots.write_camera_status(self.camera_status(), args.snapshot_dir)
             stop.wait(STARTUP_PHASE_S)
             self.telemetry.set_phase("running")
@@ -475,6 +497,8 @@ class FakeVio:
         finally:
             if stream is not None:
                 stream.close()
+            if getattr(self, "pose_out", None) is not None:
+                self.pose_out.close()
             if writer is not None:
                 writer.close()
             self.telemetry.close()

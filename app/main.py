@@ -134,6 +134,13 @@ def telemetry_dir() -> Path:
     return Path(TELEMETRY_DIR) if TELEMETRY_DIR is not None else vio_telemetry.DEFAULT_DIR
 
 
+def saved_choice(config: dict, key: str) -> str:
+    """A saved choice, or its default if a hand-edited config.json has something else."""
+    field = config_schema.FIELDS_BY_KEY[key]
+    value = config.get(key)
+    return value if value in field.choices else field.default
+
+
 def saved_depth_stream_encoding(config: dict) -> str:
     value = config.get("depth_stream_encoding")
     return value if value in depth_stream.VARIANTS else DEFAULT_CONFIG["depth_stream_encoding"]
@@ -163,6 +170,7 @@ def build_vio_command(config: dict) -> list:
             "--depth-stream-quality", str(saved_number(config, "depth_stream_quality")),
             "--depth-stream-encoding", saved_depth_stream_encoding(config),
             "--depth-stream-debug" if config.get("depth_stream_debug") else "--no-depth-stream-debug",
+            "--pose-attitude-source", saved_choice(config, "pose_attitude_source"),
             "--telemetry-dir", str(telemetry_dir()),
             "--intrinsics-from", config.get("intrinsics_from") or "rectified",
             "--depth-scale", str(float(config.get("depth_scale", 1.0))),
@@ -409,6 +417,16 @@ def camera_connected(telemetry: Optional[dict]):
     return age is not None and age <= CAMERA_FRAME_TIMEOUT_S
 
 
+def pose_status(config: dict, telemetry: Optional[dict]) -> dict:
+    """
+    The 3D pose viewer's attitude: configured_source (pose_attitude_source) and what the VIO process uses
+    (pose_stream.PoseStreamService.status: frame, attitude_source "autopilot" or "gyro", attitude_age_s of the
+    autopilot's ATTITUDE, switches, the autopilot reader's counters); only the setting while it is not running.
+    """
+    live = telemetry.get("pose") if telemetry and not telemetry["stale"] else None
+    return {"configured_source": saved_choice(config, "pose_attitude_source"), **(live or {})}
+
+
 def depth_stream_status(config: dict, process_status: dict, now: float) -> dict:
     """
     The depth stream setting and what the VIO process last published about it (stale if from another run).
@@ -453,6 +471,7 @@ def get_status():
         "camera": snapshots.read_camera_status(SNAPSHOT_DIR),
         "algorithm": config.get("algorithm"),
         "depth_stream": depth_stream_status(config, process, now),
+        "pose": pose_status(config, telemetry),
         "telemetry": telemetry,
         "camera_connected": camera_connected(telemetry),
         "chip_temperature_c": telemetry.get("chip_temperature_c") if telemetry and not telemetry["stale"] else None,
@@ -737,10 +756,14 @@ async def pose_events(directory: Path, limit: int):
 async def stream_pose(events: int = Query(0, ge=0, le=100000)):
     """
     text/event-stream for the 3D pose viewer (main page panel and /widget/pose). "pose": the VIO's integrated
-    pose, at most pose_stream.RATE_HZ (10) per second: x, y, z (m) and roll, pitch, yaw (rad, ZYX) plus q
-    [w, x, y, z] in the "start-FRD" frame (the body frame at VIO start: x forward, y right, z down).
-    "trail": the recent path, [t, x, y, z] points. "status": the widget status line once a second. Always
-    200; the VIO process only publishes while a client is connected. events > 0 stops after that many.
+    pose, at most pose_stream.RATE_HZ (10) per second: x, y, z (m), roll, pitch, yaw (radians, ZYX),
+    roll_deg, pitch_deg, yaw_deg (the same in degrees) and q [w, x, y, z], in `frame`: "NED" (from the VIO
+    start position, x north, y east, z down; once the autopilot's ATTITUDE has been read) or "start-FRD"
+    (the body frame at VIO start: x forward, y right, z down). attitude_source is "autopilot" (ArduPilot
+    ATTITUDE, attitude_age_s old) or "gyro" (gyro-integrated, drifting); see pose_stream. "trail": the recent
+    path, [t, x, y, z] points, sent again when its epoch changes (VIO restart, start-FRD -> NED). "status":
+    the widget status line once a second. Always 200; the VIO process only publishes while a client is
+    connected. events > 0 stops after that many.
     """
     directory = telemetry_dir()
     pose_stream.touch_lease(directory)

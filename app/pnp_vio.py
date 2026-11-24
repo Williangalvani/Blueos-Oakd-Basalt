@@ -26,6 +26,7 @@ from loguru import logger
 import depth_probe
 import depth_stream
 import feature_stream
+import autopilot_attitude
 import pose_stream
 import snapshots
 import vio_telemetry
@@ -146,14 +147,20 @@ def parse_args(argv=None):
     parser.add_argument('--depth-stream-quality', type=_argument_type(parse_stream_quality), default=70,
                         help='Depth stream JPEG quality, 1-100')
     parser.add_argument('--depth-stream-encoding', choices=depth_stream.VARIANTS, default=depth_stream.DEFAULT_VARIANT,
-                        help='Where and how the depth stream is encoded (see depth_stream.py): manip (ImageManip '
-                             'converts to NV12 for the camera encoder), nv12 or yuv400p (the Script builds the '
-                             'encoder frame), host_jpeg (the Pi encodes), auto (manip, then host_jpeg if the '
-                             'camera encoder outputs nothing)')
+                        help='Where and how the depth stream is encoded (see depth_stream.py): disparity (the '
+                             'StereoDepth disparity through ImageManip to the camera encoder; needs stereo '
+                             'subpixel off), manip (a Script GRAY8 frame through ImageManip), nv12 or yuv400p '
+                             '(the Script builds the encoder frame), host_jpeg (the Pi encodes), auto (disparity, '
+                             'then host_jpeg if the camera sends no or blank frames; host_jpeg at once with '
+                             'subpixel on)')
     parser.add_argument('--depth-stream-debug', action=argparse.BooleanOptionalAction, default=False,
                         help='While the depth stream runs, raise the camera log level to DEBUG; the stream nodes\' '
                              'log lines appear in /api/status depth_stream.device_log')
 
+    parser.add_argument('--pose-attitude-source', choices=pose_stream.ATTITUDE_MODES, default='autopilot',
+                        help='Attitude of the 3D pose viewer: autopilot (ArduPilot ATTITUDE read from '
+                             'mavlink2rest, the gyro-integrated attitude while it is missing or stale) or gyro '
+                             '(gyro-integrated only, drifts). The MAVLink output never uses it')
     parser.add_argument('--vehicle-ip', default='127.0.0.1')
     parser.add_argument('--quality-rate', type=float, default=1.0)
     parser.add_argument('--device-timeout', type=float, default=DEFAULT_TIMEOUT,
@@ -451,11 +458,16 @@ def node_log_name(node):
 
 def build_depth_stream(p, stereo, args, stereo_settings):
     """
-    Script node gate + 8-bit conversion of stereo.depth (depth_stream.device_script) feeding an MJPEG
-    VideoEncoder, directly (nv12, yuv400p) or through an ImageManip that converts the Script's GRAY8 frame
-    to NV12 (manip, and auto at the start). The Script waits on its control input until the host enables
-    it, then forwards every n-th frame; the encoder and host queues are non-blocking, so a slow consumer
-    only drops stream frames. The Script's 'status' output carries its errors and timing
+    Script node gate (depth_stream.device_script) feeding an MJPEG VideoEncoder, the Script waiting on its
+    control input until the host enables it, then passing every n-th frame on:
+    - disparity (auto at the start, stereo subpixel off): stereo.disparity (RAW8 px) -> the Script forwards
+      the frame unchanged -> ImageManip (to NV12) -> VideoEncoder. Every frame the encoder path sees comes
+      from a firmware pool (StereoDepth's, then ImageManip's);
+    - manip: stereo.depth -> the Script converts to a GRAY8 frame -> ImageManip (NV12) -> VideoEncoder;
+    - nv12, yuv400p: stereo.depth -> the Script builds the encoder's frame -> VideoEncoder.
+    The Script-made frames have no pool: on an OAK-D-W ImageManip made them a constant image and the
+    encoder dropped them (test12); they stay for diagnosis. The encoder and host queues are non-blocking,
+    so a slow consumer only drops stream frames. The Script's 'status' output carries its errors and timing
     (depth_stream.parse_device_status). host_jpeg adds nothing on the camera (the queues are None).
 
     Returns (control queue, JPEG queue, status queue, info, node log names).
@@ -464,28 +476,31 @@ def build_depth_stream(p, stereo, args, stereo_settings):
     fps = args.fps / every
     min_mm, max_mm = stereo_settings["stereo_depth_min_mm"], stereo_settings["stereo_depth_max_mm"]
     requested = args.depth_stream_encoding
-    variant = depth_stream.device_variant(requested)
     problem = depth_stream.size_problem(args.width, args.height)
-    if problem and requested == depth_stream.AUTO:
-        variant = None
+    variant, reason = depth_stream.resolve_variant(requested, bool(stereo_settings["stereo_subpixel"]), problem)
     shift = depth_stream.depth_shift(max_mm)
-    info = {"encoding": "gray8-depth-linear", "codec": "mjpeg", "fps_target": fps, "every": every,
+    info = {"encoding": depth_stream.encoding_for(variant), "codec": "mjpeg", "fps_target": fps, "every": every,
             "camera_fps": args.fps, "quality": args.depth_stream_quality, "image_size": [args.width, args.height],
             "depth_range_mm": [min_mm, max_mm], "quantization_mm": 1 << shift,
             "gray_far": depth_stream.GRAY_FAR, "gray_near": depth_stream.GRAY_NEAR,
             "gray_invalid_below": depth_stream.GRAY_INVALID_BELOW, "requested_variant": requested,
-            "variant": variant or depth_stream.HOST_JPEG, "size_problem": problem}
+            "variant": variant or depth_stream.HOST_JPEG, "variant_reason": reason, "size_problem": problem}
     if variant is None:
         return None, None, None, info, ()
 
+    frame_type = depth_stream.SCRIPT_FRAME_TYPES[variant]
     script = p.create(dai.node.Script)
-    stereo.depth.link(script.inputs["depth"])
+    (stereo.disparity if variant == depth_stream.DISPARITY else stereo.depth).link(script.inputs["depth"])
     script.inputs["depth"].setBlocking(False)
     script.inputs["depth"].setMaxSize(1)
     script.inputs["control"].setBlocking(False)
     script.inputs["control"].setMaxSize(4)
-    script.setScript(depth_stream.device_script(every, min_mm, max_mm,
-                                                frame_type=depth_stream.SCRIPT_FRAME_TYPES[variant]))
+    script.setScript(depth_stream.device_script(every, min_mm, max_mm, frame_type=frame_type))
+    if variant == depth_stream.DISPARITY:
+        try:
+            info["disparity_max"] = int(stereo.initialConfig.getMaxDisparity())
+        except Exception:
+            info["disparity_max"] = depth_stream.DISPARITY_MAX
 
     encoder = p.create(dai.node.VideoEncoder)
     encoder.setDefaultProfilePreset(fps, dai.VideoEncoderProperties.Profile.MJPEG)
@@ -493,7 +508,7 @@ def build_depth_stream(p, stereo, args, stereo_settings):
     encoder.input.setBlocking(False)
     encoder.input.setMaxSize(1)
     nodes = [script, encoder]
-    if variant == depth_stream.MANIP:
+    if variant in (depth_stream.MANIP, depth_stream.DISPARITY):
         manip = p.create(dai.node.ImageManip)
         manip.initialConfig.setFrameType(dai.ImgFrame.Type.NV12)
         manip.setMaxOutputFrameSize(depth_stream.manip_output_size(args.width, args.height))
@@ -554,8 +569,12 @@ def build_pipeline(p, device, args, stereo_settings):
         (handles.depth_stream_control_queue, handles.depth_stream_queue, handles.depth_stream_status_queue,
          handles.depth_stream_info, handles.depth_stream_nodes) = build_depth_stream(p, stereo, args, stereo_settings)
     # One extra frame per stereo output pool for the frame each gate queue holds, plus the one the
-    # depth stream Script is converting
-    extra = (1 if args.snapshots else 0) + (2 if handles.depth_stream_control_queue is not None else 0)
+    # depth stream Script is converting; the disparity variant's Script forwards StereoDepth's own frame,
+    # which then also waits in (and is read by) ImageManip
+    stream_extra = 0
+    if handles.depth_stream_control_queue is not None:
+        stream_extra = 3 if handles.depth_stream_info.get("variant") == depth_stream.DISPARITY else 2
+    extra = (1 if args.snapshots else 0) + stream_extra
     if extra:
         stereo.setNumFramesPool(STEREO_FRAMES_POOL + extra)
     return handles
@@ -689,7 +708,12 @@ def run_pipeline(args, log_only, data_log, stereo_settings, telemetry):
         logger.info(message)
         data_log.event("device_open", message=message)
 
-    pose_out = pose_stream.PoseStreamService(telemetry.directory, args.camera_angle, log=logger.info)
+    attitude = None
+    if args.pose_attitude_source == pose_stream.AUTOPILOT:
+        attitude = autopilot_attitude.from_mavlink2rest(args.vehicle_ip, log=logger.info)
+    pose_out = pose_stream.PoseStreamService(telemetry.directory, args.camera_angle, log=logger.info,
+                                             attitude=attitude)
+    telemetry.pose_status = pose_out.status
     reconnects = 0
     try:
         while True:
@@ -713,6 +737,7 @@ def run_pipeline(args, log_only, data_log, stereo_settings, telemetry):
             telemetry.set_phase("opening_device", reconnects=reconnects,
                                 last_reconnect={"unix_time": time.time(), "reason": reason})
     finally:
+        pose_out.close()
         if mavlink:
             mavlink.close()
 
@@ -793,6 +818,12 @@ def run_session(device, args, log_only, data_log, stereo_settings, telemetry, ma
                 handles.depth_stream_control_queue.send(control)
 
             info = handles.depth_stream_info
+            if info and info.get("variant") == depth_stream.DISPARITY:
+                # The camera's depth = rectified fx * baseline / disparity
+                focal = (rectified or calibration.raw).fx
+                info["disparity"] = depth_stream.disparity_scale(
+                    focal, calibration.baseline_m, *info["depth_range_mm"],
+                    info.get("disparity_max", depth_stream.DISPARITY_MAX))
             if info:
                 on_camera = handles.depth_stream_control_queue is not None
                 host = device_log = debug = None
@@ -817,6 +848,8 @@ def run_session(device, args, log_only, data_log, stereo_settings, telemetry, ma
                             f"{info.get('requested_variant')}){', camera debug log while streaming' if debug else ''}")
                 if info.get("size_problem"):
                     log_warning(f"Depth stream: {info['size_problem']}")
+                elif info.get("variant_reason") and info.get("requested_variant") != depth_stream.AUTO:
+                    log_warning(f"Depth stream: {info['variant_reason']}")
             data_log.event("depth_stream", enabled=stream is not None, debug=args.depth_stream_debug, **info)
             features_out = feature_stream.FeatureStreamService(telemetry.directory, (args.width, args.height),
                                                                log=logger.info)

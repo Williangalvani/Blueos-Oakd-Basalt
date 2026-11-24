@@ -91,6 +91,7 @@ def widget_status(problem, telemetry, depth, log_only, now, mock=False):
     output = telemetry.get("output") or {}
     failure = telemetry.get("last_failure")
     depth = depth or {}
+    pose = telemetry.get("pose") or {}
     return {
         "server_time": now,
         "problem": problem,
@@ -111,5 +112,8 @@ def widget_status(problem, telemetry, depth, log_only, now, mock=False):
         "mock": bool(mock),
         "depth": {key: depth.get(key) for key in (
             "enabled", "streaming", "fps", "fps_target", "image_size", "depth_range_mm", "gray_far", "gray_near",
-            "gray_invalid_below", "errors", "last_error", "encoder_stalled", "variant", "encoded_on", "fallback")},
+            "gray_invalid_below", "errors", "last_error", "encoder_stalled", "variant", "encoded_on", "fallback",
+            "encoding", "disparity", "blank")},
+        "pose": {key: pose.get(key) for key in ("frame", "frame_text", "attitude_source", "attitude_text",
+                                                 "attitude_age_s")} if pose else None,
     }

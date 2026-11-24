@@ -36,20 +36,39 @@ function jet(x) {
   return [c(1.5 - Math.abs(4 * x - 3)), c(1.5 - Math.abs(4 * x - 2)), c(1.5 - Math.abs(4 * x - 1))];
 }
 
+// d.encoding "gray8-depth-linear": gray linear in depth (gray_far at max_mm .. gray_near at min_mm);
+// "gray8-disparity": gray = disparity in px, depth_mm = d.disparity.depth_times_disparity / gray. 0 = no depth.
 function streamScale(d) {
   const range = (d && d.depth_range_mm) || [300, 4000];
-  return { min: range[0], max: range[1], far: (d && d.gray_far) || 16, near: (d && d.gray_near) || 255,
+  const disparity = d && d.encoding === 'gray8-disparity' && d.disparity;
+  if (disparity && disparity.depth_times_disparity > 0) {
+    return { kind: 'disparity', min: range[0], max: range[1], far: disparity.gray_far, near: disparity.gray_near,
+             invalid: disparity.gray_invalid_below || 3, k: disparity.depth_times_disparity };
+  }
+  return { kind: 'depth', min: range[0], max: range[1], far: (d && d.gray_far) || 16, near: (d && d.gray_near) || 255,
            invalid: (d && d.gray_invalid_below) || 8 };
 }
 
+function grayDepth(scale, g) {
+  if (g < scale.invalid) return NaN;
+  if (scale.kind === 'disparity') return scale.k / g;
+  return scale.max - (scale.max - scale.min) * (g - scale.far) / (scale.near - scale.far);
+}
+
+// Colour of a depth (mm): jet near red .. far blue, or (no COLORIZE) gray near bright
+function depthColor(scale, mm) {
+  if (Number.isNaN(mm)) return [0, 0, 0];
+  const x = (scale.max - mm) / (scale.max - scale.min);
+  if (COLORIZE) return jet(x);
+  const g = Math.round(16 + 239 * Math.max(0, Math.min(1, x)));
+  return [g, g, g];
+}
+
 function depthLut(scale) {
-  const key = [scale.far, scale.near, scale.invalid, COLORIZE].join(',');
+  const key = [scale.kind, scale.far, scale.near, scale.invalid, scale.k, scale.min, scale.max, COLORIZE].join(',');
   if (w.lutKey === key) return w.lut;
   const lut = new Uint8ClampedArray(256 * 3);
-  for (let g = 0; g < 256; g++) {
-    const rgb = g < scale.invalid ? [0, 0, 0] : COLORIZE ? jet((g - scale.far) / (scale.near - scale.far)) : [g, g, g];
-    lut.set(rgb, g * 3);
-  }
+  for (let g = 0; g < 256; g++) lut.set(depthColor(scale, grayDepth(scale, g)), g * 3);
   w.lut = lut;
   w.lutKey = key;
   return lut;
@@ -57,10 +76,9 @@ function depthLut(scale) {
 
 function drawLegend(scale) {
   const canvas = $('depth-legend'), ctx = canvas.getContext('2d');
-  const lut = depthLut(scale), image = ctx.createImageData(canvas.width, 1);
+  const image = ctx.createImageData(canvas.width, 1);
   for (let i = 0; i < canvas.width; i++) {
-    const g = Math.round(scale.near - (scale.near - scale.far) * i / (canvas.width - 1));
-    image.data.set(lut.subarray(g * 3, g * 3 + 3), i * 4);
+    image.data.set(depthColor(scale, scale.min + (scale.max - scale.min) * i / (canvas.width - 1)), i * 4);
     image.data[i * 4 + 3] = 255;
   }
   ctx.putImageData(image, 0, 0);
@@ -264,10 +282,20 @@ function renderStatus(s) {
     const stalled = span('depth: ' + (d.encoded_on === 'pi' ? 'Pi' : 'camera') + ' encoder outputs nothing', 'bad');
     if (d.last_error) stalled.title = d.last_error.text;
     parts.push(stalled);
+  } else if (!s.problem && d.blank && d.encoded_on !== 'pi') {
+    const blank = span('depth: blank frames from ' + d.blank.variant, 'bad');
+    blank.title = d.blank.text;
+    parts.push(blank);
   } else if (!s.problem && d.streaming && d.encoded_on === 'pi') {
-    const pi = span('depth: encoded on the Pi', 'muted');
-    if (d.fallback) pi.title = 'fell back from ' + d.fallback.from + ': ' + d.fallback.reason;
+    const pi = span('depth: encoded on the Pi' + (d.fallback ? ' (fallback: ' + d.fallback.reason + ')' : ''), 'muted');
+    if (d.fallback && d.fallback.detail) pi.title = d.fallback.detail;
     parts.push(pi);
+  }
+  const pose = s.pose;
+  if (!s.problem && pose && pose.attitude_source === 'gyro') {
+    const gyro = span('3D pose attitude: gyro-integrated, drifting', 'warn');
+    gyro.title = pose.frame_text || '';
+    parts.push(gyro);
   }
   line.replaceChildren(...parts);
 

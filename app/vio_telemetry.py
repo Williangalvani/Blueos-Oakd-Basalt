@@ -170,17 +170,19 @@ class Telemetry:
     """
     VIO process side. record_frame() per frame; start() runs the publisher thread, close() stops it.
     temperature() returns the chip temperature in °C (or raises); output_error() the MAVLink sender's
-    last error. Both are called on the publisher thread only.
+    last error; pose_status() the 3D pose's attitude source (pose_stream.PoseStreamService.status). All are
+    called on the publisher thread only.
     """
 
     def __init__(self, directory=DEFAULT_DIR, fps=10, min_inliers=15, mode="sending", temperature=None,
-                 output_error=None, clock=time.time, log=print):
+                 output_error=None, pose_status=None, clock=time.time, log=print):
         self.directory = Path(directory)
         self.fps = fps
         self.min_inliers = min_inliers
         self.mode = mode
         self.temperature = temperature
         self.output_error = output_error
+        self.pose_status = pose_status
         self.clock = clock
         self.log = log
         self.phase = "starting"
@@ -305,6 +307,10 @@ class Telemetry:
             output_error = self.output_error() if self.output_error is not None else None
         except Exception as e:
             output_error = str(e)
+        try:
+            pose = self.pose_status() if self.pose_status is not None else None
+        except Exception as e:
+            pose = {"error": str(e)}
         return {
             "pid": os.getpid(),
             "unix_time": now,
@@ -327,6 +333,7 @@ class Telemetry:
             "chip_temperature_c": self.chip_temperature,
             "chip_temperature_at": self.chip_temperature_at,
             "trajectory": {"x": position[0], "y": position[1], "yaw": position[2]},
+            "pose": pose,
             "history": {"rows": self.history.count, "capacity": self.history.capacity, "bytes": self.history.nbytes,
                         "seconds": HISTORY_SECONDS},
         }

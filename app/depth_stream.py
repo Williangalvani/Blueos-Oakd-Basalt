@@ -9,17 +9,42 @@ VideoEncoder node encodes it as MJPEG and only the JPEG crosses the link. The VI
 to DIRECTORY/depth_stream.jpg; main.py forwards it as multipart/x-mixed-replace. The browser colorizes
 the gray image.
 
-Encoding variants (depth_stream_encoding, VARIANTS), all with the same gray scale:
-    manip      Script -> GRAY8 frame -> ImageManip (to NV12) -> VideoEncoder. The encoder gets a frame the
-               firmware allocated itself: explicit stride, plane offsets, aligned pool buffer.
-    nv12       Script -> NV12 frame (the gray plane + a 128 chroma plane, w*h*3/2 bytes) -> VideoEncoder
-    yuv400p    Script -> YUV400p frame (w*h bytes) -> VideoEncoder
+Encoding variants (depth_stream_encoding, VARIANTS):
+    disparity  stereo.disparity -> Script (gate only: forwards StereoDepth's own frame) -> ImageManip (to
+               NV12) -> VideoEncoder. Needs stereo_subpixel off (then the disparity is RAW8, 0..95);
+               image: the disparity itself (DISPARITY_ENCODING, see "Disparity encoding" below)
+    manip      Script -> GRAY8 frame -> ImageManip (to NV12) -> VideoEncoder. Blank on test12 (see below)
+    nv12       Script -> NV12 frame (the gray plane + a 128 chroma plane, w*h*3/2 bytes) -> VideoEncoder.
+               No output on test12
+    yuv400p    Script -> YUV400p frame (w*h bytes) -> VideoEncoder. No output on test12
     host_jpeg  nothing extra on the camera: the VIO process converts the depth frame it already has and
                JPEG-encodes it on a worker thread (HostJpegEncoder), capped at HOST_CPU_BUDGET of a core
-    auto       (default) manip, switching to host_jpeg for the rest of the run if the encoder stalls
-The Script variants build their frame with the Script runtime's ImgFrame API (DEVICE_IMGFRAME_API), which
-has no setStride: the host library's v3 ImgFrame leaves fb.stride at 0 unless set, so a Script frame may
-reach the encoder without a stride. ImageManip writes stride and plane offsets itself.
+    auto       (default) disparity when stereo_subpixel is off, else host_jpeg from the start (with the
+               reason in the metadata's fallback); switches to host_jpeg for the rest of the run if the
+               encoder stalls or its frames are blank
+manip, nv12 and yuv400p (gray8-depth-linear, DEPTH_ENCODING) build their frame with the Script runtime's
+ImgFrame API (DEVICE_IMGFRAME_API). They are kept for diagnosis.
+
+Why only disparity can work on the camera (firmware a406121b strings, depthai-core v3.3.0 source, test12):
+- A Script's new ImgFrame comes from a DynamicPool of size 0. ImageManip (PlgImageManipV2) needs an input
+  pool of at least 2 ("Pool size of the input message is too small... Currently it is 0") and then sends a
+  constant image (test12: every JPEG 4668 bytes, every pixel 1). The VideoEncoder drops pool-less frames
+  with no log (test12: nv12 and yuv400p, 0 bytes).
+- StereoDepth's outputs come from its own pools (StereoDepth.setNumFramesPool, default 3; the pipeline
+  raises it), so a Script that forwards the frame it received (`node.io[...].send(frame)` with the same
+  object) keeps that pool. Not verified on hardware yet: if ImageManip still reports the pool error with
+  the disparity variant, blank detection falls back and the next thing to try is gating ImageManip through
+  its inputConfig instead of a Script.
+- ImageManip converts RAW8 / GRAY8 to NV12 (copies Y, chroma 128); it does not convert RAW16. stereo.depth
+  and the subpixel disparity are RAW16, so only the 8-bit disparity (subpixel off, extended off) fits.
+The disparity output is assumed to carry the same threshold and post-processing filters as stereo.depth
+(depthai applies them in the disparity domain before converting to depth).
+
+Disparity encoding (DISPARITY_ENCODING, disparity_scale): gray = disparity in pixels, 0..max_disparity
+(95), invalid = 0, so depth_mm = focal_px * baseline_mm / gray. Near is bright; far is dark and coarse
+(each gray level is one pixel of disparity: at 4 m and 75 mm baseline with fx 440, about 0.5 m per level).
+The page computes its legend from the scale in the metadata; GRAY_INVALID_BELOW for this encoding is
+DISPARITY_INVALID_BELOW (3), as JPEG rings around 0.
 
 VideoEncoder (MJPEG) input requirements, from the RVC2 firmware a406121b (depthai-core v3.3.0) strings and
 asserts of its PlgVidEnc and the depthai-core source:
@@ -39,7 +64,8 @@ asserts of its PlgVidEnc and the depthai-core source:
 - with the debug log level it logs "VideoEncoder took '{}' ms." per frame (depth_stream_debug).
 WIDTH_ALIGN and HEIGHT_ALIGN check the size before building the pipeline.
 
-8-bit encoding (linear in depth over the stereo threshold range, near bright):
+8-bit depth encoding (DEPTH_ENCODING: manip, nv12, yuv400p, host_jpeg; linear in depth over the stereo
+threshold range, near bright):
     0                      invalid (no depth, or outside min_mm..max_mm, as the VIO sees it)
     GRAY_FAR..GRAY_NEAR    max_mm (far) .. min_mm (near)
 Depth is quantised to 2**shift mm before the mapping (16 mm for the default 4 m range). JPEG ringing
@@ -54,6 +80,12 @@ output, and while streaming its count of frames sent about once a second; the VI
 DIRECTORY/depth_stream.json, which /api/status serves. The encoder drops frames it can't take with only a
 device log warning, so the VIO process flags the stream (encoder_stalled) when the Script keeps sending and
 no JPEG comes back. HostJpegEncoder sends the same reports, so the flag works for every variant.
+Blank frames (blank): for a camera variant, frames byte-identical to the previous one or with a gray
+standard deviation below BLANK_STD, for BLANK_S and at least BLANK_MIN_SAMPLES samples, while the host's
+own depth (stereo.depth, sampled every EXPECT_INTERVAL_S) has valid pixels that vary. A view with no depth
+or one flat depth is constant and right, so it is not blank. auto falls back to host_jpeg ("blank frames
+from <variant>"); an explicit variant only reports it. Between them, encoder_stalled (no JPEG) and blank
+(useless JPEGs) cover what test12 saw from every camera variant.
 
 Device log: DeviceLog keeps the camera's log lines (VideoEncoder, ImageManip and the stream Script first),
 which the metadata carries. With depth_stream_debug, DeviceLogDebug raises the device log level to DEBUG
@@ -94,6 +126,20 @@ PROGRESS_EVERY = 5
 ENCODER_STALL_S = 3.0
 ENCODER_REPORT_GAP = 2.5
 ENCODER_STALL_TEXT = "camera converts frames but the encoder outputs nothing"
+# Blank frames (test12: ImageManip fed a pool-less Script frame outputs a constant image): a camera JPEG is
+# constant if it is byte-identical to the previous one, or decodes (at most every BLANK_SAMPLE_S) to a
+# gray standard deviation under BLANK_STD. The stream is blank after constant JPEGs for BLANK_S (at least
+# BLANK_MIN_SAMPLES of them) while the host's own depth (sampled every EXPECT_INTERVAL_S, at most
+# EXPECT_MAX_AGE_S old) says the image should vary: at least EXPECT_VALID_MIN of it valid and a gray
+# standard deviation of EXPECT_GRAY_STD_MIN. A covered lens or an empty view is not blank.
+BLANK_S = 2.0
+BLANK_MIN_SAMPLES = 3
+BLANK_SAMPLE_S = 0.5
+BLANK_STD = 0.75
+EXPECT_INTERVAL_S = 1.0
+EXPECT_MAX_AGE_S = 3.0
+EXPECT_VALID_MIN = 0.05
+EXPECT_GRAY_STD_MIN = 3.0
 # ImgFrame methods of the Script runtime in the RVC2 firmware (depthai 3.3.0, device side a406121b);
 # a subset of the host's dai.ImgFrame. Its constructor is ImgFrame(size in bytes).
 DEVICE_IMGFRAME_API = frozenset({
@@ -108,11 +154,22 @@ DEVICE_ENCODER_INPUT_TYPES = frozenset({"NV12", "YUV400p"})
 WIDTH_ALIGN = 32
 HEIGHT_ALIGN = 2
 
-AUTO, MANIP, NV12, YUV400P, HOST_JPEG = "auto", "manip", "nv12", "yuv400p", "host_jpeg"
-VARIANTS = (AUTO, MANIP, NV12, YUV400P, HOST_JPEG)
+AUTO, DISPARITY, MANIP, NV12, YUV400P, HOST_JPEG = "auto", "disparity", "manip", "nv12", "yuv400p", "host_jpeg"
+VARIANTS = (AUTO, DISPARITY, MANIP, NV12, YUV400P, HOST_JPEG)
 DEFAULT_VARIANT = AUTO
-# The frame type the Script builds for each variant that runs on the camera
-SCRIPT_FRAME_TYPES = {MANIP: "GRAY8", NV12: "NV12", YUV400P: "YUV400p"}
+# The frame type the Script builds for each variant that runs on the camera (None: it forwards the
+# StereoDepth frame unchanged)
+SCRIPT_FRAME_TYPES = {DISPARITY: None, MANIP: "GRAY8", NV12: "NV12", YUV400P: "YUV400p"}
+CAMERA_VARIANTS = tuple(SCRIPT_FRAME_TYPES)
+# What the gray values mean (info "encoding")
+DEPTH_ENCODING, DISPARITY_ENCODING = "gray8-depth-linear", "gray8-disparity"
+# StereoDepth's disparity search range without subpixel and extended disparity (stereo_config sets
+# extended off): RAW8 0..95, 0 = invalid
+DISPARITY_MAX = 95
+# Disparity gray below this is invalid (0) or JPEG ringing around it: under 3 px is > 10 m on an OAK-D
+DISPARITY_INVALID_BELOW = 3
+SUBPIXEL_PROBLEM = ("the disparity variant needs stereo Subpixel off: with subpixel the disparity is RAW16, "
+                    "which ImageManip cannot convert for the encoder")
 # host_jpeg: at most this fraction of one Pi core on average
 HOST_CPU_BUDGET = 0.25
 HOST_STATS_EVERY = 50
@@ -129,10 +186,54 @@ STREAM_NODE_TYPES = ("VideoEncoder", "ImageManip")
 
 
 def device_variant(variant):
-    """The variant that runs on the camera at the start (auto starts with manip), None for host_jpeg."""
+    """The variant that runs on the camera at the start (auto starts with disparity), None for host_jpeg."""
     if variant == AUTO:
-        return MANIP
+        return DISPARITY
     return variant if variant in SCRIPT_FRAME_TYPES else None
+
+
+def resolve_variant(requested, subpixel=False, problem=None):
+    """
+    (variant built at the start, None for host_jpeg; why it is not the requested one, or None). auto: disparity,
+    or host_jpeg straight away if the size does not suit the encoder or stereo subpixel is on (the Script-made
+    manip/nv12/yuv400p frames came out blank or not at all on an OAK-D-W, test12). An explicit disparity request
+    with subpixel on also runs as host_jpeg; the other explicit variants are built as asked (diagnosis).
+    """
+    variant = device_variant(requested)
+    if requested == AUTO and problem:
+        return None, problem
+    if variant == DISPARITY and subpixel:
+        return None, SUBPIXEL_PROBLEM
+    return variant, None
+
+
+def encoding_for(variant):
+    return DISPARITY_ENCODING if variant == DISPARITY else DEPTH_ENCODING
+
+
+def disparity_scale(focal_px, baseline_m, min_mm, max_mm, max_disparity=DISPARITY_MAX):
+    """
+    The disparity variant's gray scale: gray = disparity in pixels (0 invalid), depth_mm = depth_times_disparity
+    / gray, as the camera computes depth (rectified focal length x baseline). gray_far / gray_near are the
+    disparities at max_mm / min_mm (near clamped to max_disparity, the closest the search range reaches).
+    """
+    k = float(focal_px) * float(baseline_m) * 1000.0
+    if not (k > 0):
+        return None
+    return {"focal_px": round(float(focal_px), 3), "baseline_m": round(float(baseline_m), 5),
+            "depth_times_disparity": round(k, 1), "max_disparity": int(max_disparity),
+            "gray_far": round(k / max(float(max_mm), 1.0), 2),
+            "gray_near": round(min(k / max(float(min_mm), 1.0), float(max_disparity)), 2),
+            "nearest_mm": round(k / max_disparity), "gray_invalid_below": DISPARITY_INVALID_BELOW}
+
+
+def gray_disparity_reference(depth_mm, focal_px, baseline_m, max_disparity=DISPARITY_MAX):
+    """The disparity variant's image for a uint16 depth image (numpy): round(f * B / depth), 0 invalid."""
+    depth = np.asarray(depth_mm, dtype=np.float64)
+    k = float(focal_px) * float(baseline_m) * 1000.0
+    with np.errstate(divide="ignore"):
+        disparity = np.where(depth > 0, np.round(k / np.maximum(depth, 1.0)), 0)
+    return np.clip(disparity, 0, max_disparity).astype(np.uint8)
 
 
 def size_problem(width, height):
@@ -242,7 +343,9 @@ def device_script(every, min_mm, max_mm, chunk_rows=CHUNK_ROWS, stats_every=150,
     'status' (Buffer, see parse_device_status) for the host. Plain CPython builtins only.
 
     frame_type (SCRIPT_FRAME_TYPES): "YUV400p" (w*h bytes) or "NV12" (the gray plane then a 128 chroma
-    plane, w*h*3/2 bytes) for the VideoEncoder, "GRAY8" (w*h bytes) for ImageManip.
+    plane, w*h*3/2 bytes) for the VideoEncoder, "GRAY8" (w*h bytes) for ImageManip. None (FORWARD, the
+    disparity variant): a gate only, the received frame is sent on unchanged (the same message, so it keeps
+    its pool buffer and metadata; min_mm and max_mm are not used).
 
     Only the on-device message API (the RVC2 firmware's Script bindings, not the host's): ImgFrame(size in
     bytes) and Buffer(size in bytes), each filled with setData; ImgFrame.setType/setWidth/setHeight (no
@@ -255,6 +358,26 @@ def device_script(every, min_mm, max_mm, chunk_rows=CHUNK_ROWS, stats_every=150,
     report_interval, and (status and node.warn) its conversion time every stats_every frames: the
     measured on-device cost.
     """
+    if frame_type is None:
+        convert = [
+            "        width = frame.getWidth()",
+            "        height = frame.getHeight()",
+            "        out = frame",
+        ]
+    else:
+        convert = [
+            "        try:",
+            "            width, height, gray = to_gray(frame)",
+            "            out = gray_frame(width, height, gray)",
+            "        except Exception as e:",
+            "            failed('convert', e)",
+            "            frame = None",
+            "            continue",
+            "        try:",
+            "            copy_metadata(frame, out)",
+            "        except Exception as e:",
+            "            failed('metadata', e)",
+        ]
     _, t_hi, t_lo, t_out = encoding_tables(min_mm, max_mm)
     return "\n".join([
         f"every = {int(every)}",
@@ -263,10 +386,26 @@ def device_script(every, min_mm, max_mm, chunk_rows=CHUNK_ROWS, stats_every=150,
         f"REPORT_INTERVAL = {float(report_interval)!r}",
         f"REPORT_MAX = {int(REPORT_MAX_CHARS)}",
         f"PROGRESS_EVERY = {int(PROGRESS_EVERY)}",
-        f"t_hi = {t_hi!r}",
-        f"t_lo = {t_lo!r}",
-        f"t_out = {t_out!r}",
+        *([] if frame_type is None else [
+            f"t_hi = {t_hi!r}",
+            f"t_lo = {t_lo!r}",
+            f"t_out = {t_out!r}",
+            "",
+            *_converter(),
+            "",
+            *_frame_builder(frame_type),
+            "",
+            "def copy_metadata(src, out):",
+            "    out.setTimestamp(src.getTimestamp())",
+            "    out.setSequenceNum(src.getSequenceNum())",
+        ]),
         "",
+        *_script_loop(convert),
+    ])
+
+
+def _converter():
+    return [
         "def to_gray(frame):",
         "    width = frame.getWidth()",
         "    height = frame.getHeight()",
@@ -284,13 +423,12 @@ def device_script(every, min_mm, max_mm, chunk_rows=CHUNK_ROWS, stats_every=150,
         "        lo = int.from_bytes(raw[0::2].translate(t_lo), 'little')",
         "        parts.append((hi | lo).to_bytes(rows * width, 'little').translate(t_out))",
         "    return width, height, b''.join(parts)",
-        "",
-        *_frame_builder(frame_type),
-        "",
-        "def copy_metadata(src, out):",
-        "    out.setTimestamp(src.getTimestamp())",
-        "    out.setSequenceNum(src.getSequenceNum())",
-        "",
+    ]
+
+
+def _script_loop(convert):
+    """The gate, report and send loop of device_script; convert: the lines making `out` from `frame`."""
+    return [
         "try:",
         "    import time",
         "    clock = time.monotonic",
@@ -345,17 +483,7 @@ def device_script(every, min_mm, max_mm, chunk_rows=CHUNK_ROWS, stats_every=150,
         "            continue",
         "        count = 0",
         "        start = clock() if clock else 0.0",
-        "        try:",
-        "            width, height, gray = to_gray(frame)",
-        "            out = gray_frame(width, height, gray)",
-        "        except Exception as e:",
-        "            failed('convert', e)",
-        "            frame = None",
-        "            continue",
-        "        try:",
-        "            copy_metadata(frame, out)",
-        "        except Exception as e:",
-        "            failed('metadata', e)",
+        *convert,
         "        frame = None",
         "        try:",
         "            node.outputs['gray'].send(out)",
@@ -385,7 +513,7 @@ def device_script(every, min_mm, max_mm, chunk_rows=CHUNK_ROWS, stats_every=150,
         "except Exception as e:",
         "    failed('stopped', e, 'fatal')",
         "    raise",
-    ])
+    ]
 
 
 def parse_device_status(data):
@@ -732,6 +860,17 @@ class DepthStreamService:
         self.encoder_stalled = False
         self._stall_base = None  # (unix time, Script frame count) of its first report since the last JPEG
         self._last_report = None
+        self.blank = None
+        self.bad_frames = 0
+        self._last_jpeg = None
+        self._last_decode = self._last_expect = float("-inf")
+        self._expected = None  # (unix time, valid fraction, gray std, varies) of the host's depth
+        self._blank_since, self._blank_samples, self._blank_level = None, 0, None
+        reason = self.info.get("variant_reason")
+        if reason and self.variant == HOST_JPEG and self.requested_variant not in (HOST_JPEG, None):
+            self.fallback = {"from": self.requested_variant, "to": HOST_JPEG, "reason": reason, "detail": None,
+                             "unix_time": clock(), "at_start": True}
+            log(f"Depth stream: {self.requested_variant} requested, encoding on the Pi (host_jpeg): {reason}")
         fps = float(self.info.get("fps_target") or 0.0)
         self._report_gap = max(ENCODER_REPORT_GAP, ENCODER_REPORT_GAP / fps if fps > 0 else 0.0)
         self.recent = deque()
@@ -769,6 +908,9 @@ class DepthStreamService:
                 self._store_frame(jpeg, frame_sequence)
             for report in self.host_encoder.reports():
                 self._on_status(report)
+        elif self.enabled and depth is not None and now - self._last_expect >= EXPECT_INTERVAL_S:
+            self._last_expect = now
+            self._expect(depth, now)
         if self.enabled and now - self._last_meta >= self.meta_interval:
             if depth is not None:
                 self.center = center_depth(depth)
@@ -786,6 +928,8 @@ class DepthStreamService:
         if enabled != self.enabled:
             self.encoder_stalled = False
             self._stall_base = None
+            self._last_jpeg = None
+            self._blank_since, self._blank_samples = None, 0
             if self.debug is not None:
                 if enabled and not self.on_host:
                     self.debug.start()
@@ -794,10 +938,10 @@ class DepthStreamService:
         self.enabled = enabled
         self._last_send = now
 
-    def _fall_back(self, reason, now):
-        """auto: the camera's encoder stalled; encode on the Pi from now on."""
+    def _fall_back(self, reason, now, detail=None):
+        """auto: the camera's encoder stalled or sends blank frames; encode on the Pi from now on."""
         previous, self.variant = self.variant, HOST_JPEG
-        self.fallback = {"from": previous, "to": HOST_JPEG, "reason": reason, "unix_time": now}
+        self.fallback = {"from": previous, "to": HOST_JPEG, "reason": reason, "detail": detail, "unix_time": now}
         self.log(f"Depth stream: falling back from {previous} (camera) to host_jpeg (encoded on the Pi): {reason}")
         try:
             self.set_enabled(False)
@@ -813,11 +957,77 @@ class DepthStreamService:
         """An encoded frame from the camera (ignored once encoding moved to the Pi)."""
         if self.on_host:
             return False
-        return self._store_frame(jpeg, sequence)
+        data = bytes(jpeg)
+        if data[:2] != b"\xff\xd8":  # empty or not a JPEG: not a frame (the stall watch keeps counting)
+            self.bad_frames += 1
+            if self.bad_frames == 1 or self.bad_frames % 100 == 0:
+                self.log(f"Depth stream: {self.bad_frames} frames from the camera encoder were not JPEGs "
+                         f"({len(data)} bytes)")
+            return False
+        if not self._store_frame(data, sequence):
+            return False
+        self._check_blank(data, self.clock())
+        return True
+
+    def _expect(self, depth, now):
+        """Whether the host's depth of about now would make a varying stream image."""
+        sample = np.asarray(depth)[::4, ::4]
+        if sample.ndim != 2 or not sample.size:
+            return
+        valid = float(np.count_nonzero(sample)) / sample.size
+        min_mm, max_mm = self.info.get("depth_range_mm") or (1, 65535)
+        std = float(gray_reference(sample, min_mm, max_mm).std())
+        self._expected = (now, valid, std, valid >= EXPECT_VALID_MIN and std >= EXPECT_GRAY_STD_MIN)
+
+    @staticmethod
+    def _gray_level(data):
+        """(constant, mean gray) of a JPEG; an undecodable one counts as constant."""
+        import cv2
+        image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_GRAYSCALE)
+        if image is None or not image.size:
+            return True, None
+        return float(image.std()) < BLANK_STD, round(float(image.mean()), 1)
+
+    def _check_blank(self, data, now):
+        identical = data == self._last_jpeg
+        self._last_jpeg = data
+        if identical:
+            constant = True
+        elif now - self._last_decode >= BLANK_SAMPLE_S:
+            self._last_decode = now
+            constant, self._blank_level = self._gray_level(data)
+        else:
+            return
+        if not constant:
+            if self.blank is not None:
+                self.log(f"Depth stream: frames from {self.variant} are not blank any more")
+                self.blank = None
+            self._blank_since, self._blank_samples = None, 0
+            return
+        if self._blank_since is None:
+            self._blank_since, self._blank_samples = now, 0
+        self._blank_samples += 1
+        expected = self._expected
+        varies = expected is not None and now - expected[0] <= EXPECT_MAX_AGE_S and expected[3]
+        if (self.blank is not None or not varies or self._blank_samples < BLANK_MIN_SAMPLES
+                or now - self._blank_since < BLANK_S):
+            return
+        variant = self.variant or "unknown"
+        level = "undecodable" if self._blank_level is None else f"gray {self._blank_level:g}"
+        text = (f"blank frames from {variant}: {self._blank_samples} constant JPEGs ({len(data)} bytes, {level}) in "
+                f"{now - self._blank_since:.1f} s while the camera depth varies ({100 * expected[1]:.0f} % valid)")
+        self.blank = {"unix_time": now, "variant": variant, "frames": self._blank_samples, "bytes": len(data),
+                      "gray": self._blank_level, "text": text}
+        self.log(f"Depth stream: {text}")
+        self.last_error = {"text": text, "unix_time": now, "fatal": False, "errors": self.errors,
+                           "frames_sent": None, "variant": variant, "blank": True}
+        if self.requested_variant == AUTO and self.host_encoder is not None:
+            self._fall_back(f"blank frames from {variant}", now, detail=text)
+        self.write_meta(now)
 
     def _store_frame(self, jpeg, sequence):
         now = self.clock()
-        data = bytes(jpeg)
+        data = jpeg if isinstance(jpeg, bytes) else bytes(jpeg)
         try:
             snapshots.atomic_write(self.directory / FRAME_FILE, data)
         except OSError as e:
@@ -885,7 +1095,8 @@ class DepthStreamService:
         self.last_error = {"text": text, "unix_time": now, "fatal": False, "errors": self.errors,
                            "frames_sent": sent, "variant": self.variant or None, "stall": True}
         if self.requested_variant == AUTO and self.host_encoder is not None and not self.on_host:
-            self._fall_back(text, now)
+            self._fall_back(f"no JPEG from {self.variant or 'unknown'} (the camera encoder outputs nothing)", now,
+                            detail=text)
 
     def rates(self, now):
         recent = [(t, size) for t, size in self.recent if now - t <= RATE_WINDOW_S]
@@ -898,7 +1109,8 @@ class DepthStreamService:
         now = self.clock() if now is None else now
         fps, kbps = self.rates(now)
         last = self.last_frame
-        return {**self.info, "pid": os.getpid(), "unix_time": now, "streaming": self.enabled,
+        return {**self.info, "encoding": encoding_for(self.variant), "blank": self.blank, "bad_frames": self.bad_frames,
+                "pid": os.getpid(), "unix_time": now, "streaming": self.enabled,
                 "frames_total": self.frames, "bytes_total": self.bytes, "fps": fps, "kbps": kbps,
                 "last_frame": None if last is None else {"unix_time": last[0], "bytes": last[1], "sequence": last[2]},
                 "center": self.center, "errors": self.errors, "last_error": self.last_error,

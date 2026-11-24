@@ -224,7 +224,18 @@ def test_widget_status_from_live_telemetry():
     assert s["last_failure"]["reason"] == "too_few_matches" and 0 < s["last_failure"]["age_s"] < 5
     assert s["depth"]["fps"] == 4.9 and s["depth"]["depth_range_mm"] == [300, 4000]
     assert s["depth"]["encoder_stalled"] is True
+    assert s["pose"] is None  # the VIO's telemetry has no pose status without a pose stream
     json.dumps(s, allow_nan=False)
+    # The depth encoding, blank frames and the pose's attitude source reach the widget
+    status["pose"] = {"frame": "NED", "frame_text": "NED", "attitude_source": "gyro",
+                      "attitude_text": "gyro-integrated, drifting", "attitude_age_s": 7.5, "x": 1.0}
+    blank = {"variant": "manip", "text": "blank frames from manip: ..."}
+    s = cockpit_widget.widget_status(None, status, {"encoding": "gray8-disparity", "blank": blank,
+                                                    "disparity": {"nearest_mm": 347}}, False, now + 1)
+    assert s["pose"] == {"frame": "NED", "frame_text": "NED", "attitude_source": "gyro",
+                         "attitude_text": "gyro-integrated, drifting", "attitude_age_s": 7.5}
+    assert s["depth"]["encoding"] == "gray8-disparity" and s["depth"]["blank"] == blank
+    assert s["depth"]["disparity"] == {"nearest_mm": 347}
     # Stale telemetry shows nothing old
     status["stale"] = True
     stale = cockpit_widget.widget_status("VIO stopped", status, {}, False, now)

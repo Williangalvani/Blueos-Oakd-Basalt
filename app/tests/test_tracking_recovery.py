@@ -228,6 +228,17 @@ def pnp_vio(monkeypatch, tmp_path):
     monkeypatch.setattr(module, "open_vio_log", lambda: vio_log.open_vio_log(tmp_path / "logs"))
     monkeypatch.setattr(module, "open_oak_device", lambda timeout, log: mock.MagicMock())
     monkeypatch.setattr(module, "load_calibration", lambda device, args: fake_calibration())
+    module.attitude_sources = []
+
+    def no_autopilot(vehicle_ip, log=print):  # the 3D pose's ATTITUDE reader, without mavlink2rest
+
+        def fetch():
+            raise OSError(f"test: no mavlink2rest at {vehicle_ip}")
+        source = module.autopilot_attitude.AttitudeSource(fetch, log=log)
+        module.attitude_sources.append(source)
+        return source
+
+    monkeypatch.setattr(module.autopilot_attitude, "from_mavlink2rest", no_autopilot)
     previous = signal.getsignal(signal.SIGTERM)
     yield module
     signal.signal(signal.SIGTERM, previous)
@@ -455,9 +466,47 @@ def build_fake_pipeline(module, argv):
     return handles, created
 
 
+def test_build_pipeline_encodes_the_disparity_on_the_camera(pnp_vio):
+    """auto with subpixel off: stereo.disparity (pooled RAW8) -> gate Script (forwards it) -> ImageManip -> encoder."""
+    dai = pnp_vio.dai
+    handles, created = build_fake_pipeline(pnp_vio, ["--stereo-depth-max-mm", "4000", "--no-stereo-subpixel"])
+    (stereo,) = nodes_of(created, dai.node.StereoDepth)
+    snapshot_script, stream_script = nodes_of(created, dai.node.Script)
+    (encoder,) = nodes_of(created, dai.node.VideoEncoder)
+    (manip,) = nodes_of(created, dai.node.ImageManip)
+    disparity_in = stream_script.inputs["depth"]
+    stereo.disparity.link.assert_called_once_with(disparity_in)
+    assert mock.call(disparity_in) not in stereo.depth.link.call_args_list
+    disparity_in.setBlocking.assert_called_with(False)
+    disparity_in.setMaxSize.assert_called_with(1)
+    stream_script.outputs["gray"].link.assert_called_once_with(manip.inputImage)
+    manip.out.link.assert_called_once_with(encoder.input)
+    manip.initialConfig.setFrameType.assert_called_once_with(dai.ImgFrame.Type.NV12)
+    manip.setNumFramesPool.assert_called_once_with(3)
+    code = stream_script.setScript.call_args[0][0]
+    compile(code, "depth_stream_script", "exec")
+    assert "out = frame" in code and "ImgFrame(" not in code and "to_gray" not in code
+    info = handles.depth_stream_info
+    assert (info["requested_variant"], info["variant"], info["variant_reason"]) == ("auto", "disparity", None)
+    assert info["encoding"] == "gray8-disparity" and isinstance(info["disparity_max"], int)
+    # snapshots 1, and 3 for the disparity frame in the Script's queue, in the Script, in ImageManip's queue
+    stereo.setNumFramesPool.assert_called_once_with(pnp_vio.STEREO_FRAMES_POOL + 4)
+
+
+@pytest.mark.parametrize("encoding", ["auto", "disparity"])
+def test_build_pipeline_disparity_needs_subpixel_off(pnp_vio, encoding):
+    dai = pnp_vio.dai
+    handles, created = build_fake_pipeline(pnp_vio, ["--depth-stream-encoding", encoding])  # subpixel on (default)
+    assert nodes_of(created, dai.node.VideoEncoder) == [] and len(nodes_of(created, dai.node.Script)) == 1
+    info = handles.depth_stream_info
+    assert info["variant"] == "host_jpeg" and info["encoding"] == "gray8-depth-linear"
+    assert info["variant_reason"] == depth_stream.SUBPIXEL_PROBLEM and "Subpixel off" in info["variant_reason"]
+
+
 def test_build_pipeline_encodes_the_depth_stream_on_the_camera(pnp_vio):
     dai = pnp_vio.dai
-    handles, created = build_fake_pipeline(pnp_vio, ["--stereo-depth-max-mm", "4000"])
+    handles, created = build_fake_pipeline(pnp_vio, ["--stereo-depth-max-mm", "4000", "--depth-stream-encoding",
+                                                     "manip"])
     (stereo,) = nodes_of(created, dai.node.StereoDepth)
     snapshot_script, stream_script = nodes_of(created, dai.node.Script)
     (encoder,) = nodes_of(created, dai.node.VideoEncoder)
@@ -494,7 +543,8 @@ def test_build_pipeline_encodes_the_depth_stream_on_the_camera(pnp_vio):
     assert info["fps_target"] == 5.0 and info["every"] == 3 and info["quality"] == 70
     assert info["depth_range_mm"][1] == 4000 and info["quantization_mm"] == 16
     assert info["image_size"] == [640, 400]
-    assert info["requested_variant"] == "auto" and info["variant"] == "manip" and info["size_problem"] is None
+    assert info["requested_variant"] == "manip" and info["variant"] == "manip" and info["size_problem"] is None
+    assert info["encoding"] == "gray8-depth-linear"
     assert len(handles.depth_stream_nodes) == 3  # the device log names of the Script, encoder and ImageManip
     # One more stereo frame per gate queue (snapshots) and two for the stream Script
     stereo.setNumFramesPool.assert_called_once_with(pnp_vio.STEREO_FRAMES_POOL + 3)
@@ -547,7 +597,7 @@ def test_build_pipeline_without_the_depth_stream(pnp_vio):
     stereo.setNumFramesPool.assert_not_called()
 
     handles, created = build_fake_pipeline(pnp_vio, ["--no-snapshots", "--depth-stream-fps", "1",
-                                                     "--depth-stream-quality", "55"])
+                                                     "--depth-stream-quality", "55", "--no-stereo-subpixel"])
     (encoder,) = nodes_of(created, dai.node.VideoEncoder)
     encoder.setDefaultProfilePreset.assert_called_once_with(1.0, dai.VideoEncoderProperties.Profile.MJPEG)
     encoder.setQuality.assert_called_once_with(55)

@@ -4,11 +4,14 @@
 // relative to this module or to `base` (the extension's base path), so it works on port 8095 and behind
 // BlueOS's /extensionv2/<name>/ proxy. The stream is only open while the viewer is on screen.
 //
-// Frames: the pose is in "start-FRD", the body frame at VIO start (x forward, y right, z down; NED with
-// north at the initial heading if the vehicle started level). three.js is y-up: a start-FRD vector
-// (x, y, z) is drawn at (y, -z, -x), so forward points into the screen from the default view, right is
-// right and down is down. The same proper rotation maps the attitude quaternion [w, x, y, z] to
-// three's (x: y, y: -z, z: -x, w). The grid is the start depth (z = 0), 1 m cells.
+// Frames (p.frame): "NED" from the VIO start position (x north, y east, z down) once the autopilot's
+// ATTITUDE has been read, else "start-FRD", the body frame at VIO start (x forward, y right, z down; NED
+// with north at the initial heading if the vehicle started level). The attitude comes from the autopilot
+// or, while it is missing or stale, is gyro-integrated and drifts (p.attitude_source, shown in the status
+// line). Angles are shown in degrees (p.roll_deg ...; p.roll ... are radians). three.js is y-up: a frame
+// vector (x, y, z) is drawn at (y, -z, -x), so x points into the screen from the default view, y is right
+// and down is down. The same proper rotation maps the attitude quaternion [w, x, y, z] to three's
+// (x: y, y: -z, z: -x, w). The grid is the start depth (z = 0), 1 m cells.
 
 import * as THREE from './vendor/three/three.module.min.js';
 import { OrbitControls } from './vendor/three/OrbitControls.js';
@@ -49,14 +52,40 @@ const STYLE = `
 .pv-legend b { font-weight: 600; }
 .pv-x { color: #ff4d4d; } .pv-y { color: #3ddc84; } .pv-z { color: #4d8dff; } .pv-t { color: #ffb020; }
 .pv-muted { color: #8aa0b5; }
+.pv-warn { color: #ffb020; }
 `;
 
-/** A start-FRD vector (x forward, y right, z down) in three.js coordinates. */
+// Axis names of each frame for the legend
+const FRAME_AXES = { NED: ['x north', 'y east', 'z down'], 'start-FRD': ['x fwd', 'y right', 'z down'] };
+
+/** The legend for a frame: its name and the colours of its axes. */
+export function frameLegend(frame) {
+  const name = FRAME_AXES[frame] ? frame : 'start-FRD';
+  const [x, y, z] = FRAME_AXES[name];
+  return `${name}: <b class="pv-x">${x}</b> <b class="pv-y">${y}</b> <b class="pv-z">${z}</b>` +
+    ' · <b class="pv-t">trail</b> · grid 1 m';
+}
+
+/** "attitude: ..." for the status line; a warning while gyro-integrated. */
+export function attitudeText(p) {
+  if (!p || !p.attitude_source) return '';
+  if (p.attitude_source === 'autopilot') {
+    const age = Number.isFinite(p.attitude_age_s) ? ` (${p.attitude_age_s.toFixed(1)} s old)` : '';
+    return `<span title="roll, pitch, yaw from the autopilot (mavlink2rest)">attitude: ArduPilot ATTITUDE${age}</span>`;
+  }
+  const why = p.attitude_mode === 'autopilot'
+    ? (Number.isFinite(p.attitude_age_s) ? `, autopilot ATTITUDE ${p.attitude_age_s.toFixed(0)} s old` : ', no autopilot ATTITUDE')
+    : '';
+  return `<b class="pv-warn" title="gyro rotation chained from the start or from the last autopilot attitude; ` +
+    `no bias correction">attitude: gyro-integrated, drifting${why}</b>`;
+}
+
+/** A frame vector (x, y, z) in three.js coordinates. */
 export function toThree(x, y, z) {
   return new THREE.Vector3(y, -z, -x);
 }
 
-/** A start-FRD attitude quaternion [w, x, y, z] in three.js coordinates. */
+/** An attitude quaternion [w, x, y, z] (body -> frame) in three.js coordinates. */
 export function quaternionToThree(q) {
   return new THREE.Quaternion(q[2], -q[3], -q[1], q[0]);
 }
@@ -89,7 +118,7 @@ function gridLines(size, divisions, centerColor, color) {
 }
 
 function axisLines(length) {
-  // x, y, z of start-FRD (or of the body, inside the vehicle group) as red, green, blue segments
+  // x, y, z of the frame (or of the body, inside the vehicle group) as red, green, blue segments
   const positions = [], colors = [];
   const add = (v, hex) => {
     const c = new THREE.Color(hex);
@@ -143,12 +172,11 @@ export function mountPoseViewer(root, options = {}) {
     <div class="pv ${options.fill ? 'pv-fill' : 'pv-panel'}">
       <div class="pv-view"></div>
       <div class="pv-box pv-status">connecting…</div>
-      <div class="pv-box pv-legend">start-FRD: <b class="pv-x">x fwd</b> <b class="pv-y">y right</b>
-        <b class="pv-z">z down</b> · <b class="pv-t">trail</b> · grid 1 m</div>
-      <div class="pv-box pv-readout"><table>
-        <tr><td class="k">x</td><td data-v="x">–</td><td class="k">roll</td><td data-v="roll">–</td></tr>
-        <tr><td class="k">y</td><td data-v="y">–</td><td class="k">pitch</td><td data-v="pitch">–</td></tr>
-        <tr><td class="k">z</td><td data-v="z">–</td><td class="k">yaw</td><td data-v="yaw">–</td></tr>
+      <div class="pv-box pv-legend">${frameLegend('start-FRD')}</div>
+      <div class="pv-box pv-readout" title="position in m, roll / pitch / yaw in degrees (ZYX)"><table>
+        <tr><td class="k">x m</td><td data-v="x">–</td><td class="k">roll °</td><td data-v="roll">–</td></tr>
+        <tr><td class="k">y m</td><td data-v="y">–</td><td class="k">pitch °</td><td data-v="pitch">–</td></tr>
+        <tr><td class="k">z m</td><td data-v="z">–</td><td class="k">yaw °</td><td data-v="yaw">–</td></tr>
       </table></div>
       <div class="pv-box pv-tools">
         <button type="button" data-act="reset" title="Look at the vehicle and its trail again">Reset view</button>
@@ -160,6 +188,7 @@ export function mountPoseViewer(root, options = {}) {
   const el = root.querySelector('.pv');
   const view = el.querySelector('.pv-view');
   const statusBox = el.querySelector('.pv-status');
+  const legend = el.querySelector('.pv-legend');
   const message = el.querySelector('.pv-message');
   const values = Object.fromEntries([...el.querySelectorAll('[data-v]')].map(n => [n.dataset.v, n]));
   const follow = el.querySelector('[data-act="follow"]');
@@ -208,7 +237,7 @@ export function mountPoseViewer(root, options = {}) {
   scene.add(new THREE.Line(trailGeometry, new THREE.LineBasicMaterial({ color: COLORS.trail })));
 
   const state = { es: null, active: false, inView: true, frame: null, epoch: null, clearedAt: 0, trail: [],
-                  pose: null, poseAt: 0, problem: null, cameraAngle: null, mock: false };
+                  pose: null, poseAt: 0, problem: null, cameraAngle: null, mock: false, shownFrame: 'start-FRD' };
 
   function setFrustum(angle) {
     if (angle === state.cameraAngle) return;
@@ -299,9 +328,14 @@ export function mountPoseViewer(root, options = {}) {
     values.x.textContent = p.x.toFixed(2) + ' m';
     values.y.textContent = p.y.toFixed(2) + ' m';
     values.z.textContent = p.z.toFixed(2) + ' m';
-    values.roll.textContent = (p.roll * DEG).toFixed(1) + '°';
-    values.pitch.textContent = (p.pitch * DEG).toFixed(1) + '°';
-    values.yaw.textContent = (p.yaw * DEG).toFixed(1) + '°';
+    for (const k of ['roll', 'pitch', 'yaw']) {
+      values[k].textContent = (Number.isFinite(p[k + '_deg']) ? p[k + '_deg'] : p[k] * DEG).toFixed(1) + '°';
+    }
+    if (p.frame !== state.shownFrame) {
+      state.shownFrame = p.frame;
+      legend.innerHTML = frameLegend(p.frame);
+      legend.title = p.frame_text || '';
+    }
     if (firstPose) resetView();
     showStatus();
   }
@@ -317,8 +351,8 @@ export function mountPoseViewer(root, options = {}) {
     const stale = age > STALE_MS;
     const tracking = p ? (p.ok ? 'tracking' : 'not tracking (pose held)') : '';
     statusBox.innerHTML = p
-      ? `${state.mock ? '<b>mock</b> · ' : ''}${tracking} · ${p.ok_frames}/${p.frames} frames with motion` +
-        `<span class="pv-muted">${formatAge(age)}</span>`
+      ? `${state.mock ? '<b>mock</b> · ' : ''}${tracking} · ${attitudeText(p)} · ` +
+        `${p.ok_frames}/${p.frames} frames with motion<span class="pv-muted">${formatAge(age)}</span>`
       : (state.mock ? '<b>mock</b> · ' : '') + 'waiting for the pose…';
     message.textContent = state.problem ? state.problem : (p && stale ? `no pose for ${(age / 1000).toFixed(0)} s` : '');
   }

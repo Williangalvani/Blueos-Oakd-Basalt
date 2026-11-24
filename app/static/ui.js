@@ -580,8 +580,10 @@ function focalCheck() {
 }
 
 // --- live depth stream --------------------------------------------------------------------------
-// The camera encodes gray, linear in depth (depth_stream.py): 0 = no depth, gray_far (max_mm) ..
-// gray_near (min_mm). The page colorizes it with a 256-entry lookup table on a canvas.
+// The stream's gray (depth_stream.py, d.encoding): "gray8-depth-linear" is linear in depth, 0 = no depth,
+// gray_far (max_mm) .. gray_near (min_mm); "gray8-disparity" (the disparity variant) is the camera's
+// disparity in pixels, 0 = no depth, depth_mm = d.disparity.depth_times_disparity / gray. Both are colored
+// by depth on the same jet scale (min_mm red .. max_mm blue), with a 256-entry lookup table on a canvas.
 
 const depthStream = { on: false, retry: null, timer: null, lut: null, lutKey: '', scale: null };
 
@@ -592,18 +594,32 @@ function jet(x) {
 
 function streamScale(d) {
   const range = (d && d.depth_range_mm) || [300, 4000];
-  return { min: range[0], max: range[1], far: (d && d.gray_far) || 16, near: (d && d.gray_near) || 255,
+  const disparity = d && d.encoding === 'gray8-disparity' && d.disparity;
+  if (disparity && disparity.depth_times_disparity > 0) {
+    return { kind: 'disparity', min: range[0], max: range[1], far: disparity.gray_far, near: disparity.gray_near,
+             invalid: disparity.gray_invalid_below || 3, k: disparity.depth_times_disparity,
+             nearest: disparity.nearest_mm };
+  }
+  return { kind: 'depth', min: range[0], max: range[1], far: (d && d.gray_far) || 16, near: (d && d.gray_near) || 255,
            invalid: (d && d.gray_invalid_below) || 8 };
 }
 
+// Depth (mm) of a gray value on the scale, NaN for no depth
+function grayDepth(scale, g) {
+  if (g < scale.invalid) return NaN;
+  if (scale.kind === 'disparity') return scale.k / g;
+  return scale.max - (scale.max - scale.min) * (g - scale.far) / (scale.near - scale.far);
+}
+
+function depthColor(scale, mm) {
+  return Number.isNaN(mm) ? [0, 0, 0] : jet((scale.max - mm) / (scale.max - scale.min));
+}
+
 function depthLut(scale) {
-  const key = [scale.far, scale.near, scale.invalid].join(',');
+  const key = [scale.kind, scale.far, scale.near, scale.invalid, scale.k, scale.min, scale.max].join(',');
   if (depthStream.lutKey === key) return depthStream.lut;
   const lut = new Uint8ClampedArray(256 * 3);
-  for (let g = 0; g < 256; g++) {
-    const rgb = g < scale.invalid ? [0, 0, 0] : jet((g - scale.far) / (scale.near - scale.far));
-    lut.set(rgb, g * 3);
-  }
+  for (let g = 0; g < 256; g++) lut.set(depthColor(scale, grayDepth(scale, g)), g * 3);
   depthStream.lut = lut;
   depthStream.lutKey = key;
   return lut;
@@ -612,17 +628,27 @@ function depthLut(scale) {
 function drawDepthLegend(scale) {
   const canvas = $('depth-legend');
   const ctx = canvas.getContext('2d');
-  const lut = depthLut(scale), image = ctx.createImageData(canvas.width, 1);
+  const image = ctx.createImageData(canvas.width, 1);
   for (let i = 0; i < canvas.width; i++) {
-    const g = Math.round(scale.near - (scale.near - scale.far) * i / (canvas.width - 1));
-    image.data.set(lut.subarray(g * 3, g * 3 + 3), i * 4);
+    image.data.set(depthColor(scale, scale.min + (scale.max - scale.min) * i / (canvas.width - 1)), i * 4);
     image.data[i * 4 + 3] = 255;
   }
   ctx.putImageData(image, 0, 0);
   const m = mm => (mm / 1000).toFixed(2) + ' m';
-  setText('legend-near', m(scale.min) + ' near');
+  const nearest = scale.kind === 'disparity' && scale.nearest > scale.min ? ' (disparity: nearest ' + m(scale.nearest) + ')' : '';
+  setText('legend-near', m(scale.min) + ' near' + nearest);
   setText('legend-mid', m((scale.min + scale.max) / 2));
   setText('legend-far', m(scale.max) + ' far');
+}
+
+// "16 mm steps, 240 gray levels" or, for disparity, the depth step of one pixel at 1 m and at max_mm
+function quantizationText(d, scale) {
+  if (scale.kind === 'disparity') {
+    const step = mm => (mm * mm / scale.k).toFixed(0) + ' mm';
+    return 'disparity ' + scale.far.toFixed(1) + '–' + scale.near.toFixed(1) + ' px (1 px = ' + step(1000)
+      + ' at 1 m, ' + step(scale.max) + ' at ' + (scale.max / 1000).toFixed(1) + ' m)';
+  }
+  return isNum(d.quantization_mm) ? d.quantization_mm + ' mm steps, ' + (d.gray_near - d.gray_far + 1) + ' gray levels' : '–';
 }
 
 const STREAM_URL = 'api/stream/depth';
@@ -702,7 +728,8 @@ function depthEncodingText(d) {
   if (d.stale || !d.variant) return d.configured_encoding ? d.configured_encoding + ' (configured)' : '–';
   const parts = [d.variant + (d.encoded_on === 'pi' ? ' · encoded on the Pi' : ' · encoded on the camera')];
   if (d.requested_variant && d.requested_variant !== d.variant) parts.push('requested ' + d.requested_variant);
-  if (d.fallback) parts.push('fell back from ' + d.fallback.from + ' (camera encoder output nothing)');
+  if (d.fallback) parts.push('fallback: ' + d.fallback.reason + (d.fallback.at_start ? '' : ' (from ' + d.fallback.from + ')'));
+  if (d.encoding === 'gray8-disparity') parts.push('gray = disparity (px), depth = f·B / disparity');
   const host = d.host_encoder;
   if (d.encoded_on === 'pi' && host) {
     parts.push('Pi CPU ' + fmt(host.cpu_percent, 1) + ' % of a core (cap ' + fmt(host.cpu_budget_percent, 0) + ' %)'
@@ -719,6 +746,7 @@ function depthErrorsText(d, now) {
   const error = d.last_error;
   const age = error && isNum(error.unix_time) && isNum(now) ? ' (' + Math.max(0, now - error.unix_time).toFixed(0) + ' s ago)' : '';
   if (d.encoder_stalled) return 'encoder outputs nothing: ' + (error ? error.text + age : 'frames go in, no JPEG comes back');
+  if (d.blank) return d.blank.text;
   if (d.errors) return d.errors + (error ? ' · ' + (error.fatal ? 'stopped: ' : '') + error.text + age : '');
   return error ? 'none now · last: ' + error.text + age : 'none';
 }
@@ -751,7 +779,7 @@ function renderDepthStream(s) {
     : c ? 'no depth' : '–');
   setText('ds-center-pixel', c ? (c.pixel_mm ? (c.pixel_mm / 1000).toFixed(3) + ' m' : 'no depth') + ' at (' + c.x + ', ' + c.y + ')' : '–');
   setText('ds-range', (depthStream.scale.min / 1000).toFixed(2) + ' – ' + (depthStream.scale.max / 1000).toFixed(2) + ' m');
-  setText('ds-quant', isNum(d.quantization_mm) ? d.quantization_mm + ' mm steps, ' + (d.gray_near - d.gray_far + 1) + ' gray levels' : '–');
+  setText('ds-quant', quantizationText(d, depthStream.scale));
   setText('ds-rate', d.streaming && isNum(d.fps) ? d.fps.toFixed(1) + ' fps (target ' + fmt(d.fps_target, 1) + ')'
     : isNum(d.fps_target) ? 'target ' + d.fps_target.toFixed(1) + ' fps' : '–');
   setText('ds-kbps', d.streaming && isNum(d.kbps) ? d.kbps.toFixed(0) + ' kbit/s' : '–');
