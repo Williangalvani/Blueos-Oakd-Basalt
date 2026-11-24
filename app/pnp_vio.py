@@ -142,9 +142,6 @@ def parse_args(argv=None):
 
     parser.add_argument('--snapshots', action=argparse.BooleanOptionalAction, default=True,
                         help='On-demand camera snapshots for /api/snapshot (no bandwidth until requested)')
-    parser.add_argument('--snapshot-encoding', choices=snapshots.ENCODINGS, default=snapshots.CAMERA_JPEG,
-                        help='camera_jpeg: rect_left, rect_right and rgb snapshots JPEG-encoded on the camera; raw: '
-                             'sent raw, PNG-encoded on the Pi (the fallback). depth snapshots are always raw')
     parser.add_argument('--snapshot-dir', type=Path, default=snapshots.SNAPSHOT_DIR)
     parser.add_argument('--telemetry-dir', type=Path, default=None,
                         help='Live status and plot history for the web page (default: <snapshot-dir>/telemetry)')
@@ -170,10 +167,6 @@ def parse_args(argv=None):
                              'while the depth probe or a watched host_jpeg stream needs them. full_frame: every depth '
                              'frame goes to the Pi, which looks the depth up itself (the previous behaviour)')
 
-    parser.add_argument('--pose-attitude-source', choices=pose_stream.ATTITUDE_MODES, default='autopilot',
-                        help='Attitude of the 3D pose viewer: autopilot (ArduPilot ATTITUDE read from '
-                             'mavlink2rest, the gyro-integrated attitude while it is missing or stale) or gyro '
-                             '(gyro-integrated only, drifts). The MAVLink output never uses it')
     parser.add_argument('--vehicle-ip', default='127.0.0.1')
     parser.add_argument('--quality-rate', type=float, default=1.0)
     parser.add_argument('--device-timeout', type=float, default=DEFAULT_TIMEOUT,
@@ -541,16 +534,13 @@ def build_snapshot_gate(p, device, stereo, args):
 
     not_encoded = {}
     groups = {}
-    if args.snapshot_encoding == snapshots.RAW:
-        not_encoded = {s: "Snapshot Encoding is raw" for s in snapshots.CAMERA_JPEG_STREAMS if s in sources}
+    problem = depth_stream.size_problem(args.width, args.height)
+    if problem:
+        not_encoded.update(rect_left=problem, rect_right=problem)
     else:
-        problem = depth_stream.size_problem(args.width, args.height)
-        if problem:
-            not_encoded.update(rect_left=problem, rect_right=problem)
-        else:
-            groups["mono"] = (("rect_left", "rect_right"), float(args.fps))
-        if "rgb" in sources:
-            groups["color"] = (("rgb",), SNAPSHOT_RGB_FPS)
+        groups["mono"] = (("rect_left", "rect_right"), float(args.fps))
+    if "rgb" in sources:
+        groups["color"] = (("rgb",), SNAPSHOT_RGB_FPS)
     encoders = {stream: output for output, (streams, _) in groups.items() for stream in streams}
 
     script = p.create(dai.node.Script)
@@ -1044,9 +1034,7 @@ def run_pipeline(args, log_only, data_log, stereo_settings, telemetry):
         logger.info(message)
         data_log.event("device_open", message=message)
 
-    attitude = None
-    if args.pose_attitude_source == pose_stream.AUTOPILOT:
-        attitude = autopilot_attitude.from_mavlink2rest(args.vehicle_ip, log=logger.info)
+    attitude = autopilot_attitude.from_mavlink2rest(args.vehicle_ip, log=logger.info)
     pose_out = pose_stream.PoseStreamService(telemetry.directory, args.camera_angle, log=logger.info,
                                              attitude=attitude)
     telemetry.pose_status = pose_out.status
@@ -1160,7 +1148,7 @@ def run_session(device, args, log_only, data_log, stereo_settings, telemetry, ma
                 overlay=lambda: overlay.builder((args.width, args.height)),
                 encoded=handles.snapshot_encoded, not_encoded=handles.snapshot_not_encoded)
             data_log.event("snapshots", streams=list(handles.snapshot_streams),
-                           unavailable=handles.snapshot_unavailable, encoding=args.snapshot_encoding,
+                           unavailable=handles.snapshot_unavailable,
                            encoded_on_camera=list(handles.snapshot_encoded),
                            not_encoded=handles.snapshot_not_encoded)
 

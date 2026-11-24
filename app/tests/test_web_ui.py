@@ -210,7 +210,8 @@ OLD_CONFIG = {
     "optical_flow_grid_size": 80, "optical_flow_max_iterations": 3, "optical_flow_levels": 2,
     "optical_flow_skip_frames": 1, "vio_max_states": 2, "vio_max_kfs": 4, "vio_max_iterations": 3,
     "dvl_source": "no_such_source", "stereo_median": "9x9", "depth_stream_encoding": "manip",
-    "depth_points_rois": "camera", "stereo_median_last": True,
+    "depth_points_rois": "camera", "stereo_median_last": True, "pose_attitude_source": "gyro",
+    "snapshot_encoding": "raw",
 }
 
 
@@ -225,6 +226,7 @@ def test_an_older_saved_config_loads_without_the_removed_settings(client, tmp_pa
     assert config["depth_stream_encoding"] == "auto"
     command = main.build_vio_command(config)
     assert command[:3] == ["python", "-u", "/app/pnp_vio.py"]
+    assert not {"--pose-attitude-source", "--snapshot-encoding", "--depth-points-rois"} & set(command)
     assert http.get("/api/config").json() == config
     # The page posts back what it loaded
     assert http.post("/api/config", json=http.get("/api/config").json()).status_code == 200
@@ -774,14 +776,3 @@ def test_status_lists_every_image_stream_and_flags_the_raw_fallbacks(client, tmp
     assert by_name["snapshot_rect_right"]["fallback"].startswith(snapshots.RAW_FALLBACK)
     widget = main.widget_status_now()
     assert widget["raw_fallbacks"] == images["fallbacks"]
-
-
-def test_snapshot_encoding_setting_reaches_the_vio_command(client):
-    main, http = client
-    assert config_schema.SNAPSHOT_ENCODINGS == snapshots.ENCODINGS
-    pnp = {**main.DEFAULT_CONFIG}
-    command = main.build_vio_command(pnp)
-    assert command[command.index("--snapshot-encoding") + 1] == "camera_jpeg"
-    command = main.build_vio_command({**pnp, "snapshot_encoding": "raw"})
-    assert command[command.index("--snapshot-encoding") + 1] == "raw"
-    assert http.post("/api/config", json={**pnp, "snapshot_encoding": "png"}).status_code == 422

@@ -302,7 +302,7 @@ def test_payload_units_labels_and_status(tmp_path):
     assert p["frame"] == "NED" and "x north, y east, z down" in p["frame_text"]
     assert p["autopilot"]["samples"] == 1 and p["autopilot"]["message"] == "ATTITUDE"
     json.dumps(p)
-    # No autopilot configured (pose_attitude_source gyro): labelled as drifting, start-FRD
+    # No attitude source: labelled as drifting, start-FRD
     gyro = pose_stream.PoseStreamService(tmp_path / "g", clock=clock, log=lambda m: None)
     gyro.record(clock.t, True, [0.0, 0.0, 0.0], [0.0, 0.0, 0.1])
     g = gyro.payload(clock.t)
@@ -369,36 +369,10 @@ def test_mock_attitude_matches_the_mock_gyro_deltas():
             assert np.allclose(s.matrix(), expected, atol=1e-6)
 
 
-# --- configuration --------------------------------------------------------------------------------
+# --- the VIO's attitude source --------------------------------------------------------------------
 
-def test_pose_attitude_source_reaches_the_vio_command(client, tmp_path):
-    import config_schema
-    main, http = client
-    assert config_schema.POSE_ATTITUDE_SOURCES == pose_stream.ATTITUDE_MODES
-    pnp = {**main.DEFAULT_CONFIG}
-    assert pnp["pose_attitude_source"] == "autopilot"
-    command = main.build_vio_command(pnp)
-    assert command[command.index("--pose-attitude-source") + 1] == "autopilot"
-    command = main.build_vio_command({**pnp, "pose_attitude_source": "gyro"})
-    assert command[command.index("--pose-attitude-source") + 1] == "gyro"
-    command = main.build_vio_command({**pnp, "pose_attitude_source": "compass"})  # hand-edited
-    assert command[command.index("--pose-attitude-source") + 1] == "autopilot"
-    assert http.post("/api/config", json={**pnp, "pose_attitude_source": "compass"}).status_code == 422
-    assert http.post("/api/config", json={**pnp, "pose_attitude_source": "gyro"}).status_code == 200
-    assert http.get("/api/status").json()["pose"] == {"configured_source": "gyro"}
-    fields = {f["name"]: f for f in http.get("/api/config/schema").json()["fields"]}
-    assert fields["pose_attitude_source"]["choices"] == ["autopilot", "gyro"]
-    import mock_vio
-    assert mock_vio.parse_args([]).pose_attitude_source == "autopilot"
-    assert mock_vio.parse_args(["--pose-attitude-source", "gyro"]).pose_attitude_source == "gyro"
-
-
-def test_the_vio_reads_attitude_only_when_configured(pnp_vio, monkeypatch, tmp_path):
+def test_the_vio_reads_the_autopilot_attitude(pnp_vio, monkeypatch, tmp_path):
     from test_tracking_recovery import run_fake, scenario
-    assert pnp_vio.parse_args([]).pose_attitude_source == "autopilot"
-    assert pnp_vio.parse_args(["--pose-attitude-source", "gyro"]).pose_attitude_source == "gyro"
-    with pytest.raises(SystemExit):
-        pnp_vio.parse_args(["--pose-attitude-source", "compass"])
     captured = []
     real = pose_stream.PoseStreamService
 
@@ -413,7 +387,3 @@ def test_the_vio_reads_attitude_only_when_configured(pnp_vio, monkeypatch, tmp_p
     status = captured[-1].status()
     assert status["attitude_mode"] == "autopilot" and status["attitude_source"] == "gyro"
     assert status["frame"] == "start-FRD" and status["autopilot"]["fresh"] is False
-    for path in (tmp_path / "logs").iterdir():
-        path.unlink()
-    run_fake(pnp_vio, monkeypatch, tmp_path, scenario(n_lost=0), ["--pose-attitude-source", "gyro"])
-    assert len(pnp_vio.attitude_sources) == 1 and captured[-1].attitude is None

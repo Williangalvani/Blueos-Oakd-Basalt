@@ -20,12 +20,8 @@ from stereo_config import (DEFAULT_LEVER_ARM_M, DEFAULT_REFRACTIVE_INDEX, DEPTH_
 DVL_SOURCES = ("auto", "off")
 # depth_stream.VARIANTS (kept here so the schema does not import the stream code)
 DEPTH_STREAM_ENCODINGS = ("auto", "mono_features", "host_jpeg")
-# pose_stream.ATTITUDE_MODES
-POSE_ATTITUDE_SOURCES = ("autopilot", "gyro")
 # depth_points.TRANSPORTS
 DEPTH_TRANSPORTS = ("points", "full_frame")
-# snapshots.ENCODINGS
-SNAPSHOT_ENCODINGS = ("camera_jpeg", "raw")
 VEHICLE_IP_RE = re.compile(r"^[A-Za-z0-9.\-:\[\]]+$")
 
 GROUPS = (
@@ -114,11 +110,6 @@ CONFIG_FIELDS = (
                 "depth frame goes to the Pi (the previous behaviour, for comparison)", choices=DEPTH_TRANSPORTS),
     ConfigField("snapshots", "bool", True, "Snapshots",
                 "PnP only: on-demand camera snapshots (live views); no bandwidth until requested"),
-    ConfigField("snapshot_encoding", "choice", "camera_jpeg", "Snapshot Encoding",
-                "PnP only: camera_jpeg = rect_left, rect_right and rgb snapshots are JPEG-encoded on the camera "
-                "(quality 95, instead of 256 kB raw at 640x400); raw = sent raw and PNG-encoded on the Pi (the fallback, "
-                "also used automatically if the camera's encoder returns nothing). The depth snapshot is always "
-                "raw: 16-bit millimetres do not fit a JPEG", choices=SNAPSHOT_ENCODINGS),
     ConfigField("depth_stream", "bool", True, "Live depth stream",
                 "PnP only: the camera image with the tracked features (or the depth), MJPEG-encoded on the "
                 "camera for the Live panel; sent only while the panel is open"),
@@ -137,11 +128,6 @@ CONFIG_FIELDS = (
     ConfigField("depth_stream_debug", "bool", False, "Depth stream camera debug log",
                 "PnP only: while the depth stream runs, the camera logs at DEBUG level and the stream nodes' log "
                 "lines appear under Live depth (and /api/status); back to normal when the stream stops"),
-    ConfigField("pose_attitude_source", "choice", "autopilot", "3D Pose Attitude",
-                "PnP only, viewer only: autopilot = the 3D pose's orientation is ArduPilot's ATTITUDE (read from "
-                "mavlink2rest, NED with the autopilot heading), gyro-integrated (drifting) while it is missing or "
-                "more than 3 s old; gyro = gyro-integrated only. The VIO output does not use it",
-                choices=POSE_ATTITUDE_SOURCES),
 
     ConfigField("fps", "int", 30, "FPS", "Camera frame rate; lower = less camera and Pi CPU", "camera", 1, 60, step=1),
     ConfigField("camera_angle", "float", 0.0, "Camera Angle (°)", "0 = forward, 90 = down", "camera", -180.0, 180.0,

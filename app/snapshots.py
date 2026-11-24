@@ -43,8 +43,6 @@ CAMERA_STATUS = "camera.json"
 # How each stream is encoded in the running VIO (SnapshotService.status), for /api/status
 ENCODING_STATUS = "encoding.json"
 RAW_FALLBACK = "fallback: raw frames over the link, encoded on the Pi"
-CAMERA_JPEG, RAW = "camera_jpeg", "raw"
-ENCODINGS = (CAMERA_JPEG, RAW)
 
 
 def request_number(stream, raw=False):

@@ -544,7 +544,7 @@ def test_the_pose_stream_follows_the_mock_survey(server):
     status, pose = get_json(port, "/api/pose")
     assert status == 200 and pose["epoch"] == poses[0]["epoch"]
     _, s = get_json(port, "/api/status")
-    assert s["pose"]["configured_source"] == "autopilot" and s["pose"]["attitude_source"] == "autopilot"
+    assert s["pose"]["attitude_mode"] == "autopilot" and s["pose"]["attitude_source"] == "autopilot"
     assert s["pose"]["autopilot"]["fresh"] and "mock autopilot ATTITUDE (gaps)" in s["pose"]["autopilot"]["description"]
     # auto: the rectified-left camera image, encoded on the (mock) camera
     assert s["depth_stream"]["variant"] == "mono_features" and s["depth_stream"]["configured_encoding"] == "auto"

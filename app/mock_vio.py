@@ -99,13 +99,11 @@ def parse_args(argv=None):
     parser.add_argument("--recovery-frames", type=int, default=20)
     parser.add_argument("--max-reference-age", type=float, default=1.0)
     parser.add_argument("--snapshots", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--snapshot-encoding", choices=snapshots.ENCODINGS, default=snapshots.CAMERA_JPEG)
     parser.add_argument("--depth-stream", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--depth-stream-fps", type=float, default=5.0)
     parser.add_argument("--depth-stream-quality", type=int, default=70)
     parser.add_argument("--depth-stream-encoding", choices=depth_stream.VARIANTS, default=depth_stream.DEFAULT_VARIANT)
     parser.add_argument("--depth-stream-debug", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--pose-attitude-source", choices=pose_stream.ATTITUDE_MODES, default=pose_stream.AUTOPILOT)
     parser.add_argument("--depth-transport", choices=depth_points.TRANSPORTS, default=depth_points.DEFAULT_TRANSPORT)
     parser.add_argument("--min-depth", type=float, default=0.2)
     parser.add_argument("--max-depth", type=float, default=15.0)
@@ -762,15 +760,13 @@ class FakeVio:
             self.telemetry.set_phase("configuring")
             writer = snapshots.SnapshotWriter(args.snapshot_dir, self.depth_range, log=print)
             pending = []
-            camera_jpeg = args.snapshot_encoding == snapshots.CAMERA_JPEG
             snapshot_service = snapshots.SnapshotService(
                 ("rect_left", "rect_right", "depth") if args.snapshots else (),
                 lambda stream, raw: pending.append(raw), writer,
                 args.snapshot_dir, unavailable={"rgb": "mock mode: the synthetic camera has no CAM_A (RGB)"}
                 if args.snapshots else {s: "snapshots are disabled (--no-snapshots)" for s in snapshots.STREAMS},
                 log=print, overlay=lambda: self.snapshot_overlay,
-                encoded=("rect_left", "rect_right") if camera_jpeg else (),
-                not_encoded={} if camera_jpeg else {s: "Snapshot Encoding is raw" for s in ("rect_left", "rect_right")})
+                encoded=("rect_left", "rect_right"))
             probe = depth_probe.DepthProbeService(args.snapshot_dir / "depth_probe", self.depth_range,
                                                   args.depth_scale, (self.width, self.height), log=print,
                                                   refractive_index=args.refractive_index)
@@ -780,11 +776,9 @@ class FakeVio:
                 self.stream = stream = self.make_depth_stream()
             features_out = feature_stream.FeatureStreamService(self.telemetry_dir, (self.width, self.height),
                                                                log=print)
-            attitude = None
-            if args.pose_attitude_source == pose_stream.AUTOPILOT:
-                attitude = autopilot_attitude.AttitudeSource(
-                    mock_mode.attitude_fetch(self.started, clock=self.clock), clock=self.clock, log=print,
-                    description=f"mock autopilot ATTITUDE ({mock_mode.attitude_mode()})").start()
+            attitude = autopilot_attitude.AttitudeSource(
+                mock_mode.attitude_fetch(self.started, clock=self.clock), clock=self.clock, log=print,
+                description=f"mock autopilot ATTITUDE ({mock_mode.attitude_mode()})").start()
             self.pose_out = pose_stream.PoseStreamService(self.telemetry_dir, args.camera_angle, log=print,
                                                           attitude=attitude)
             self.telemetry.pose_status = self.pose_out.status

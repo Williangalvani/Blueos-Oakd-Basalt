@@ -75,7 +75,6 @@ FRAME_TEXTS = {
     FRAME_NED: "NED from the VIO start position: x north, y east, z down (m), heading from the autopilot",
 }
 AUTOPILOT, GYRO = "autopilot", "gyro"
-ATTITUDE_MODES = (AUTOPILOT, GYRO)
 ATTITUDE_TEXTS = {AUTOPILOT: "ArduPilot ATTITUDE", GYRO: "gyro-integrated, drifting"}
 UNITS = {"x, y, z": "m", "roll, pitch, yaw": "rad", "roll_deg, pitch_deg, yaw_deg": "deg",
          "attitude_age_s": "s"}
@@ -223,7 +222,7 @@ def frame_text(frame, source):
 class PoseStreamService:
     """
     VIO process side; see the module docstring. attitude: an autopilot_attitude.AttitudeSource (its latest()
-    is read once per frame), or None for the gyro only (attitude_mode "gyro").
+    is read once per frame), or None for the gyro only (attitude_mode "gyro"; the VIO always passes one).
     """
 
     def __init__(self, directory, camera_angle_deg=0.0, rate_hz=RATE_HZ, lease_s=LEASE_S, poll_interval=0.5,

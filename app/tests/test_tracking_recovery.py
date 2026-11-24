@@ -519,13 +519,11 @@ def test_build_pipeline_jpeg_encodes_the_snapshots_on_the_camera(pnp_vio):
     assert "encoders = {'rect_left': 'mono', 'rect_right': 'mono', 'rgb': 'color'}" in code
 
 
-@pytest.mark.parametrize("argv, reason", [(["--snapshot-encoding", "raw"], "Snapshot Encoding is raw"),
-                                          (["--width", "600"], "multiple of 32")])
-def test_build_pipeline_sends_snapshots_raw_when_set_or_the_encoder_cannot(pnp_vio, argv, reason):
+def test_build_pipeline_sends_snapshots_raw_when_the_encoder_cannot(pnp_vio):
     dai = pnp_vio.dai
-    handles, created = build_fake_pipeline(pnp_vio, ["--no-depth-stream", *argv])
+    handles, created = build_fake_pipeline(pnp_vio, ["--no-depth-stream", "--width", "600"])
     assert nodes_of(created, dai.node.VideoEncoder) == [] and handles.snapshot_encoded == ()
-    assert reason in handles.snapshot_not_encoded["rect_left"]
+    assert "multiple of 32" in handles.snapshot_not_encoded["rect_left"]
     assert "encoders = {}" in snapshot_gate(pnp_vio, created).setScript.call_args[0][0]
 
 
@@ -577,11 +575,11 @@ STEREO_VARIANTS = {"subpixel": [], "subpixel-off": ["--no-stereo-subpixel", "--n
 
 def pipeline_combinations():
     """Each transport with each depth stream variant, then each other option changed on its own for both."""
-    base = {"snapshot_encoding": snapshots.CAMERA_JPEG, "rgb": True, "stereo": "subpixel"}
+    base = {"rgb": True, "stereo": "subpixel"}
     cases = [dict(base, transport=transport, stream=stream)
              for transport in ("points", "full_frame") for stream in depth_stream.VARIANTS]
     for transport in ("points", "full_frame"):
-        for change in ({"snapshot_encoding": snapshots.RAW}, {"rgb": False}, {"stereo": "subpixel-off"}):
+        for change in ({"rgb": False}, {"stereo": "subpixel-off"}):
             cases.append(dict(base, transport=transport, stream="auto", **change))
     return [pytest.param(case, id="-".join(str(value) for value in case.values())) for case in cases]
 
@@ -596,7 +594,7 @@ def test_build_pipeline_starts_in_every_combination(pnp_vio, case):
     dai = pnp_vio.dai
     transport = case["transport"]
     argv = ["--depth-transport", transport, "--depth-stream-encoding", case["stream"],
-            "--snapshot-encoding", case["snapshot_encoding"], *STEREO_VARIANTS[case["stereo"]]]
+            *STEREO_VARIANTS[case["stereo"]]]
     handles, created = build_fake_pipeline(pnp_vio, argv, cameras=[dai.CameraBoardSocket.CAM_A] if case["rgb"] else [],
                                            start=True)
     scripts = nodes_of(created, dai.node.Script)
@@ -699,7 +697,7 @@ def test_build_pipeline_without_the_depth_stream(pnp_vio):
     assert handles.depth_stream_control_queue is None and handles.depth_stream_info == {}
     (stereo,) = nodes_of(created, dai.node.StereoDepth)
     stereo.setNumFramesPool.assert_called_once_with(pnp_vio.STEREO_FRAMES_POOL + 2)
-    handles, created = build_fake_pipeline(pnp_vio, ["--no-depth-stream", "--snapshot-encoding", "raw"])
+    handles, created = build_fake_pipeline(pnp_vio, ["--no-depth-stream", "--width", "600"])
     (stereo,) = nodes_of(created, dai.node.StereoDepth)
     stereo.setNumFramesPool.assert_called_once_with(pnp_vio.STEREO_FRAMES_POOL + 1)
 

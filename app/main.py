@@ -200,13 +200,11 @@ def build_vio_command(config: dict) -> list:
         "--recovery-frames", str(int(config["tracking_recovery_frames"])),
         "--max-reference-age", str(float(config["max_reference_age"])),
         "--snapshots" if config["snapshots"] else "--no-snapshots",
-        "--snapshot-encoding", saved_choice(config, "snapshot_encoding"),
         "--depth-stream" if config.get("depth_stream", True) else "--no-depth-stream",
         "--depth-stream-fps", str(saved_number(config, "depth_stream_fps")),
         "--depth-stream-quality", str(saved_number(config, "depth_stream_quality")),
         "--depth-stream-encoding", saved_depth_stream_encoding(config),
         "--depth-stream-debug" if config.get("depth_stream_debug") else "--no-depth-stream-debug",
-        "--pose-attitude-source", saved_choice(config, "pose_attitude_source"),
         "--depth-transport", saved_choice(config, "depth_transport"),
         "--telemetry-dir", str(telemetry_dir()),
         "--intrinsics-from", config.get("intrinsics_from") or "rectified",
@@ -456,14 +454,14 @@ def camera_connected(telemetry: Optional[dict]):
     return age is not None and age <= CAMERA_FRAME_TIMEOUT_S
 
 
-def pose_status(config: dict, telemetry: Optional[dict]) -> dict:
+def pose_status(telemetry: Optional[dict]) -> dict:
     """
-    The 3D pose viewer's attitude: configured_source (pose_attitude_source) and what the VIO process uses
-    (pose_stream.PoseStreamService.status: frame, attitude_source "autopilot" or "gyro", attitude_age_s of the
-    autopilot's ATTITUDE, switches, the autopilot reader's counters); only the setting while it is not running.
+    The 3D pose viewer's attitude as the VIO process uses it (pose_stream.PoseStreamService.status: frame,
+    attitude_source "autopilot" or "gyro", attitude_age_s of the autopilot's ATTITUDE, switches, the autopilot
+    reader's counters); empty while it is not running.
     """
     live = telemetry.get("pose") if telemetry and not telemetry["stale"] else None
-    return {"configured_source": saved_choice(config, "pose_attitude_source"), **(live or {})}
+    return dict(live or {})
 
 
 def depth_stream_status(config: dict, process_status: dict, now: float) -> dict:
@@ -532,7 +530,7 @@ def image_streams_status(config: dict, depth: dict, telemetry: Optional[dict], p
                 continue
             streams.append({
                 "name": f"snapshot_{stream}", "label": f"Snapshot {stream}", **(entry or {}),
-                "configured": saved_choice(config, "snapshot_encoding") if stream != "depth" else "raw",
+                "configured": "camera_jpeg" if stream in snapshots.CAMERA_JPEG_STREAMS else "raw",
                 "viewed": None, "mbps": None, "per_request": True,
                 "fallback": ((entry or {}).get("fallback") or {}).get("text")})
     return {"streams": streams, "fallbacks": [s["fallback"] for s in streams if s.get("fallback")],
@@ -582,7 +580,7 @@ def get_status():
         "depth_transport": depth_transport_status(config, telemetry),
         "image_streams": image_streams_status(config, depth, telemetry, process, viewers),
         "viewers": viewers,
-        "pose": pose_status(config, telemetry),
+        "pose": pose_status(telemetry),
         "telemetry": telemetry,
         "camera_connected": camera_connected(telemetry),
         "chip_temperature_c": telemetry.get("chip_temperature_c") if telemetry and not telemetry["stale"] else None,
