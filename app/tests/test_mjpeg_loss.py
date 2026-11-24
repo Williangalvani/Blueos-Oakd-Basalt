@@ -23,7 +23,9 @@ import vio_log  # noqa: E402
 from pnp_odometry import Intrinsics, PnPParams, depth_from_points, lookup_depth  # noqa: E402
 from rectified_intrinsics import StereoCalibration, rectified_for_settings  # noqa: E402
 from slc_fakes import FAKE_DAI, slc_compute  # noqa: E402
-from stereo_config import STEREO_DEFAULTS, resolve_stereo_settings  # noqa: E402
+from stereo_config import STEREO_SETTINGS, resolve_stereo_settings  # noqa: E402
+
+STEREO_DEFAULTS = {setting.key: setting.default for setting in STEREO_SETTINGS}
 from test_stereo_probe import FakeCamera, FakeDevice, FakeFrame, FakeInput, FakeStereoDepth, fake_dai  # noqa: E402
 
 cv2 = pytest.importorskip("cv2")

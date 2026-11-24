@@ -97,30 +97,6 @@ def _same_value(current, wanted):
     return math.isclose(float(current), float(wanted), rel_tol=1e-6, abs_tol=1e-6)
 
 
-def diff_params(current: dict) -> list:
-    """
-    Suggested optical-hold parameters that differ from `current` (name -> value, e.g. read from the
-    autopilot), in SUGGESTED_OPTICAL_HOLD_PARAMS order. Each entry: name, current (None if missing),
-    suggested, needs_reboot, rationale and status ("change" or "missing"). Keep-current entries are skipped.
-    Pure: reads nothing from and writes nothing to the autopilot.
-    """
-    diff = []
-    for param in SUGGESTED_OPTICAL_HOLD_PARAMS:
-        if param.value is None:
-            continue
-        value = current.get(param.name)
-        if value is not None:
-            try:
-                if _same_value(value, param.value):
-                    continue
-            except (TypeError, ValueError):
-                pass
-        diff.append({"name": param.name, "current": value, "suggested": param.value,
-                     "needs_reboot": param.needs_reboot, "rationale": param.rationale,
-                     "status": "missing" if value is None else "change"})
-    return diff
-
-
 def message_time(message):
     """Unix time of mavlink2rest's status.time.last_update of a message, or None if it has none we can parse."""
     try:

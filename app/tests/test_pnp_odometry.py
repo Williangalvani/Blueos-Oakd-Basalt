@@ -18,7 +18,6 @@ from pnp_odometry import (  # noqa: E402
     confidence_from_inliers,
     integrate_gyro,
     intrinsics_from_frame,
-    lever_arm_body_delta,
     lever_arm_correction,
     lookup_depth,
     matrix_to_rotvec,
@@ -630,6 +629,11 @@ def test_refractive_index_one_is_the_in_air_model():
 
 
 LEVER_ARM = np.array([0.1655, -0.0069, 0.180])
+
+
+def lever_arm_body_delta(position_delta, R_01, lever_arm):
+    """Body (IMU) displacement from the camera's, as pnp_vio logs it in lever_delta_position."""
+    return np.asarray(position_delta, dtype=np.float64) - lever_arm_correction(R_01, lever_arm)
 
 
 def yaw_frd(angle):

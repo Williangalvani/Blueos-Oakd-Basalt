@@ -177,7 +177,6 @@ DEFAULT_VARIANT = AUTO
 # The frame type the Script builds for each variant that runs on the camera (None: it forwards the
 # StereoDepth frame unchanged, straight into the encoder)
 SCRIPT_FRAME_TYPES = {MONO_FEATURES: None, DISPARITY: None, MANIP: "GRAY8", NV12: "NV12", YUV400P: "YUV400p"}
-CAMERA_VARIANTS = tuple(SCRIPT_FRAME_TYPES)
 FORWARD_VARIANTS = tuple(v for v, frame_type in SCRIPT_FRAME_TYPES.items() if frame_type is None)
 # The StereoDepth output each variant shows (info "source")
 SOURCES = {MONO_FEATURES: "rectifiedLeft", DISPARITY: "disparity", MANIP: "depth", NV12: "depth",

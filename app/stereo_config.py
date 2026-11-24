@@ -81,9 +81,6 @@ STEREO_SETTINGS = (
             minimum=0, maximum=65535),
 )
 
-SETTINGS_BY_KEY = {setting.key: setting for setting in STEREO_SETTINGS}
-STEREO_DEFAULTS = {setting.key: setting.default for setting in STEREO_SETTINGS}
-
 # StereoDepthConfig.PostProcessing.filteringOrder (depthai-core v3.3.0): the default, the order the DEFAULT,
 # FACE, HIGH_DETAIL and ROBOTICS presets set (ACCURACY and DENSITY keep the default), and stereo_median_last's
 FILTERING_ORDER_DEFAULT = ("MEDIAN", "DECIMATION", "SPECKLE", "SPATIAL", "TEMPORAL")

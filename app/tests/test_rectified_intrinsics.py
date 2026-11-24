@@ -22,7 +22,9 @@ from rectified_intrinsics import (  # noqa: E402
     rectified_intrinsics,
     same_intrinsics,
 )
-from stereo_config import STEREO_DEFAULTS, parse_depth_scale, parse_intrinsics_override  # noqa: E402
+from stereo_config import STEREO_SETTINGS, parse_depth_scale, parse_intrinsics_override  # noqa: E402
+
+STEREO_DEFAULTS = {setting.key: setting.default for setting in STEREO_SETTINGS}
 
 DATA = Path(__file__).parent / "data"
 CALIB = json.loads((DATA / "calib_oakd_w_poe.json").read_text())

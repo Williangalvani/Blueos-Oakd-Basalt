@@ -9,8 +9,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import stereo_config  # noqa: E402
 import vio_log  # noqa: E402
-from stereo_config import (STEREO_DEFAULTS, apply_stereo_config, effective_stereo_config,  # noqa: E402
+from stereo_config import (STEREO_SETTINGS, apply_stereo_config, effective_stereo_config,  # noqa: E402
                            resolve_stereo_settings, stereo_command_args, stereo_warnings)
+
+STEREO_DEFAULTS = {setting.key: setting.default for setting in STEREO_SETTINGS}
 
 EXPECTED_DEFAULTS = {
     "stereo_preset": "ROBOTICS",

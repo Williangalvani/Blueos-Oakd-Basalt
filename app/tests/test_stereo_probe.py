@@ -12,7 +12,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import stereo_probe  # noqa: E402
 import vio_log  # noqa: E402
-from stereo_config import STEREO_DEFAULTS, resolve_stereo_settings  # noqa: E402
+from stereo_config import STEREO_SETTINGS, resolve_stereo_settings  # noqa: E402
+
+STEREO_DEFAULTS = {setting.key: setting.default for setting in STEREO_SETTINGS}
 
 SAVED = resolve_stereo_settings(STEREO_DEFAULTS)
 

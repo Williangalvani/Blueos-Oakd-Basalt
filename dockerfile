@@ -77,9 +77,4 @@ LABEL readme='https://raw.githubusercontent.com/williangalvani/Blueos-Oakd-Basal
 LABEL links='{"source": "https://github.com/williangalvani/Blueos-Oakd-Basalt"}'
 LABEL requirements="core >= 1.1"
 
-# Environment variables
-ENV FPS=3
-ENV CAMERA_ANGLE=0.0
-ENV VEHICLE_IP=127.0.0.1
-
 CMD ["/app/entrypoint.sh"]

@@ -8,7 +8,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import autopilot_params  # noqa: E402
-from autopilot_params import SUGGESTED_OPTICAL_HOLD_PARAMS, AutopilotParams, diff_params  # noqa: E402
+from autopilot_params import SUGGESTED_OPTICAL_HOLD_PARAMS, AutopilotParams  # noqa: E402
 from stereo_config import DEFAULT_LEVER_ARM_M  # noqa: E402
 
 SUGGESTED = {param.name: param for param in SUGGESTED_OPTICAL_HOLD_PARAMS}
@@ -56,37 +56,13 @@ def test_nothing_configures_the_autopilot_automatically():
                 assert "configure_visual_odometry" not in f.read(), name
 
 
-def test_diff_of_an_empty_vehicle_lists_every_value_as_missing():
-    diff = diff_params({})
-    assert [entry["name"] for entry in diff] == [p.name for p in SUGGESTED_OPTICAL_HOLD_PARAMS if p.value is not None]
-    assert all(entry["status"] == "missing" and entry["current"] is None for entry in diff)
-    assert diff[0] == {"name": "AHRS_EKF_TYPE", "current": None, "suggested": 3, "needs_reboot": True,
-                       "rationale": SUGGESTED["AHRS_EKF_TYPE"].rationale, "status": "missing"}
-
-
-def test_diff_ignores_float32_rounding_and_keep_current_params():
+def test_recommended_values_match_through_float32_rounding():
     # As PARAM_VALUE returns them: float32
-    current = {p.name: float(np.float32(p.value)) for p in SUGGESTED_OPTICAL_HOLD_PARAMS if p.value is not None}
-    assert current["VISO_POS_X"] != 0.1655
-    current["VISO_DELAY_MS"] = 87
-    assert diff_params(current) == []
-
-
-def test_diff_reports_changes_in_order_and_leaves_the_input_alone():
-    current = {p.name: p.value for p in SUGGESTED_OPTICAL_HOLD_PARAMS if p.value is not None}
-    current.update(EK3_SRC1_POSXY=6, VISO_POS_Z=0.0, VISO_TYPE=0, EXTRA_PARAM=5)
-    del current["EK3_SRC1_YAW"]
-    snapshot = dict(current)
-    diff = diff_params(current)
-    assert current == snapshot
-    assert [(e["name"], e["current"], e["suggested"], e["status"]) for e in diff] == [
-        ("VISO_TYPE", 0, 1, "change"), ("VISO_POS_Z", 0.0, 0.18, "change"),
-        ("EK3_SRC1_POSXY", 6, 0, "change"), ("EK3_SRC1_YAW", None, 1, "missing")]
-
-
-def test_diff_treats_unreadable_values_as_a_change():
-    (entry,) = [e for e in diff_params({"VISO_ORIENT": "forward"}) if e["name"] == "VISO_ORIENT"]
-    assert entry["status"] == "change" and entry["current"] == "forward"
+    for param in SUGGESTED_OPTICAL_HOLD_PARAMS:
+        if param.value is not None:
+            assert autopilot_params._same_value(float(np.float32(param.value)), param.value), param.name
+    assert float(np.float32(0.1655)) != 0.1655
+    assert not autopilot_params._same_value(0.0, 0.18) and not autopilot_params._same_value(6, 0)
 
 
 @pytest.mark.parametrize("message, expected", [

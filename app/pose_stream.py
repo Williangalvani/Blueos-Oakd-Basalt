@@ -69,13 +69,11 @@ TRAIL_POINTS = 1500
 # Gyro rotation kept to carry an autopilot sample forward from its own time
 CHAIN_HISTORY_S = 2.0
 FRAME_START, FRAME_NED = "start-FRD", "NED"
-FRAME = FRAME_START
 FRAME_TEXTS = {
     FRAME_START: ("body frame at VIO start: x forward, y right, z down (m); NED with north at the initial heading "
                   "if the vehicle started level"),
     FRAME_NED: "NED from the VIO start position: x north, y east, z down (m), heading from the autopilot",
 }
-FRAME_TEXT = FRAME_TEXTS[FRAME_START]
 AUTOPILOT, GYRO = "autopilot", "gyro"
 ATTITUDE_MODES = (AUTOPILOT, GYRO)
 ATTITUDE_TEXTS = {AUTOPILOT: "ArduPilot ATTITUDE", GYRO: "gyro-integrated, drifting"}
