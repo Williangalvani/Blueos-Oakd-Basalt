@@ -32,6 +32,7 @@ def client(monkeypatch, tmp_path):
     started = []
     monkeypatch.setattr(main.supervisor, "status", lambda: dict(process))
     monkeypatch.setattr(main, "start_vio", lambda: started.append(True))
+    monkeypatch.setattr(main, "param_checker", main.make_param_checker())
     http = fastapi_testclient.TestClient(main.app)
     http.process, http.started = process, started
     return main, http
@@ -77,11 +78,14 @@ def test_page_is_one_self_contained_offline_page(client):
                   "panel-depth-stream", "depth-stream-img", "depth-stream-canvas", "depth-legend", "ds-cost",
                   "ds-errors", "depth-stream-title", "depth-stream-overlay", "depth-stream-features",
                   "depth-legend-box", "feature-legend-box", "ds-source", "ds-features", "ds-n-inlier",
-                  "ds-n-no_depth", "link-kv", "link-streams", "link-streams-body", "link-hint"):
+                  "ds-n-no_depth", "link-kv", "link-streams", "link-streams-body", "link-hint",
+                  "params-check", "params-title", "params-detail", "params-configure", "params-table",
+                  "params-table-body", "params-notes"):
         assert f'id="{panel}"' in page
-    # The shared features overlay and camera link formatting are inlined before ui.js, which uses them
+    # The shared features overlay, camera link and parameter check formatting are inlined before ui.js
     assert page.index("const FEATURE_STATES = ") < page.index("function drawStreamFeatures")
     assert page.index("function linkSummaryRows(") < page.index("function renderLink(")
+    assert page.index("function paramCheckView(") < page.index("function renderParamCheck(")
     assert "integrated, drifts" in page
     # Every configuration field is in the form
     for field in config_schema.CONFIG_FIELDS:
@@ -89,12 +93,49 @@ def test_page_is_one_self_contained_offline_page(client):
 
 
 @pytest.mark.parametrize("asset, kind", [("ui.css", "text/css"), ("ui.js", "javascript"), ("ui.html", "text/html"),
-                                         ("features_overlay.js", "javascript"), ("link_panel.js", "javascript")])
+                                         ("features_overlay.js", "javascript"), ("link_panel.js", "javascript"),
+                                         ("param_check.js", "javascript")])
 def test_static_assets_are_served_without_external_urls(client, asset, kind):
     main, http = client
     response = http.get(f"/static/{asset}")
     assert response.status_code == 200 and kind in response.headers["content-type"]
     assert external_urls(response.text) == set()
+
+
+def function_body(js, name):
+    start = js.index(f"function {name}(")
+    end = js.index("\n}\n", start)
+    return js[start:end]
+
+
+def test_configure_goes_through_the_confirm_dialog_and_the_guarded_post(client):
+    main, http = client
+    page = http.get("/").text
+    js = http.get("/static/ui.js").text
+    assert 'id="params-configure" onclick="openConfigureDialog()" hidden' in page
+    # The banner is drawn from every /api/status
+    assert "renderParamCheck(s.autopilot_params)" in function_body(js, "renderStatus")
+    configure = function_body(js, "openConfigureDialog")
+    assert "paramConfigureChanges(check)" in configure and "showWriteDialog(changes" in configure
+    assert "fetch" not in configure  # only opens the dialog
+    dialog = function_body(js, "showWriteDialog")
+    assert "$('ap-dialog').showModal()" in dialog and "fetch" not in dialog
+    # The one write: the dialog's confirm button, with confirm: true, to the guarded POST
+    assert js.count("'api/autopilot/params'") == 1
+    write = function_body(js, "confirmWrite")
+    assert "body: JSON.stringify({ confirm: true, params })" in write
+    assert "read back ' + paramText(c.readback)" in write
+    assert "to take effect (not done automatically)." in write
+    assert "updateStatus()" in write  # the banner shows the re-check right after the write
+    assert 'onclick="confirmWrite()"' in page
+    # Nothing ever reboots the autopilot
+    app_dir = os.path.join(os.path.dirname(__file__), "..")
+    sources = [os.path.join(app_dir, name) for name in os.listdir(app_dir) if name.endswith(".py")]
+    sources += [os.path.join(app_dir, "static", name) for name in os.listdir(os.path.join(app_dir, "static"))
+                if name.endswith(".js")]
+    for path in sources:
+        with open(path) as f:
+            assert "PREFLIGHT_REBOOT" not in f.read(), path
 
 
 def test_page_polls_politely(client):
@@ -182,6 +223,7 @@ def test_status_without_vio(client):
     assert status["camera_connected"] is None and status["chip_temperature_c"] is None
     assert status["algorithm"] == "basalt" and status["uptime_s"] is None
     assert "cpu_percent" in status and status["vehicle"]["armed"] is None
+    assert status["autopilot_params"]["checked_at"] is None and status["autopilot_params"]["ok"] is False
     # The page's request asks the VIO process to publish
     assert (vio_telemetry.DEFAULT_DIR / vio_telemetry.STATUS_LEASE).exists()
 

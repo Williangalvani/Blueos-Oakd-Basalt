@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import time
 import urllib.request
 
 import pytest
@@ -33,6 +34,7 @@ def client(monkeypatch, tmp_path, vehicle):
     monkeypatch.setattr(main, "AUTOPILOT_TIMEOUT", 0.2)
     monkeypatch.setattr(main, "AUTOPILOT_ATTEMPTS", 1)
     monkeypatch.setattr(main, "HEARTBEAT_WAIT", 0.5)
+    monkeypatch.setattr(main, "param_checker", main.make_param_checker())
     (tmp_path / "config.json").write_text(json.dumps({"vehicle_ip": "fake-vehicle"}))
     return main, fastapi_testclient.TestClient(main.app)
 
@@ -121,7 +123,8 @@ def test_post_without_confirm_is_400(client, vehicle, body):
 
 
 @pytest.mark.parametrize("params, message", [
-    ({"AHRS_EKF_TYPE": 3}, "not one of the suggested parameters"),
+    ({"EK2_ENABLE": 0}, "not one of the suggested parameters"),
+    ({"AHRS_EKF_TYPE": 1}, "not one of 0, 2, 3, 10, 11"),
     ({"SYSID_THISMAV": 2}, "not one of the suggested parameters"),
     ({"VISO_POS_X": 9.0}, "outside -5..5"),
     ({"VISO_TYPE": 7}, "outside 0..3"),
@@ -227,6 +230,57 @@ def test_a_get_never_reaches_the_autopilot(client, vehicle):
     assert response.status_code == 405 and response.headers["allow"] == "POST"
     assert http.get("/api/autopilot/params/read").status_code == 405
     assert vehicle.requests == [] and vehicle.param_sets() == []
+
+
+# --- the parameter check in /api/status (param_checker) -------------------------------------------
+
+def test_status_has_the_parameter_check_and_its_get_never_reaches_the_autopilot(client, vehicle):
+    main, http = client
+    check = http.get("/api/status").json()["autopilot_params"]
+    assert check["checked_at"] is None and check["reachable"] is None and check["ok"] is False
+    assert check["error"] == "not checked yet" and check["mismatches"] == []
+    assert vehicle.requests == []
+    http.post("/api/autopilot/params/read")  # the on-demand check
+    check = http.get("/api/status").json()["autopilot_params"]
+    assert check["reachable"] is True and check["armed"] is False and check["ok"] is False
+    assert [m["name"] for m in check["mismatches"]] == ["VISO_TYPE", "VISO_POS_X", "VISO_POS_Y", "VISO_POS_Z",
+                                                        "EK3_SRC1_VELXY", "EK3_SRC1_POSXY"]
+    assert check["mismatches"][0] == {"name": "VISO_TYPE", "current": 0.0, "recommended": 1, "needs_reboot": True}
+    assert check["mavlink2rest"] == "http://fake-vehicle/mavlink2rest"
+    requests = len(vehicle.requests)
+    http.get("/api/status")
+    # The Cockpit widget's status line (sent on its event streams) carries the compact check
+    widget = main.widget_status_now()["autopilot_params"]
+    assert widget["ok"] is False and widget["reachable"] is True and len(widget["mismatches"]) == 6
+    assert set(widget["mismatches"][0]) == {"name"}
+    assert len(vehicle.requests) == requests and vehicle.param_sets() == []
+
+
+def test_server_startup_runs_the_read_only_check_and_configure_fixes_it(client, vehicle, monkeypatch):
+    main, http = client
+    monkeypatch.setattr(main, "start_vio", lambda: None)
+    monkeypatch.setattr(main.supervisor, "shutdown", lambda: None)
+    start = main.param_checker.start
+    monkeypatch.setattr(main.param_checker, "start", lambda: start(first_delay=0.0))
+    with type(http)(main.app) as live:
+        deadline = time.monotonic() + 10.0
+        while live.get("/api/status").json()["autopilot_params"]["checked_at"] is None:
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+        check = live.get("/api/status").json()["autopilot_params"]
+        assert len(check["mismatches"]) == 6 and vehicle.param_sets() == []
+        # Configure: exactly the mismatches, through the guarded POST; checked again right after
+        changes = {m["name"]: m["recommended"] for m in check["mismatches"]}
+        result = live.post("/api/autopilot/params", json={"confirm": True, "params": changes}).json()
+        assert [c["name"] for c in result["changed"]] == list(changes) and result["reboot_required"] == ["VISO_TYPE"]
+        check = live.get("/api/status").json()["autopilot_params"]
+        assert check["mismatches"] == [] and check["pending_reboot"] == ["VISO_TYPE"] and check["ok"] is False
+        vehicle.reboot()
+        live.post("/api/autopilot/params/read")
+        check = live.get("/api/status").json()["autopilot_params"]
+        assert check["pending_reboot"] == [] and check["ok"] is True
+    assert main.param_checker._thread is None  # stopped at shutdown
+    assert len(vehicle.param_sets()) == 6
 
 
 def test_live_armed_state_needs_a_heartbeat_counter(vehicle):

@@ -35,15 +35,14 @@ def resolve_log_only(cli_flag=False, environ=None):
     return bool(cli_flag) or env_forces_log_only(environ)
 
 
-def setup_autopilot_output(log_only, vehicle_ip, autopilot_params, mavlink_sender, log=print):
+def setup_autopilot_output(log_only, vehicle_ip, mavlink_sender, log=print):
     """
-    Configure the autopilot and return a connected-or-retrying MAVLink sender, or None in
-    log-only mode, where neither factory is called.
+    A connected-or-retrying MAVLink sender, or None in log-only mode, where the factory is not called.
+    Never reads or writes autopilot parameters: only the web page writes them, on a confirmed request.
     """
     if log_only:
         log(LOG_ONLY_BANNER)
         return None
-    autopilot_params(vehicle_ip).configure_visual_odometry()
     sender = mavlink_sender(f"ws://{vehicle_ip}/mavlink2rest/ws/mavlink?filter=SEND_ONLY")
     if not sender.connect():
         log("MAVLink websocket not connected yet; will keep retrying")

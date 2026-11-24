@@ -27,6 +27,7 @@ import depth_stream
 import dvl_source
 import feature_stream
 import mjpeg_loss
+import param_checker as param_checker_module
 import pose_stream
 import mock_mode
 import snapshots
@@ -291,9 +292,11 @@ supervisor = VIOSupervisor(launch_vio, log=lambda msg: print(msg, flush=True),
 cpu_sampler = system_stats.CpuSampler()
 history_reader = vio_telemetry.HistoryReader()
 dvl_poller = dvl_source.DvlPoller()
-# Armed state from the ArduPilot panel's last read or write (no polling of its own)
+# Armed state from the last parameter check, read or write (param_checker)
 vehicle_state = {"armed": None, "detail": "not read yet", "checked_at": None}
 vehicle_state_lock = threading.Lock()
+# Mock mode's in-memory autopilot (enable_mock_mode)
+mock_autopilot = None
 # One stereo probe at a time: it has the camera to itself while the VIO is stopped
 stereo_probe_lock = threading.Lock()
 
@@ -303,7 +306,7 @@ def enable_mock_mode(directory=None):
     Mock mode (see mock_mode.py): data under `directory` (default mock_mode.data_dir()), mock_vio.py instead of
     the camera, the mock autopilot and DVL, and urllib refusing every request. Call before serving.
     """
-    global MOCK, CONFIG_FILE, SNAPSHOT_DIR, TELEMETRY_DIR, dvl_poller
+    global MOCK, CONFIG_FILE, SNAPSHOT_DIR, TELEMETRY_DIR, dvl_poller, mock_autopilot
     root = Path(directory) if directory is not None else mock_mode.data_dir()
     for name in ("snapshots", "telemetry", "logs"):
         (root / name).mkdir(parents=True, exist_ok=True)
@@ -316,7 +319,8 @@ def enable_mock_mode(directory=None):
         save_config({**DEFAULT_CONFIG, **mock_mode.INITIAL_CONFIG})
     dvl_poller = dvl_source.DvlPoller(fetch=mock_mode.dvl_fetch)
     mock_mode.block_network()
-    remember_vehicle_state(mock_mode.MockAutopilot().heartbeat_status())
+    mock_autopilot = mock_mode.MockAutopilot(armed=mock_mode.mock_armed())
+    remember_vehicle_state(make_autopilot().heartbeat_status())
     print(f"MOCK MODE: no camera, no autopilot; data in {root}", flush=True)
 
 
@@ -361,7 +365,7 @@ def render_page(config: dict) -> str:
     parts = {
         "<!--UI_CSS-->": f"<style>\n{(STATIC_DIR / 'ui.css').read_text()}\n</style>",
         "<!--UI_JS-->": "\n".join(f"<script>\n{(STATIC_DIR / name).read_text()}\n</script>"
-                                  for name in ("features_overlay.js", "link_panel.js", "ui.js")),
+                                  for name in ("features_overlay.js", "link_panel.js", "param_check.js", "ui.js")),
         "<!--FIELDS_STEREO-->": stereo_form_fields(config),
     }
     for group, _ in config_schema.GROUPS:
@@ -384,11 +388,12 @@ def index():
 
 
 def render_widget() -> str:
-    """widget.html with widget.css, features_overlay.js, link_panel.js and widget.js inlined, like render_page."""
+    """widget.html with widget.css, features_overlay.js, link_panel.js, param_check.js and widget.js inlined, like
+    render_page."""
     html = (STATIC_DIR / "widget.html").read_text()
     html = html.replace("<!--WIDGET_CSS-->", f"<style>\n{(STATIC_DIR / 'widget.css').read_text()}\n</style>")
     scripts = "\n".join(f"<script>\n{(STATIC_DIR / name).read_text()}\n</script>"
-                        for name in ("features_overlay.js", "link_panel.js", "widget.js"))
+                        for name in ("features_overlay.js", "link_panel.js", "param_check.js", "widget.js"))
     return html.replace("<!--WIDGET_JS-->", scripts)
 
 
@@ -578,11 +583,13 @@ def depth_transport_status(config: dict, telemetry: Optional[dict]) -> dict:
 def get_status():
     """
     VIO process status (automatic restarts, log-only mode, the PnP camera matrix), plus the PnP live
-    telemetry (rates, failures by reason, output, chip temperature), host CPU load and the last known
-    armed state. telemetry is null until the PnP VIO publishes; stale when it stopped.
+    telemetry (rates, failures by reason, output, chip temperature), host CPU load, the last known
+    armed state and the last autopilot parameter check (autopilot_params: param_checker.ParamChecker.summary,
+    the cached result; this GET never contacts the autopilot). telemetry is null until the PnP VIO publishes;
+    stale when it stopped.
     """
     if MOCK:
-        remember_vehicle_state(mock_mode.MockAutopilot().heartbeat_status())
+        remember_vehicle_state(make_autopilot().heartbeat_status())
     now = time.time()
     process = supervisor.status()
     vio_telemetry.touch_lease(vio_telemetry.STATUS_LEASE, telemetry_dir())
@@ -611,6 +618,7 @@ def get_status():
         "cpu_percent": cpu_sampler.percent(),
         "uptime_s": now - started if started and process.get("running") else None,
         "vehicle": vehicle,
+        "autopilot_params": param_checker.summary(now),
         "server_time": now,
     }
 
@@ -814,7 +822,8 @@ def widget_status_now() -> dict:
                                         depth, log_only_status(config)["log_only"], now, mock=MOCK,
                                         viewers=viewers,
                                         image_streams=image_streams_status(config, depth, telemetry, process,
-                                                                           viewers))
+                                                                           viewers),
+                                        autopilot_params=param_checker.summary(now))
 
 
 async def feature_events(directory: Path, limit: int, client: str = "page"):
@@ -1161,8 +1170,11 @@ def post_stereo_probe(cases: Optional[str] = None, mode: str = stereo_probe.CASE
 
 
 def make_autopilot() -> AutopilotParams:
+    global mock_autopilot
     if MOCK:
-        return mock_mode.MockAutopilot()
+        if mock_autopilot is None:
+            mock_autopilot = mock_mode.MockAutopilot(armed=mock_mode.mock_armed())
+        return mock_autopilot
     return AutopilotParams(load_config().get("vehicle_ip", "127.0.0.1"), timeout=AUTOPILOT_TIMEOUT)
 
 
@@ -1171,45 +1183,51 @@ def remember_vehicle_state(heartbeat: dict):
         vehicle_state.update(armed=heartbeat.get("armed"), detail=heartbeat.get("detail"), checked_at=time.time())
 
 
+def make_param_checker() -> param_checker_module.ParamChecker:
+    return param_checker_module.ParamChecker(lambda: make_autopilot(), attempts=lambda: AUTOPILOT_ATTEMPTS,
+                                             on_heartbeat=remember_vehicle_state,
+                                             log=lambda message: print(message, flush=True))
+
+
+# The recommended-parameter check (main page banner): every 30 s from startup, on the panel's read, after a write
+param_checker = make_param_checker()
+
+
 @app.post("/api/autopilot/params/read")
 def read_autopilot_params():
     """
-    The suggested optical-hold parameters (autopilot_params.SUGGESTED_OPTICAL_HOLD_PARAMS) as the autopilot
-    has them, via mavlink2rest: current, suggested, status ok/differs/unreadable, rationale, needs_reboot,
-    allowed range; plus the HEARTBEAT armed state. Only reads (PARAM_REQUEST_READ); never writes. POST
-    because it sends MAVLink requests to the autopilot.
+    The recommended parameters (autopilot_params.SUGGESTED_OPTICAL_HOLD_PARAMS) as the autopilot has them, via
+    mavlink2rest: current, suggested, status ok/differs/unreadable, rationale, needs_reboot, allowed range; plus
+    the HEARTBEAT armed state. Only reads (PARAM_REQUEST_READ); never writes. Also refreshes the parameter check
+    in /api/status (it waits for a check already running). POST because it sends MAVLink requests.
     """
-    autopilot = make_autopilot()
-    result = autopilot_params.read_suggested_params(autopilot, attempts=AUTOPILOT_ATTEMPTS)
-    remember_vehicle_state(result["heartbeat"])
-    return JSONResponse({**result, "mavlink2rest": autopilot.base_url, "read_at": time.time()},
+    result = param_checker.read()
+    summary = param_checker.summary()
+    if result is None:
+        raise HTTPException(status_code=502, detail=summary["error"])
+    return JSONResponse({**result, "mavlink2rest": summary["mavlink2rest"], "read_at": summary["checked_at"]},
                         headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/autopilot/params")
 def post_autopilot_params(body=Body(...)):
     """
-    Write suggested parameters: {"confirm": true, "params": {"NAME": value, ...}}. 400 without confirm, for
-    names outside the suggested table or values outside their range; 409 (nothing written) unless a new
-    HEARTBEAT arrives and says disarmed. Each written parameter is read back. Returns changed
-    [{name, old, new, readback}], failed, unchanged and reboot_required. Mock mode: always 403, nothing written.
+    Write recommended parameters: {"confirm": true, "params": {"NAME": value, ...}}. 400 without confirm, for
+    names outside the recommended table or values outside their range; 409 (nothing written) unless a new
+    HEARTBEAT arrives and says disarmed. Each written parameter is read back, then the parameter check runs
+    again. Returns changed [{name, old, new, readback}], failed, unchanged and reboot_required (never rebooted
+    from here). Mock mode writes to the in-memory mock autopilot.
     """
-    if MOCK:
-        return JSONResponse({"detail": mock_mode.WRITE_REFUSED, "mock": True}, status_code=403)
     if not isinstance(body, dict) or body.get("confirm") is not True:
         raise HTTPException(status_code=400, detail='writing needs {"confirm": true, "params": {...}}')
     problems = autopilot_params.validate_param_values(body.get("params"))
     if problems:
         raise HTTPException(status_code=400, detail="; ".join(problems))
-    autopilot = make_autopilot()
     try:
-        result = autopilot_params.write_suggested_params(autopilot, body["params"], heartbeat_wait=HEARTBEAT_WAIT,
-                                                         attempts=AUTOPILOT_ATTEMPTS)
+        result = param_checker.write(body["params"], heartbeat_wait=HEARTBEAT_WAIT)
     except autopilot_params.WriteRefused as e:
-        remember_vehicle_state(e.heartbeat)
         return JSONResponse({"detail": str(e), "heartbeat": e.heartbeat}, status_code=409)
-    remember_vehicle_state(result["heartbeat"])
-    return JSONResponse({**result, "written_at": time.time()}, headers={"Cache-Control": "no-store"})
+    return JSONResponse({**result, "mock": MOCK, "written_at": time.time()}, headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/start")
@@ -1236,14 +1254,16 @@ async def api_reset():
 
 @app.on_event("startup")
 async def startup_event():
-    """Start VIO on server startup"""
+    """Start VIO and the background parameter check on server startup"""
     start_vio()
+    param_checker.start()
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Stop VIO and the supervisor thread on server shutdown"""
+    """Stop VIO, the supervisor thread and the parameter check on server shutdown"""
     supervisor.shutdown()
+    param_checker.stop()
 
 
 if mock_mode.enabled():

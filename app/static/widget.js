@@ -274,6 +274,8 @@ function renderStatus(s) {
   if (!s.problem) {
     for (const [text, cls] of transportWidgetParts(s.depth_transport, s.viewers)) parts.push(span(text, cls));
   }
+  const params = paramWidgetText(s.autopilot_params);
+  if (params) parts.push(span(params, 'warn'));
   const pose = s.pose;
   if (!s.problem && pose && pose.attitude_source === 'gyro') {
     const gyro = span('3D pose attitude: gyro-integrated, drifting', 'warn');

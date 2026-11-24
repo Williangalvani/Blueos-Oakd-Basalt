@@ -9,7 +9,7 @@
 <body>
 <header>
   <h1>OAK-D VIO <span class="muted">(Option D)</span></h1>
-  <span id="pill-mock" class="pill mock" hidden title="Mock mode: synthetic camera and a simulated, read-only autopilot (OAKD_MOCK=1)">MOCK</span>
+  <span id="pill-mock" class="pill mock" hidden title="Mock mode: synthetic camera and a simulated, in-memory autopilot (OAKD_MOCK=1)">MOCK</span>
   <span id="pill-camera" class="pill">camera ?</span>
   <span id="pill-vio" class="pill">VIO ?</span>
   <span id="pill-output" class="pill">output ?</span>
@@ -17,6 +17,18 @@
   <span id="header-right" class="muted header-right">vehicle: ? · uptime – · CPU –</span>
 </header>
 <div id="log-only-banner" class="log-only" hidden></div>
+<div id="params-check" class="params-check checking">
+  <div class="params-head">
+    <b id="params-title">Checking the autopilot parameters…</b>
+    <span id="params-detail" class="muted"></span>
+    <button type="button" class="w small" id="params-configure" onclick="openConfigureDialog()" hidden>Configure…</button>
+  </div>
+  <table id="params-table" class="params-table" hidden>
+    <thead><tr><th>Param</th><th>Current</th><th></th><th>Recommended</th><th></th></tr></thead>
+    <tbody id="params-table-body"></tbody>
+  </table>
+  <div id="params-notes" class="params-notes"></div>
+</div>
 
 <main>
 <section class="c4" id="panel-status">

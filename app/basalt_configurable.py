@@ -9,7 +9,6 @@ import time
 import argparse
 import depthai as dai
 from mavlink_node import MavlinkNode
-from autopilot_params import AutopilotParams
 from device_open import DEFAULT_TIMEOUT, DeviceOpenTimeout, open_oak_device
 from vio_log import LOG_ONLY_BANNER, env_forces_log_only, open_vio_log, resolve_log_only
 
@@ -83,8 +82,6 @@ def run(args, log_only, data_log):
     if log_only:
         print(f"⚠️ {LOG_ONLY_BANNER}", flush=True)
         data_log.event("warning", message=LOG_ONLY_BANNER)
-    else:
-        AutopilotParams(args.vehicle_ip).configure_visual_odometry()
 
     def log_device_open(message):
         print(message, flush=True)

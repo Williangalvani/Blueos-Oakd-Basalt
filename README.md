@@ -7,53 +7,56 @@ It uses the [depthai-core](https://github.com/luxonis/depthai-core) `BasaltVIO` 
 ## What it does on startup
 
 1. Starts a configuration web page on port **8095** (8080 is used by mavlink-server on BlueOS 1.4.x).
-2. Configures the autopilot's EKF to use visual odometry (see below).
-3. Starts the VIO pipeline with the saved settings and begins sending MAVLink.
+2. Starts the VIO pipeline with the saved settings and begins sending MAVLink.
+3. Checks the autopilot's parameters against the recommended set (below), read-only, and shows the result on the page.
+
+It never changes autopilot parameters by itself.
 
 ## Autopilot parameters
 
-Every time VIO starts, the extension reads these parameters from the autopilot (system 1, component 1) and writes any that differ:
+`SUGGESTED_OPTICAL_HOLD_PARAMS` in [`app/autopilot_params.py`](app/autopilot_params.py) is the one recommended set for position hold on `VISION_POSITION_DELTA` (ArduSub, EKF3): name, value, whether it needs a reboot, and why, with references to the ArduPilot source.
 
-| Parameter | Value | Meaning | Needs reboot |
+| Parameter | Recommended | Reboot | Why |
 |---|---|---|---|
-| `AHRS_EKF_TYPE` | 3 | Use EKF3 | yes |
-| `EK3_ENABLE` | 1 | Enable EKF3 | yes |
-| `VISO_TYPE` | 1 | Visual odometry over MAVLink | yes |
-| `EK3_SRC1_POSXY` | 6 | Horizontal position from ExternalNav | no |
-| `EK3_SRC1_VELXY` | 6 | Horizontal velocity from ExternalNav | no |
-| `EK3_SRC1_POSZ` | 1 | Depth/altitude from the barometer | no |
-
-- Parameters are only changed while the vehicle is **disarmed**. If it is armed, the step is skipped and a warning is logged.
-- Each write is confirmed against the autopilot's `PARAM_VALUE` reply.
-- If a parameter that needs a reboot was changed, the log says so. The extension never reboots the autopilot itself. Reboot it from BlueOS or your ground station once after the first install.
-- Any custom EKF source setup on the vehicle will be overwritten on each start. To change the list, edit `VISUAL_ODOMETRY_PARAMS` in [`app/autopilot_params.py`](app/autopilot_params.py).
-
-The log lines look like this (BlueOS → Extensions → Installed → the extension's logs):
-
-```
-VISO_TYPE: 0 -> 1
-EK3_SRC1_POSXY: 0 -> 6
-EK3_SRC1_VELXY: 3 -> 6
-EK3_SRC1_POSZ = 1 (already set)
-Reboot the autopilot for VISO_TYPE to take effect
-```
-
-### Suggested parameters for optical position hold (written only from the page)
-
-`SUGGESTED_OPTICAL_HOLD_PARAMS` in [`app/autopilot_params.py`](app/autopilot_params.py) lists what position hold on `VISION_POSITION_DELTA` should use: name, suggested value, whether it needs a reboot, and why. `diff_params(current)` compares it with a `{name: value}` dict and returns the entries that differ or are missing, with status `change` or `missing`. Float32 rounding is ignored. The page's [ArduPilot panel](#ardupilot-panel) shows them next to the vehicle's values and writes them only when you confirm, while the vehicle is disarmed. Nothing writes them at startup, and the automatic setup above is unchanged.
-
-| Parameter | Suggested | Reboot | Why |
-|---|---|---|---|
-| `VISO_TYPE` | 1 | yes | MAVLink visual odometry. |
+| `AHRS_EKF_TYPE` | 3 | yes | EKF3 (ArduPilot's default). Only EKF3 takes `VISION_POSITION_DELTA`. |
+| `EK3_ENABLE` | 1 | yes | EKF3 enabled (default). |
+| `VISO_TYPE` | 1 | yes | MAVLink visual odometry. The other `VISO_*` parameters only appear after this is set and the autopilot rebooted. |
 | `VISO_POS_X/Y/Z` | 0.1655, −0.0069, 0.180 | no | Camera relative to the IMU, m FRD, from the CAD. EKF3 applies this lever arm itself (see [Lever arm](#lever-arm-viso_pos-pnp)). |
 | `VISO_ORIENT` | 0 | no | The extension already rotates into body FRD. |
-| `VISO_DELAY_MS` | keep | no | Unverified; tune from logs. |
-| `EK3_SRC1_VELXY` | 6 | no | Fuse the visual body velocity. |
-| `EK3_SRC1_POSXY` | 0 | no | None: the EKF dead-reckons a relative position from the visual velocity, which ArduSub accepts for position hold with visual odometry enabled. 3 (GPS) only helps with a fix at the surface. |
+| `VISO_DELAY_MS` | keep | no | Unverified; tune from logs. Never counted as a difference. |
+| `EK3_SRC1_VELXY` | 6 | no | ExternalNav: the EKF fuses the visual body velocity only with this. |
+| `EK3_SRC1_POSXY` | 0 | no | None: see below. |
 | `EK3_SRC1_POSZ` | 1 | no | Baro (depth). |
+| `EK3_SRC1_VELZ` | 0 | no | None (ArduSub's default): the body-frame deltas already carry the vertical velocity. |
 | `EK3_SRC1_YAW` | 1 | no | Compass: the deltas carry no heading. |
 
-The automatic setup sets `EK3_SRC1_POSXY` to 6 (ExternalNav). That asks for an absolute position this extension never sends; with only `VISION_POSITION_DELTA` the EKF ends up in relative aiding, as with 0.
+Why `EK3_SRC1_POSXY` = 0 and not 6 (ArduPilot master 6f5d8560db):
+
+- `VISION_POSITION_DELTA` becomes body-frame odometry (`AP_VisualOdom_Backend.cpp:62`), fused only when `EK3_SRC1_VELXY` is ExternalNav (`AP_NavEKF3_PosVelFusion.cpp:2059-2063`, `AP_NavEKF3_Control.cpp:572-576`).
+- With POSXY 6 the EKF waits for an absolute ExternalNav position (`VISION_POSITION_ESTIMATE`, `AP_NavEKF3_Control.cpp:619-626`) that this extension never sends. It therefore ends up in relative aiding anyway (`AP_NavEKF3_Control.cpp:297-305`), exactly as with 0, so 6 only misleads.
+- In relative aiding the EKF dead-reckons a relative position from the body velocity (`AP_NavEKF3_Control.cpp:791, 812`). ArduSub's position hold accepts that relative position while visual odometry is enabled (`ArduSub/system.cpp:196-204, 234-266`).
+- 3 (GPS) needs a GPS fix (`AP_NavEKF3_Control.cpp:595-601`), which is lost when submerged.
+
+### The check and the Configure button
+
+The page checks the autopilot every 30 s, on demand (the [ArduPilot panel](#ardupilot-panel)'s *Read*) and right after a write. Checks only send `PARAM_REQUEST_READ`. While mavlink2rest or the autopilot does not answer, the check backs off up to 5 minutes. `/api/status` carries the cached result as `autopilot_params`: `checked_at`, `reachable`, `armed`, `ok`, `mismatches` (`name`, `current`, `recommended`, `needs_reboot`), `unreadable`, `pending_reboot` and `error`.
+
+The top of the page shows one of these:
+
+- **A warning** ("Autopilot parameters differ from the recommended setup"): a table of current → recommended, with the parameters that need a reboot marked.
+- **Not checked**: mavlink2rest or the autopilot HEARTBEAT is missing.
+- **A reboot reminder**: everything is written but the autopilot has not rebooted since. This clears once `SYSTEM_TIME` shows the autopilot booted after the write.
+- **A small green line**: everything matches.
+
+*Configure…* opens a dialog listing exactly the changes. Nothing is written until you confirm. The write then goes through the same guarded `POST /api/autopilot/params` as the ArduPilot panel:
+
+- It is refused (HTTP 409, nothing written) unless a fresh HEARTBEAT says the vehicle is disarmed.
+- Each value is read back and shown in the dialog.
+- Parameters that need a reboot are listed. The extension never reboots the autopilot: do it from BlueOS or your ground station.
+
+The Cockpit widget shows a one-line hint when the parameters differ or a reboot is pending.
+
+`diff_params(current)` compares the set with a `{name: value}` dict and returns the entries that differ or are missing. Float32 rounding is ignored.
 
 ## MAVLink output
 
@@ -197,7 +200,7 @@ The camera is about 0.17 m forward and 0.18 m below the IMU. When the vehicle ro
 - `AP_VisualOdom_Backend::handle_vision_position_delta_msg` (`libraries/AP_VisualOdom/AP_VisualOdom_Backend.cpp`, ~l.62–69) passes `_frontend.get_pos_offset()`, i.e. `VISO_POS_X/Y/Z`, to `AP::ahrs().writeBodyFrameOdom(...)`.
 - EKF3 (`libraries/AP_NavEKF3/AP_NavEKF3_PosVelFusion.cpp`, ~l.1493–1498) predicts the sensor velocity as the body velocity plus `(delAng / delAngDT) × posOffsetBody`, with `posOffsetBody = VISO_POS − INS_POS`. So `VISO_POS_*` is relative to the vehicle origin; with `INS_POS_*` at 0 that is the IMU.
 
-Set `VISO_POS_X/Y/Z` on the autopilot to the lever arm (0.1655, −0.0069, 0.180 m from the CAD; see [Suggested parameters](#suggested-parameters-for-optical-position-hold-written-only-from-the-page)). *Lever arm diagnostics* only adds JSONL step fields, for comparing the two in logs:
+Set `VISO_POS_X/Y/Z` on the autopilot to the lever arm (0.1655, −0.0069, 0.180 m from the CAD; see [Autopilot parameters](#autopilot-parameters)). *Lever arm diagnostics* only adds JSONL step fields, for comparing the two in logs:
 
 - `lever_delta_position`: the IMU delta, `position_delta − (r − Rᵀr)`, body FRD, m;
 - `lever_delta_correction`: the `r − Rᵀr` term;
@@ -215,10 +218,10 @@ The page is backed by a small HTTP API:
 | GET | `/api/config/schema` | Every setting: `name`, `type`, `min`, `max`, `default`, `help`, `label`, `group`, `choices`, `nullable` |
 | POST | `/api/config` | Validate and save settings (JSON body, same keys; missing keys get defaults) and restart VIO. 422 lists every invalid field: `detail: [{field, msg, loc, type}]`, e.g. `FPS (fps): must be between 1 and 60 (got 0)`; nothing is saved |
 | POST | `/api/log_only` | `{"log_only": true\|false}`: save the setting and restart VIO; 400 for anything else |
-| GET | `/api/status` | Whether the VIO process is running, restarts, whether log-only mode is active (`log_only`, `log_only_forced_by_env`), and for PnP the `camera` matrix in use (`null` until the first frame): the in-air `intrinsics`, `effective_intrinsics`, `refractive_index`, `depth_scale` and `total_depth_scale`. Also `algorithm`, `telemetry` (PnP live status, below; `null` until published, `stale: true` when VIO stopped; `telemetry.link` is the [camera link](#camera-link-bandwidth)), `camera_connected`, `chip_temperature_c`, `cpu_percent`, `uptime_s`, the last known `vehicle` armed state and `mock` (true in [mock mode](#mock-mode-no-oak-d-no-autopilot)). `depth_transport` ([depth at the features](#depth-at-the-features-pnp-depth_transport): the settings, the live pairing counters and the camera's CPU / memory load), `viewers` and `image_streams` ([images on demand](#images-on-demand-and-viewers)) |
+| GET | `/api/status` | Whether the VIO process is running, restarts, whether log-only mode is active (`log_only`, `log_only_forced_by_env`), and for PnP the `camera` matrix in use (`null` until the first frame): the in-air `intrinsics`, `effective_intrinsics`, `refractive_index`, `depth_scale` and `total_depth_scale`. Also `algorithm`, `telemetry` (PnP live status, below; `null` until published, `stale: true` when VIO stopped; `telemetry.link` is the [camera link](#camera-link-bandwidth)), `camera_connected`, `chip_temperature_c`, `cpu_percent`, `uptime_s`, the last known `vehicle` armed state, the cached [parameter check](#the-check-and-the-configure-button) `autopilot_params` (this GET never contacts the autopilot) and `mock` (true in [mock mode](#mock-mode-no-oak-d-no-autopilot)). `depth_transport` ([depth at the features](#depth-at-the-features-pnp-depth_transport): the settings, the live pairing counters and the camera's CPU / memory load), `viewers` and `image_streams` ([images on demand](#images-on-demand-and-viewers)) |
 | GET | `/api/history?seconds=60&max_points=600&tail=0` | PnP plot history, oldest first, `t` in seconds before `server_time`: `vx`, `vy`, `vz` (m/s, body FRD, `null` for rejected frames), integrated `x`, `y`, `yaw`, `inliers`, `ok`. At most `max_points` (≤ 600) over `seconds` (≤ 600); `tail` (≤ 10 s) adds the newest frames at full rate. `dvl` holds the [DVL overlay](#dvl-overlay). Weak `ETag`; `If-None-Match` gives 304 |
 | POST | `/api/autopilot/params/read` | The suggested optical-hold parameters as the vehicle has them, and the HEARTBEAT armed state. Read only (POST because it sends MAVLink requests). See [ArduPilot panel](#ardupilot-panel) |
-| POST | `/api/autopilot/params` | `{"confirm": true, "params": {"NAME": value}}`: guarded write with read-back (403 in mock mode). See [ArduPilot panel](#ardupilot-panel) |
+| POST | `/api/autopilot/params` | `{"confirm": true, "params": {"NAME": value}}`: guarded write with read-back, refused (409) unless a fresh HEARTBEAT says disarmed. See [ArduPilot panel](#ardupilot-panel) |
 | GET | `/api/logs` | Data logs: name, size (bytes), mtime (unix time), newest first |
 | GET | `/api/logs/{name}` | Download one data log |
 | POST | `/api/start`, `/api/stop` | Start or stop VIO |
@@ -532,11 +535,11 @@ With *DVL overlay source* `auto`, `main.py` ([`app/dvl_source.py`](app/dvl_sourc
 
 ### ArduPilot panel
 
-The panel reads the [suggested parameters](#suggested-parameters-for-optical-position-hold-written-only-from-the-page) with `PARAM_REQUEST_READ` and shows current, suggested (editable), status (`ok`, `differs`, `unreadable`), why and *reboot*, plus the armed state from the autopilot's HEARTBEAT (`base_mode & 128`). Reading (`POST /api/autopilot/params/read`, on load and on *Re-read*) never writes. Both reading and writing are POST, so no GET (BlueOS's API scan, a browser prefetch) reaches the autopilot.
+The panel reads the [recommended parameters](#autopilot-parameters) with `PARAM_REQUEST_READ` and shows current, suggested (editable), status (`ok`, `differs`, `unreadable`), why and *reboot*, plus the armed state from the autopilot's HEARTBEAT (`base_mode & 128`). Reading (`POST /api/autopilot/params/read`, on load and on *Re-read*) never writes; it also refreshes the [parameter check](#the-check-and-the-configure-button) at the top of the page. Both reading and writing are POST, so no GET (BlueOS's API scan, a browser prefetch) reaches the autopilot.
 
 Writing (`POST /api/autopilot/params`):
 
-- The page's *Write selected…* opens a dialog listing each change (`NAME old → new`, reboot flag) and the armed state; a second, explicit click sends `{"confirm": true, "params": {...}}`. Nothing is written automatically or at startup.
+- The page's *Write selected…* (and the check's *Configure…*, with exactly the differences) opens a dialog listing each change (`NAME old → new`, reboot flag) and the armed state; a second, explicit click sends `{"confirm": true, "params": {...}}`. Nothing is written automatically or at startup.
 - 400 without `"confirm": true`, for any name outside the suggested table, and for values outside the parameter's range or allowed values (e.g. `VISO_TYPE` 0–3, `VISO_POS_*` ±5 m, `VISO_ORIENT` 0/2/4/6/24/25); one bad entry rejects the whole request.
 - 409, nothing written, unless a HEARTBEAT that arrives during the request (its counter must advance within 2.5 s) says disarmed: armed, no HEARTBEAT, a stale one, or no mavlink2rest all refuse. The armed bit is checked again before each `PARAM_SET`; if the vehicle arms midway, the rest are reported as failed and not written.
 - Each written parameter is read back with a fresh `PARAM_REQUEST_READ`. The response lists `changed` (`name`, `old`, `new`, `readback`), `failed` (with the error, e.g. a read-back mismatch), `unchanged` and `reboot_required`. The autopilot is never rebooted by the extension.
@@ -577,7 +580,7 @@ OAKD_MOCK=1 ../.venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8095
 - **Camera link:** synthetic XLink counters, labelled `mock (synthetic XLink counters)` and `"mock": true`: down is the bytes the fake VIO counts for its streams (the same accounting as on the camera) + 1 % + 1.5 kB/s, up the counted up streams + 0.8 kB/s; USB SUPER. With `points` about 4.1 Mbps down (`depth_points` 2.2, `features` 1.5, `imu` 0.3) and 1.1 Mbps up (`depth_points_rois`) at the mock's 10 fps; with `full_frame` about 43 Mbps down. They only show that the box works, not what a camera sends. `--scenario link` of `ui_screenshots.py` screenshots the box and the widget line.
 - **Depth transport:** `points` (the default) and `full_frame` as described in [Depth at the features](#depth-at-the-features-pnp-depth_transport), with both ROI sources, the full depth gate, the camera load (its Leon CPU follows the emulated work) and the viewers.
 - **Snapshots:** each snapshot shows the scene at its request time. `rect_left` / `rect_right` come as JPEGs (OpenCV standing in for the camera's encoder, quality 95, counted at their size), `depth` raw. The depth probe and the focal check therefore give real results on the synthetic frames. RGB is "not available".
-- **Autopilot:** simulated and read-only (`mock_mode.MockAutopilot`). The HEARTBEAT is always disarmed, and `POST /api/autopilot/params/read` returns fixed values (some differ from the suggestions). `POST /api/autopilot/params` always answers 403 and writes nothing.
+- **Autopilot:** simulated in memory (`mock_mode.MockAutopilot`), with the dev vehicle's parameters, so the [parameter check](#the-check-and-the-configure-button) warns about `VISO_POS_X/Y/Z` and `EK3_SRC1_POSXY`. *Configure…* writes the in-memory values (until the server restarts). The HEARTBEAT is disarmed; `OAKD_MOCK_ARMED=1` makes it armed, so writes are refused (409).
 - **DVL:** the overlay is fed by an in-process fake mavlink2rest.
 - **Network:** urllib refuses every URL, so nothing leaves the machine. The fake VIO opens no MAVLink connection; "messages sent" counts what would have been sent.
 - **Visible:** a purple MOCK badge on the page and in the widget's status line, and `"mock": true` in `/api/status` (and in the widget's status events).
@@ -590,7 +593,7 @@ On a vehicle whose EKF already uses ExternalNav (`VISO_TYPE` 1, `EK3_SRC1_VELXY`
 - set `OAKD_LOG_ONLY=1` in the container environment; this forces log-only whatever the saved setting, and the page shows that it is forced,
 - run `pnp_vio.py` or `basalt_configurable.py` with `--log-only`.
 
-In log-only mode the autopilot parameters are neither read nor written and no MAVLink connection is created, so nothing reaches mavlink2rest. The VIO process logs `LOG-ONLY: no MAVLink output, autopilot params untouched` at startup.
+In log-only mode the VIO process neither reads nor writes autopilot parameters and creates no MAVLink connection. It logs `LOG-ONLY: no MAVLink output, autopilot params untouched` at startup. The web page's [parameter check](#the-check-and-the-configure-button) keeps running: it only reads (`PARAM_REQUEST_READ`) and writes nothing unless you confirm *Configure…*.
 
 Each VIO process start writes a JSONL file to `/app/data/logs/` (`/usr/blueos/extensions/oakd-vio/logs/` on the vehicle), named `vio-YYYYmmdd-HHMMSS-<pid>.jsonl`, in both modes. Every line has `type`, `wall_time` (ISO, UTC), `unix_time` and `monotonic`. Lines are flushed as they are written.
 

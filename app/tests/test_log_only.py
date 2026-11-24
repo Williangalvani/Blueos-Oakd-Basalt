@@ -35,20 +35,28 @@ def test_env_var_unset_and_no_flag_is_not_log_only():
     assert vio_log.resolve_log_only(False, {}) is False
 
 
-def test_log_only_constructs_no_sender_and_touches_no_params():
-    params, sender, messages = mock.Mock(), mock.Mock(), []
-    result = vio_log.setup_autopilot_output(True, "192.168.2.2", params, sender, log=messages.append)
+@pytest.fixture
+def no_param_access(monkeypatch):
+    """Every MAVLink request through AutopilotParams fails the test: no parameter reads or writes at VIO start."""
+    import autopilot_params
+
+    def refuse(*args, **kwargs):
+        pytest.fail("the VIO start must not touch autopilot parameters")
+    for name in ("_post", "read", "write"):
+        monkeypatch.setattr(autopilot_params.AutopilotParams, name, refuse)
+
+
+def test_log_only_constructs_no_sender_and_touches_no_params(no_param_access):
+    sender, messages = mock.Mock(), []
+    result = vio_log.setup_autopilot_output(True, "192.168.2.2", sender, log=messages.append)
     assert result is None
-    params.assert_not_called()
     sender.assert_not_called()
     assert messages == [vio_log.LOG_ONLY_BANNER]
 
 
-def test_normal_mode_configures_params_and_connects_sender():
-    params, sender = mock.Mock(), mock.Mock()
-    result = vio_log.setup_autopilot_output(False, "192.168.2.2", params, sender, log=lambda m: None)
-    params.assert_called_once_with("192.168.2.2")
-    params.return_value.configure_visual_odometry.assert_called_once_with()
+def test_normal_mode_connects_the_sender_and_writes_no_params(no_param_access):
+    sender = mock.Mock()
+    result = vio_log.setup_autopilot_output(False, "192.168.2.2", sender, log=lambda m: None)
     sender.assert_called_once_with("ws://192.168.2.2/mavlink2rest/ws/mavlink?filter=SEND_ONLY")
     sender.return_value.connect.assert_called_once_with()
     assert result is sender.return_value
@@ -63,7 +71,6 @@ def pnp_vio(monkeypatch, tmp_path):
     module = importlib.import_module("pnp_vio")
     monkeypatch.setattr(vio_log, "LOG_DIR", tmp_path)
     monkeypatch.setattr(module, "open_vio_log", lambda: vio_log.open_vio_log(tmp_path))
-    monkeypatch.setattr(module, "AutopilotParams", mock.Mock())
     monkeypatch.setattr(module, "MavlinkSender", mock.Mock())
 
     def no_device(timeout, log):
@@ -85,11 +92,10 @@ def run_pnp_main(module, argv):
 
 
 @pytest.mark.parametrize("argv, env", [(["--log-only"], None), ([], "1")])
-def test_pnp_vio_log_only_never_builds_sender_or_params(pnp_vio, monkeypatch, argv, env):
+def test_pnp_vio_log_only_never_builds_sender_or_params(pnp_vio, no_param_access, monkeypatch, argv, env):
     if env is not None:
         monkeypatch.setenv(vio_log.LOG_ONLY_ENV, env)
     lines = run_pnp_main(pnp_vio, argv)
-    pnp_vio.AutopilotParams.assert_not_called()
     pnp_vio.MavlinkSender.assert_not_called()
 
     events = [line["event"] for line in lines]
@@ -100,10 +106,10 @@ def test_pnp_vio_log_only_never_builds_sender_or_params(pnp_vio, monkeypatch, ar
     assert lines[-1]["exit_code"] == 2
 
 
-def test_pnp_vio_normal_mode_still_configures_autopilot(pnp_vio):
+def test_pnp_vio_normal_mode_sends_but_never_configures_the_autopilot(pnp_vio, no_param_access):
     lines = run_pnp_main(pnp_vio, ["--vehicle-ip", "10.0.0.1"])
-    pnp_vio.AutopilotParams.assert_called_once_with("10.0.0.1")
-    pnp_vio.MavlinkSender.assert_called_once()
+    assert not hasattr(pnp_vio, "AutopilotParams")
+    pnp_vio.MavlinkSender.assert_called_once_with("ws://10.0.0.1/mavlink2rest/ws/mavlink?filter=SEND_ONLY")
     pnp_vio.MavlinkSender.return_value.close.assert_called_once_with()
     assert lines[0]["log_only"] is False
 

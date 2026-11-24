@@ -7,8 +7,8 @@ OAKD_MOCK=1 in the environment (or main.py --mock) makes main.py:
 - launch mock_vio.py instead of pnp_vio.py / basalt_configurable.py, through the same VIOSupervisor. The
   fake VIO publishes through the real telemetry, depth stream, feature stream, snapshot and depth probe
   services, so every web server code path runs as with a camera;
-- use MockAutopilot for the ArduPilot panel: a disarmed HEARTBEAT and fixed parameter values, read only;
-  POST /api/autopilot/params is refused before anything else;
+- use one MockAutopilot for the parameter checker and the ArduPilot panel: a disarmed HEARTBEAT (ARMED with
+  OAKD_MOCK_ARMED=1) and the dev vehicle's parameter values, which a confirmed write changes in memory;
 - feed the DVL overlay from dvl_fetch (a fake mavlink2rest answering in-process), and the mock VIO's 3D pose
   attitude from attitude_fetch (the same, in the VIO process; with gaps, OAKD_MOCK_ATTITUDE);
 - make urllib refuse every URL (block_network), so no request ever leaves the process.
@@ -20,6 +20,7 @@ import datetime
 import math
 import os
 import random
+import struct
 import sys
 import tempfile
 import time
@@ -35,11 +36,15 @@ MOCK_VIO = APP_DIR / "mock_vio.py"
 # Saved on first start in mock mode: the PnP algorithm at a resolution the widget shows well
 INITIAL_CONFIG = {"algorithm": "pnp", "fps": 10, "resolution_width": 640, "resolution_height": 400}
 AUTOPILOT_URL = "mock://autopilot"
-WRITE_REFUSED = "mock mode: the autopilot is simulated and read-only; nothing was written"
-# What the mock autopilot reports; VISO_POS_* and EK3_SRC1_POSXY differ from the suggestions on purpose
+# OAKD_MOCK_ARMED=1: the mock autopilot reports ARMED, so the page's writes are refused
+ARMED_ENV = "OAKD_MOCK_ARMED"
+# What the mock autopilot starts with: the dev vehicle's values, so VISO_POS_* and EK3_SRC1_POSXY differ from the
+# recommended set
 PARAM_VALUES = {
+    "AHRS_EKF_TYPE": 3.0, "EK3_ENABLE": 1.0,
     "VISO_TYPE": 1.0, "VISO_POS_X": 0.0, "VISO_POS_Y": 0.0, "VISO_POS_Z": 0.0, "VISO_ORIENT": 0.0,
-    "VISO_DELAY_MS": 10.0, "EK3_SRC1_VELXY": 6.0, "EK3_SRC1_POSXY": 6.0, "EK3_SRC1_POSZ": 1.0, "EK3_SRC1_YAW": 1.0,
+    "VISO_DELAY_MS": 10.0, "EK3_SRC1_VELXY": 6.0, "EK3_SRC1_POSXY": 6.0, "EK3_SRC1_POSZ": 1.0, "EK3_SRC1_VELZ": 0.0,
+    "EK3_SRC1_YAW": 1.0,
 }
 DVL_SYSTEM, DVL_COMPONENT = 1, 197
 DVL_RATE_HZ = 5.0
@@ -132,34 +137,52 @@ def attitude(t):
     return tuple(amplitude * math.sin(tau * t / period) for amplitude, period in (ROLL_WOBBLE, PITCH_WOBBLE))
 
 
-class MockAutopilot:
-    """autopilot_params.AutopilotParams for mock mode: disarmed, fixed parameter values, never writes."""
+def mock_armed(environ=None):
+    environ = os.environ if environ is None else environ
+    return environ.get(ARMED_ENV, "").strip().lower() in TRUE_VALUES
 
-    def __init__(self, values=None, clock=time.time):
+
+def _float32(value):
+    return struct.unpack("f", struct.pack("f", float(value)))[0]
+
+
+class MockAutopilot:
+    """
+    autopilot_params.AutopilotParams for mock mode, in memory: a HEARTBEAT (disarmed unless `armed`), the
+    parameters in `values` (float32 like a real autopilot), PARAM_SET changes them. Never touches the network.
+    """
+
+    def __init__(self, values=None, armed=False, clock=time.time):
         self.base_url = AUTOPILOT_URL
-        self.values = dict(PARAM_VALUES if values is None else values)
+        self.values = {name: _float32(value) for name, value in (PARAM_VALUES if values is None else values).items()}
+        self.armed = armed
         self.clock = clock
+        self.booted_at = clock()
 
     def heartbeat_status(self, now=None):
         now = self.clock() if now is None else now
-        return {"reachable": True, "armed": False, "counter": int(now), "age_s": now % 1.0,
-                "detail": "disarmed (mock autopilot)"}
+        state = "ARMED" if self.armed else "disarmed"
+        return {"reachable": True, "armed": self.armed, "counter": int(now), "age_s": now % 1.0,
+                "detail": f"{state} (mock autopilot)"}
 
     def live_armed_state(self, wait=2.5, poll=0.1):
         return self.heartbeat_status()
 
     def is_armed(self):
-        return False
+        return self.armed
+
+    def boot_time(self, now=None):
+        return self.booted_at
 
     def read(self, name, attempts=3):
         value = self.values.get(name)
         return None if value is None else (value, "MAV_PARAM_TYPE_REAL32")
 
     def write(self, name, value, param_type, attempts=3):
-        raise PermissionError(WRITE_REFUSED)
-
-    def configure_visual_odometry(self):
-        pass
+        if name not in self.values:
+            return None
+        self.values[name] = _float32(value)
+        return self.values[name], param_type
 
 
 def _iso(t):

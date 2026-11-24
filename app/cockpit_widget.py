@@ -83,12 +83,14 @@ def widget_problem(config, process, telemetry):
     return None
 
 
-def widget_status(problem, telemetry, depth, log_only, now, mock=False, viewers=None, image_streams=None):
+def widget_status(problem, telemetry, depth, log_only, now, mock=False, viewers=None, image_streams=None,
+                  autopilot_params=None):
     """
     The status line of the widget: one small JSON object, sent once a second. mock: mock mode (no camera).
     viewers: main.py's viewers.ViewerRegistry.status (who is watching; "video idle" when nobody watches video).
     depth_transport: "points" or "full_frame" with the share of frames that got their depth.
     raw_fallbacks: main.image_streams_status's fallbacks (image streams sent raw and encoded on the Pi).
+    autopilot_params: the parameter check (param_checker.ParamChecker.summary) without the mismatch details.
     """
     telemetry = telemetry if telemetry and not telemetry.get("stale") else {}
     recent = telemetry.get("recent") or {}
@@ -130,4 +132,9 @@ def widget_status(problem, telemetry, depth, log_only, now, mock=False, viewers=
                                                                  "last_problem")} if transport else None,
         "viewers": {key: viewers.get(key) for key in ("total", "video", "video_idle", "text")} if viewers else None,
         "raw_fallbacks": list((image_streams or {}).get("fallbacks") or ()),
+        "autopilot_params": None if autopilot_params is None else {
+            "checked_at": autopilot_params.get("checked_at"), "reachable": autopilot_params.get("reachable"),
+            "ok": autopilot_params.get("ok"), "mismatches": [{"name": m["name"]} for m in autopilot_params["mismatches"]],
+            "unreadable": list(autopilot_params["unreadable"]),
+            "pending_reboot": list(autopilot_params["pending_reboot"])},
     }

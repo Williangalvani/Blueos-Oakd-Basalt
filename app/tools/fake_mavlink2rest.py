@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-A fake mavlink2rest for tests and the UI demo server: an autopilot with parameters and a HEARTBEAT (armed
-or not), our own VISION_POSITION_DELTA (system 1, component 195) and optionally a DVL's
+A fake mavlink2rest for tests and the UI demo server: an autopilot with parameters, a HEARTBEAT (armed
+or not) and a SYSTEM_TIME (reboot() restarts its time_boot_ms), our own VISION_POSITION_DELTA (system 1, component 195) and optionally a DVL's
 VISION_POSITION_DELTA, in mavlink2rest's REST shapes:
 
   GET  /mavlink2rest/mavlink/vehicles                                    the message tree
@@ -32,8 +32,8 @@ ARMED_FLAG = 128
 
 DEFAULT_PARAMS = {
     "VISO_TYPE": 0, "VISO_POS_X": 0.0, "VISO_POS_Y": 0.0, "VISO_POS_Z": 0.0, "VISO_ORIENT": 0,
-    "VISO_DELAY_MS": 10, "EK3_SRC1_VELXY": 0, "EK3_SRC1_POSXY": 6, "EK3_SRC1_POSZ": 1, "EK3_SRC1_YAW": 1,
-    "AHRS_EKF_TYPE": 3, "EK3_ENABLE": 1,
+    "VISO_DELAY_MS": 10, "EK3_SRC1_VELXY": 0, "EK3_SRC1_POSXY": 6, "EK3_SRC1_POSZ": 1, "EK3_SRC1_VELZ": 0,
+    "EK3_SRC1_YAW": 1, "AHRS_EKF_TYPE": 3, "EK3_ENABLE": 1,
 }
 FLOAT_PARAMS = {"VISO_POS_X", "VISO_POS_Y", "VISO_POS_Z"}
 
@@ -79,6 +79,7 @@ class FakeVehicle:
         self.reachable = reachable
         self.ignore_param_set = set(ignore_param_set)
         self.started = clock()
+        self.booted = self.started - 600.0  # the autopilot's boot (SYSTEM_TIME.time_boot_ms); reboot() resets it
         self.posted = []
         self.requests = []
         self.param_value = None
@@ -109,6 +110,18 @@ class FakeVehicle:
                             "system_status": {"type": "MAV_STATE_ACTIVE" if self.armed else "MAV_STATE_STANDBY"}},
                            counter, last, self.heartbeat_hz)
 
+    def system_time_entry(self):
+        if not self.heartbeat:
+            return None
+        counter, last = self._ticks(self.heartbeat_hz)
+        return self._entry({"type": "SYSTEM_TIME", "time_unix_usec": int(last * 1e6),
+                            "time_boot_ms": int((last - self.booted) * 1000)}, counter, last, self.heartbeat_hz)
+
+    def reboot(self):
+        """The autopilot restarts now: SYSTEM_TIME.time_boot_ms starts again from 0."""
+        with self.lock:
+            self.booted = self.clock()
+
     def dvl_entry(self):
         if self.dvl_velocity is None:
             return None
@@ -133,6 +146,8 @@ class FakeVehicle:
             if (system, component) == AUTOPILOT:
                 if name == "HEARTBEAT":
                     return self.heartbeat_entry()
+                if name == "SYSTEM_TIME":
+                    return self.system_time_entry()
                 if name == "PARAM_VALUE" and self.param_value is not None:
                     return self._entry(self.param_value, self.param_value_counter, self.param_value_time, 0.0)
             if (system, component) == OWN_VIO and name == "VISION_POSITION_DELTA":

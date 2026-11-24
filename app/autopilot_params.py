@@ -1,7 +1,7 @@
 """
-Configures the autopilot's EKF to fuse the VISION_POSITION_DELTA messages sent by this extension, and
-reads/writes the suggested optical-hold parameters for the web page's ArduPilot panel (writes only on an
-explicit, confirmed request while a live HEARTBEAT says disarmed).
+The recommended autopilot parameters for fusing this extension's VISION_POSITION_DELTA (ArduSub, EKF3), and
+reading/writing them for the web page (param_checker.py, the ArduPilot panel). Nothing writes them
+automatically: writes happen only on an explicit, confirmed request while a live HEARTBEAT says disarmed.
 """
 
 import datetime
@@ -13,19 +13,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Optional
 
-from loguru import logger
-
 from stereo_config import DEFAULT_LEVER_ARM_M
-
-# (name, value, takes effect only after an autopilot reboot)
-VISUAL_ODOMETRY_PARAMS = [
-    ("AHRS_EKF_TYPE", 3, True),   # EKF3
-    ("EK3_ENABLE", 1, True),
-    ("VISO_TYPE", 1, True),       # MAVLink visual odometry
-    ("EK3_SRC1_POSXY", 6, False),  # ExternalNav
-    ("EK3_SRC1_VELXY", 6, False),  # ExternalNav
-    ("EK3_SRC1_POSZ", 1, False),   # Baro
-]
 
 
 @dataclass(frozen=True)
@@ -36,10 +24,18 @@ class SuggestedParam:
     rationale: str
 
 
-# Optical position hold with VISION_POSITION_DELTA (ArduSub, EKF3). Shown on the web page; written only when
-# the user confirms a write there (configure_visual_odometry still uses VISUAL_ODOMETRY_PARAMS).
+# Optical position hold with VISION_POSITION_DELTA (ArduSub, EKF3): the one recommended set. The web page checks
+# the vehicle against it and writes it only when the user confirms. ArduPilot references: master 6f5d8560db.
 SUGGESTED_OPTICAL_HOLD_PARAMS = (
-    SuggestedParam("VISO_TYPE", 1, True, "MAVLink visual odometry: accept VISION_POSITION_DELTA from this extension."),
+    SuggestedParam("AHRS_EKF_TYPE", 3, True,
+                   "EKF3 (ArduPilot's default, AP_AHRS.cpp:56): only EKF3 takes VISION_POSITION_DELTA "
+                   "(AP_AHRS.cpp:1457-1461 writeBodyFrameOdom goes to EKF3 only)."),
+    SuggestedParam("EK3_ENABLE", 1, True,
+                   "EKF3 enabled (default 1, AP_NavEKF3.cpp:165-171); its parameters (EK3_*) exist only while it is "
+                   "enabled."),
+    SuggestedParam("VISO_TYPE", 1, True,
+                   "MAVLink visual odometry: accept VISION_POSITION_DELTA from this extension. The other VISO_* "
+                   "parameters only appear after this is set and the autopilot rebooted."),
     SuggestedParam("VISO_POS_X", DEFAULT_LEVER_ARM_M[0], False,
                    "Camera forward of the IMU (m, FRD, from the CAD). EKF3 adds (gyro rate) x VISO_POS to the "
                    "predicted camera velocity, so the extension sends uncorrected camera deltas. Relative to the "
@@ -54,13 +50,20 @@ SUGGESTED_OPTICAL_HOLD_PARAMS = (
                    "this delay. A delta averages its interval, so its true delay is about half a frame interval "
                    "plus the pipeline latency; tune it from logs (range 0-250 ms)."),
     SuggestedParam("EK3_SRC1_VELXY", 6, False,
-                   "ExternalNav: fuse the VISION_POSITION_DELTA body velocity for horizontal velocity."),
+                   "ExternalNav: the EKF fuses the VISION_POSITION_DELTA body-frame velocity (all three axes) only "
+                   "when VELXY is ExternalNav (AP_NavEKF3_PosVelFusion.cpp:2059-2063, Control.cpp:572-576)."),
     SuggestedParam("EK3_SRC1_POSXY", 0, False,
-                   "0 None: VISION_POSITION_DELTA carries no absolute position, so the EKF dead-reckons a relative "
-                   "position from the visual velocity; ArduSub accepts that for position hold when visual odometry "
-                   "is enabled. 3 GPS only helps with a GPS fix at the surface (lost when submerged). The current "
-                   "auto-configuration sets 6 ExternalNav, an absolute position this extension never sends."),
+                   "0 None: VISION_POSITION_DELTA carries no absolute position. The EKF dead-reckons a relative "
+                   "position from the body velocity (AID_RELATIVE, AP_NavEKF3_Control.cpp:297-305, 791, 812) and "
+                   "ArduSub POSHOLD accepts a relative position when visual odometry is enabled (ArduSub "
+                   "system.cpp:196-204, 234-266). 6 ExternalNav waits for an absolute position "
+                   "(VISION_POSITION_ESTIMATE, Control.cpp:619-626) this extension never sends, so it only "
+                   "misleads; 3 GPS needs a GPS fix (Control.cpp:595-601), lost when submerged."),
     SuggestedParam("EK3_SRC1_POSZ", 1, False, "Baro: depth from the pressure sensor."),
+    SuggestedParam("EK3_SRC1_VELZ", 0, False,
+                   "None (ArduSub's default, ArduSub/Parameters.h:442): the body-frame deltas already carry the "
+                   "vertical velocity (FuseBodyVel fuses x, y and z); 6 would only fuse VISION_SPEED_ESTIMATE / "
+                   "ODOMETRY velocity (PosVelFusion.cpp:604, 966), which this extension does not send."),
     SuggestedParam("EK3_SRC1_YAW", 1, False,
                    "Compass: the body-frame deltas carry no heading, so heading for an earth-frame hold comes from "
                    "the compass."),
@@ -70,6 +73,8 @@ SUGGESTED_OPTICAL_HOLD_PARAMS = (
 # Values the web page may write, per suggested parameter: (min, max, allowed values or None, whole numbers only).
 # Enumerations from the ArduPilot parameter docs; VISO_POS_* and VISO_DELAY_MS are ArduPilot's own ranges.
 PARAM_LIMITS = {
+    "AHRS_EKF_TYPE": (0, 11, (0, 2, 3, 10, 11), True),  # DCM, EKF2, EKF3, Sim, ExternalAHRS
+    "EK3_ENABLE": (0, 1, (0, 1), True),
     "VISO_TYPE": (0, 3, (0, 1, 2, 3), True),  # None, MAVLink, IntelT265, VOXL
     "VISO_POS_X": (-5.0, 5.0, None, False),
     "VISO_POS_Y": (-5.0, 5.0, None, False),
@@ -79,6 +84,7 @@ PARAM_LIMITS = {
     "EK3_SRC1_VELXY": (0, 7, (0, 3, 4, 5, 6, 7), True),  # None, GPS, Beacon, OpticalFlow, ExternalNav, WheelEncoder
     "EK3_SRC1_POSXY": (0, 6, (0, 3, 4, 6), True),  # None, GPS, Beacon, ExternalNav
     "EK3_SRC1_POSZ": (0, 6, (0, 1, 2, 3, 4, 6), True),  # None, Baro, RangeFinder, GPS, Beacon, ExternalNav
+    "EK3_SRC1_VELZ": (0, 6, (0, 3, 6), True),  # None, GPS, ExternalNav
     "EK3_SRC1_YAW": (0, 8, (0, 1, 2, 3, 6, 8), True),  # None, Compass, GPS, GPS+Compass, ExternalNav, GSF
 }
 SUGGESTED_BY_NAME = {param.name: param for param in SUGGESTED_OPTICAL_HOLD_PARAMS}
@@ -408,40 +414,20 @@ class AutopilotParams:
                 return current
             time.sleep(poll)
 
-    def configure_visual_odometry(self):
-        """Sets VISUAL_ODOMETRY_PARAMS on the autopilot. Never raises; failures are logged."""
+    def boot_time(self, now=None):
+        """
+        Unix time the autopilot booted (now - SYSTEM_TIME.time_boot_ms), from the SYSTEM_TIME mavlink2rest keeps;
+        None if there is none, it is older than HEARTBEAT_MAX_AGE_S or malformed. A GET only: sends nothing.
+        """
+        now = time.time() if now is None else now
+        message = self._vehicle_message("SYSTEM_TIME")
+        if message is None:
+            return None
+        stamp = message_time(message)
         try:
-            armed = self.is_armed()
-        except Exception as e:
-            logger.warning(f"Could not reach mavlink2rest at {self.base_url}, skipping autopilot setup: {e}")
-            return
-        if armed is None:
-            logger.warning("No autopilot HEARTBEAT seen, skipping autopilot parameter setup")
-            return
-        if armed:
-            logger.warning("Vehicle is armed, not changing autopilot parameters")
-            return
-
-        needs_reboot = []
-        for name, wanted, reboot_required in VISUAL_ODOMETRY_PARAMS:
-            try:
-                current = self.read(name)
-                if current is None:
-                    logger.warning(f"{name}: not reported by the autopilot, skipping")
-                    continue
-                value, param_type = current
-                if value == wanted:
-                    logger.info(f"{name} = {wanted:g} (already set)")
-                    continue
-                result = self.write(name, wanted, param_type)
-                if result is None or result[0] != wanted:
-                    logger.error(f"{name}: failed to set to {wanted:g} (was {value:g})")
-                    continue
-                logger.info(f"{name}: {value:g} -> {wanted:g}")
-                if reboot_required:
-                    needs_reboot.append(name)
-            except Exception as e:
-                logger.error(f"{name}: {e}")
-
-        if needs_reboot:
-            logger.warning(f"Reboot the autopilot for {', '.join(needs_reboot)} to take effect")
+            boot_ms = float(message["message"]["time_boot_ms"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if stamp is None or now - stamp > HEARTBEAT_MAX_AGE_S:
+            return None
+        return stamp - boot_ms / 1000.0

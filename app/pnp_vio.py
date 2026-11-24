@@ -33,7 +33,6 @@ import link_stats
 import pose_stream
 import snapshots
 import vio_telemetry
-from autopilot_params import AutopilotParams
 from device_open import DEFAULT_TIMEOUT, DeviceOpenTimeout, DeviceRestartWatch, open_oak_device
 from mavlink_sender import MavlinkSender
 from pnp_odometry import (Intrinsics, PnPOdometry, PnPParams, camera_to_body_frd, camera_to_body_rotation,
@@ -1080,8 +1079,7 @@ def run_pipeline(args, log_only, data_log, stereo_settings, telemetry):
         logger.warning(message)
         data_log.event("warning", message=message)
 
-    mavlink = setup_autopilot_output(log_only, args.vehicle_ip, AutopilotParams, MavlinkSender,
-                                     log=log_warning)
+    mavlink = setup_autopilot_output(log_only, args.vehicle_ip, MavlinkSender, log=log_warning)
     if mavlink:
         telemetry.output_error = lambda: mavlink.last_error
 

@@ -157,29 +157,53 @@ def test_the_mock_vio_takes_the_real_command_line(algorithm, tmp_path):
         assert args.telemetry_dir == main.telemetry_dir()
 
 
-def test_mock_autopilot_reads_and_never_writes():
+MOCK_MISMATCHES = ["VISO_POS_X", "VISO_POS_Y", "VISO_POS_Z", "EK3_SRC1_POSXY"]
+
+
+def test_mock_autopilot_is_the_dev_vehicle_and_writes_in_memory():
     import autopilot_params
     autopilot = mock_mode.MockAutopilot()
     result = autopilot_params.read_suggested_params(autopilot)
     assert result["armed"] is False and result["heartbeat"]["reachable"]
+    assert [p["name"] for p in result["params"]] == [p.name for p in autopilot_params.SUGGESTED_OPTICAL_HOLD_PARAMS]
     assert {p["name"] for p in result["params"]} == set(mock_mode.PARAM_VALUES)
-    assert all(p["status"] in ("ok", "differs") for p in result["params"])
-    with pytest.raises(PermissionError):
-        autopilot.write("VISO_TYPE", 1, "MAV_PARAM_TYPE_REAL32")
-    written = autopilot_params.write_suggested_params(autopilot, {"VISO_POS_X": 0.2}, heartbeat_wait=0)
-    assert written["changed"] == [] and "PARAM_SET failed" in written["failed"][0]["error"]
-    assert autopilot.values["VISO_POS_X"] == mock_mode.PARAM_VALUES["VISO_POS_X"]
+    assert [p["name"] for p in result["params"] if p["status"] == "differs"] == MOCK_MISMATCHES
+    written = autopilot_params.write_suggested_params(autopilot, {"VISO_POS_X": 0.1655, "VISO_TYPE": 1},
+                                                      heartbeat_wait=0)
+    assert [c["name"] for c in written["changed"]] == ["VISO_POS_X"] and written["failed"] == []
+    assert written["changed"][0]["readback"] == pytest.approx(0.1655) and written["unchanged"][0]["name"] == "VISO_TYPE"
+    assert autopilot.values["VISO_POS_X"] == pytest.approx(0.1655)
+    assert mock_mode.MockAutopilot().values["VISO_POS_X"] == 0.0  # each instance starts from PARAM_VALUES
 
 
-def test_the_write_route_refuses_in_mock_mode_before_anything_else(monkeypatch):
+def test_armed_mock_refuses_writes(monkeypatch):
+    import autopilot_params
+    assert mock_mode.mock_armed({mock_mode.ARMED_ENV: "1"}) and not mock_mode.mock_armed({})
+    autopilot = mock_mode.MockAutopilot(armed=True)
+    assert autopilot.heartbeat_status()["armed"] is True and "ARMED" in autopilot.heartbeat_status()["detail"]
+    with pytest.raises(autopilot_params.WriteRefused, match="ARMED"):
+        autopilot_params.write_suggested_params(autopilot, {"VISO_POS_X": 0.1655}, heartbeat_wait=0)
+    assert autopilot.values["VISO_POS_X"] == 0.0
+
+
+def test_the_write_route_in_mock_mode_writes_the_mock_or_refuses_when_armed(monkeypatch):
     from fastapi.testclient import TestClient
     import main
     monkeypatch.setattr(main, "MOCK", True)
-    monkeypatch.setattr(main, "make_autopilot", lambda: pytest.fail("no autopilot may be contacted"))
+    monkeypatch.setattr(main, "mock_autopilot", mock_mode.MockAutopilot(armed=True))
+    monkeypatch.setattr(main, "param_checker", main.make_param_checker())
     client = TestClient(main.app)
-    for body in ({"confirm": True, "params": {"VISO_POS_X": 0.1}}, {"params": {}}, {}):
-        r = client.post("/api/autopilot/params", json=body)
-        assert r.status_code == 403 and r.json()["detail"] == mock_mode.WRITE_REFUSED
+    r = client.post("/api/autopilot/params", json={"confirm": True, "params": {"EK3_SRC1_POSXY": 0}})
+    assert r.status_code == 409 and "ARMED" in r.json()["detail"]
+    assert main.mock_autopilot.values["EK3_SRC1_POSXY"] == 6.0
+    assert client.get("/api/status").json()["vehicle"]["armed"] is True
+    main.mock_autopilot.armed = False
+    r = client.post("/api/autopilot/params", json={"confirm": True, "params": {"EK3_SRC1_POSXY": 0}})
+    assert r.status_code == 200 and r.json()["mock"] is True
+    assert r.json()["changed"] == [{"name": "EK3_SRC1_POSXY", "old": 6.0, "new": 0.0, "readback": 0.0}]
+    checked = client.get("/api/status").json()["autopilot_params"]
+    assert [m["name"] for m in checked["mismatches"]] == ["VISO_POS_X", "VISO_POS_Y", "VISO_POS_Z"]
+    assert client.post("/api/autopilot/params", json={"params": {"EK3_SRC1_POSXY": 6}}).status_code == 400
 
 
 def test_block_network_refuses_every_url(monkeypatch):
@@ -572,17 +596,35 @@ def test_the_feature_stream_yields_events(server):
     assert wanted <= states
 
 
-def test_parameters_read_from_the_mock_and_writes_are_refused(server):
+def test_the_parameter_check_shows_the_mock_mismatches_and_configure_fixes_them(server):
     port, root, _ = server
+    # The background check runs on its own from startup (FIRST_CHECK_DELAY_S)
+    deadline = time.monotonic() + 10.0
+    while True:
+        _, s = get_json(port, "/api/status")
+        checked = s["autopilot_params"]
+        if checked["checked_at"] is not None or time.monotonic() > deadline:
+            break
+        time.sleep(0.2)
+    assert checked["reachable"] is True and checked["armed"] is False and checked["ok"] is False
+    assert [m["name"] for m in checked["mismatches"]] == MOCK_MISMATCHES
+    assert checked["unreadable"] == [] and checked["pending_reboot"] == [] and checked["error"] is None
     status, read = get_json(port, "/api/autopilot/params/read", method="POST")
     assert status == 200 and read["armed"] is False and read["mavlink2rest"] == mock_mode.AUTOPILOT_URL
     before = {p["name"]: p["current"] for p in read["params"]}
     assert before == mock_mode.PARAM_VALUES
-    status, refused = get_json(port, "/api/autopilot/params", method="POST",
-                               body={"confirm": True, "params": {"VISO_POS_X": 0.1655, "EK3_SRC1_POSXY": 0}})
-    assert status == 403 and refused["detail"] == mock_mode.WRITE_REFUSED
+    # Configure: exactly the mismatches, at their recommended values
+    configure = {m["name"]: m["recommended"] for m in checked["mismatches"]}
+    status, written = get_json(port, "/api/autopilot/params", method="POST", body={"confirm": True, "params": configure})
+    assert status == 200 and [c["name"] for c in written["changed"]] == MOCK_MISMATCHES and written["failed"] == []
+    assert written["reboot_required"] == []
+    _, s = get_json(port, "/api/status")
+    assert s["autopilot_params"]["ok"] is True and s["autopilot_params"]["mismatches"] == []
+    # Put the dev vehicle's values back for the other tests
+    status, _ = get_json(port, "/api/autopilot/params", method="POST",
+                         body={"confirm": True, "params": {name: before[name] for name in configure}})
     _, again = get_json(port, "/api/autopilot/params/read", method="POST")
-    assert {p["name"]: p["current"] for p in again["params"]} == before
+    assert status == 200 and {p["name"]: p["current"] for p in again["params"]} == before
 
 
 def test_snapshots_probe_and_focal_check_give_synthetic_results(server):

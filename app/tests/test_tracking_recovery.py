@@ -1343,11 +1343,14 @@ class FakeWebSocketApp:
 
 @pytest.fixture
 def mavlink_out(pnp_vio, monkeypatch):
-    """Real MavlinkSender over a fake websocket; AutopilotParams mocked so no autopilot is ever touched."""
+    """Real MavlinkSender over a fake websocket; any autopilot parameter request fails the test."""
+    import autopilot_params
     import mavlink_sender
     FakeWebSocketApp.instances = []
     monkeypatch.setattr(mavlink_sender.websocket, "WebSocketApp", FakeWebSocketApp)
-    monkeypatch.setattr(pnp_vio, "AutopilotParams", mock.Mock())
+    for name in ("_post", "read", "write"):
+        monkeypatch.setattr(autopilot_params.AutopilotParams, name,
+                            lambda *args, **kwargs: pytest.fail("the VIO must not touch autopilot parameters"))
     monkeypatch.setattr(pnp_vio, "load_calibration", lambda device, args: fake_calibration(np.eye(3)))
     return pnp_vio
 
@@ -1360,8 +1363,6 @@ def test_run_sends_vision_position_delta_matching_the_log(mavlink_out, monkeypat
                         [*SPIN_ARGS, "--lever-arm", "--vehicle-ip", "10.0.0.9", "--quality-rate", "0"],
                         imu=[gyro], log_only=False)
     after_us = time.time() * 1e6
-    pnp_vio.AutopilotParams.assert_called_once_with("10.0.0.9")
-    pnp_vio.AutopilotParams.return_value.configure_visual_odometry.assert_called_once_with()
     (ws,) = FakeWebSocketApp.instances
     assert ws.url == "ws://10.0.0.9/mavlink2rest/ws/mavlink?filter=SEND_ONLY" and ws.closed
     events = {line["event"]: line for line in lines if line["type"] == "event"}

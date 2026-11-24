@@ -1,7 +1,8 @@
 'use strict';
 // OAK-D VIO web UI: vanilla JS, inline SVG, no external resources (works offline on a boat).
 // Polling: /api/status and /api/history once a second while the tab is visible, snapshots only
-// while auto-refresh is on, the ArduPilot parameters on load and on demand.
+// while auto-refresh is on, the ArduPilot parameters on load and on demand (the server's own background
+// parameter check arrives with /api/status: the banner at the top).
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const $ = id => document.getElementById(id);
@@ -160,6 +161,8 @@ function renderStatus(s) {
   const checked = vehicle.checked_at ? ' (' + fmt(s.server_time - vehicle.checked_at, 0) + ' s ago)' : '';
   setText('header-right', 'vehicle: ' + armed + checked + ' · uptime ' + duration(s.uptime_s) + ' · CPU '
     + fmt(s.cpu_percent, 0, ' %'));
+
+  renderParamCheck(s.autopilot_params);
 
   const banner = $('log-only-banner');
   banner.hidden = !s.log_only;
@@ -1275,24 +1278,45 @@ function paramError(p, text) {
   return '';
 }
 
-function openWriteDialog() {
-  if (!ui.autopilot) return showToast('Read the parameters first', 'error');
-  const changes = [], problems = [];
-  for (const row of $('ap-table').tBodies[0].rows) {
-    if (!row.querySelector('.ap-select').checked) continue;
-    const p = ui.autopilot.params.find(q => q.name === row.dataset.name);
-    const text = row.querySelector('.ap-value').value;
-    const error = paramError(p, text);
-    if (error) { problems.push(p.name + ': ' + error); continue; }
-    const value = Number(text);
-    if (sameParam(p.current, value)) continue;
-    changes.push({ name: p.name, old: p.current, new: value, reboot: p.needs_reboot });
+// --- parameter check banner (param_check.js) -----------------------------------------------------
+
+function renderParamCheck(check) {
+  const view = paramCheckView(check);
+  const box = $('params-check');
+  box.className = 'params-check ' + view.state;
+  setText('params-title', view.title);
+  setText('params-detail', view.detail);
+  const body = $('params-table-body');
+  body.replaceChildren();
+  for (const [name, current, recommended, reboot] of view.rows) {
+    const row = body.insertRow();
+    row.insertCell().appendChild(Object.assign(document.createElement('b'), { textContent: name }));
+    row.insertCell().textContent = current;
+    row.insertCell().textContent = '→';
+    row.insertCell().textContent = recommended;
+    const tag = row.insertCell();
+    if (reboot) tag.appendChild(Object.assign(document.createElement('span'), { className: 'tag reboot', textContent: 'needs reboot' }));
   }
-  if (problems.length) return showToast('Invalid: ' + problems.join('; '), 'error');
-  if (!changes.length) return showToast('Nothing selected differs from the vehicle', 'error');
+  $('params-table').hidden = !view.rows.length;
+  const button = $('params-configure');
+  button.hidden = !view.configure;
+  button.disabled = !view.configureEnabled;
+  button.title = view.configureTitle;
+  const notes = $('params-notes');
+  notes.replaceChildren(...view.notes.map(text => Object.assign(document.createElement('div'), { textContent: text })));
+}
+
+function openConfigureDialog() {
+  const check = ui.status && ui.status.autopilot_params;
+  const changes = paramConfigureChanges(check);
+  if (!changes.length) return showToast('Nothing differs from the recommended setup', 'error');
+  showWriteDialog(changes, { armed: check.armed }, 'Configure: write ' + changes.length
+    + ' recommended parameter(s) to the autopilot?');
+}
+
+function showWriteDialog(changes, heartbeat, title) {
   ui.pendingWrite = changes;
-  const heartbeat = ui.autopilot.heartbeat || {};
-  setText('ap-dialog-title', 'Write ' + changes.length + ' parameter(s) to the autopilot?');
+  setText('ap-dialog-title', title);
   const armed = $('ap-dialog-armed');
   armed.textContent = (heartbeat.armed === false ? 'Vehicle DISARMED at the last read. '
     : heartbeat.armed === true ? 'Vehicle ARMED at the last read: the server will refuse. '
@@ -1314,6 +1338,24 @@ function openWriteDialog() {
   confirmButton.textContent = 'Write ' + changes.length + ' parameter(s)';
   setText('ap-dialog-cancel', 'Cancel');
   $('ap-dialog').showModal();
+}
+
+function openWriteDialog() {
+  if (!ui.autopilot) return showToast('Read the parameters first', 'error');
+  const changes = [], problems = [];
+  for (const row of $('ap-table').tBodies[0].rows) {
+    if (!row.querySelector('.ap-select').checked) continue;
+    const p = ui.autopilot.params.find(q => q.name === row.dataset.name);
+    const text = row.querySelector('.ap-value').value;
+    const error = paramError(p, text);
+    if (error) { problems.push(p.name + ': ' + error); continue; }
+    const value = Number(text);
+    if (sameParam(p.current, value)) continue;
+    changes.push({ name: p.name, old: p.current, new: value, reboot: p.needs_reboot });
+  }
+  if (problems.length) return showToast('Invalid: ' + problems.join('; '), 'error');
+  if (!changes.length) return showToast('Nothing selected differs from the vehicle', 'error');
+  showWriteDialog(changes, ui.autopilot.heartbeat || {}, 'Write ' + changes.length + ' parameter(s) to the autopilot?');
 }
 
 function closeWriteDialog() {
@@ -1358,7 +1400,8 @@ async function confirmWrite() {
     box.textContent = (r.status === 409 ? 'Refused, nothing written (HTTP 409): ' : 'Not written (HTTP ' + r.status + '): ')
       + errorText(r.data, r.status);
     result.appendChild(box);
-    if (r.data && r.data.heartbeat) { ui.autopilot.heartbeat = r.data.heartbeat; renderAutopilotArmed(); }
+    if (r.data && r.data.heartbeat && ui.autopilot) { ui.autopilot.heartbeat = r.data.heartbeat; renderAutopilotArmed(); }
+    updateStatus();
     return;
   }
   const data = r.data;
@@ -1370,12 +1413,15 @@ async function confirmWrite() {
     result.appendChild(Object.assign(document.createElement('div'), { className: 'warn',
       textContent: 'Reboot the autopilot for ' + data.reboot_required.join(', ') + ' to take effect (not done automatically).' }));
   }
-  for (const c of data.changed) {
-    const p = ui.autopilot.params.find(q => q.name === c.name);
-    if (p) { p.current = c.readback; p.status = sameParam(p.current, p.suggested) ? 'ok' : 'differs'; }
+  if (ui.autopilot) {
+    for (const c of data.changed) {
+      const p = ui.autopilot.params.find(q => q.name === c.name);
+      if (p) { p.current = c.readback; p.status = sameParam(p.current, p.suggested) ? 'ok' : 'differs'; }
+    }
+    ui.autopilot.heartbeat = data.heartbeat;
+    renderAutopilot();
   }
-  ui.autopilot.heartbeat = data.heartbeat;
-  renderAutopilot();
+  updateStatus();
   showToast(data.changed.length + ' parameter(s) changed' + (data.failed.length ? ', ' + data.failed.length + ' failed' : ''),
             data.failed.length ? 'error' : 'success');
 }

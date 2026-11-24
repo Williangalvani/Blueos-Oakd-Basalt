@@ -183,6 +183,9 @@ def test_widget_page_is_self_contained_and_relative(client):
         assert f'id="{element}"' in page
     # The camera link line comes from the formatting shared with the main page
     assert page.index("function linkWidgetText(") < page.index("function renderStatus(")
+    # So does the parameter check's hint
+    assert page.index("function paramWidgetText(") < page.index("function renderStatus(")
+    assert "paramWidgetText(s.autopilot_params)" in page
 
 
 def test_full_page_links_the_widget_and_works_behind_the_proxy(client):
@@ -258,6 +261,16 @@ def test_widget_status_from_live_telemetry():
     status["stale"] = True
     stale = cockpit_widget.widget_status("VIO stopped", status, {}, False, now)
     assert stale["fps"] is None and stale["last_frame"] is None and stale["last_failure"] is None
+    # The parameter check, without the values (the widget only hints; the main page has the table)
+    assert s["autopilot_params"] is None
+    check = {"checked_at": now, "age_s": 3.0, "reachable": True, "armed": False, "ok": False,
+             "mismatches": [{"name": "EK3_SRC1_POSXY", "current": 6.0, "recommended": 0, "needs_reboot": False}],
+             "unreadable": [], "pending_reboot": ["VISO_TYPE"], "error": None, "checking": False,
+             "interval_s": 30.0, "mavlink2rest": "http://x/mavlink2rest"}
+    s = cockpit_widget.widget_status(None, status, {}, False, now, autopilot_params=check)
+    assert s["autopilot_params"] == {"checked_at": now, "reachable": True, "ok": False,
+                                     "mismatches": [{"name": "EK3_SRC1_POSXY"}], "unreadable": [],
+                                     "pending_reboot": ["VISO_TYPE"]}
 
 
 # --- feature endpoints ----------------------------------------------------------------------------
