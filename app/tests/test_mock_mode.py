@@ -276,19 +276,38 @@ def test_the_mock_host_jpeg_variant_encodes_on_the_pi(tmp_path):
     stream.close()
 
 
-def test_the_mock_auto_with_subpixel_encodes_on_the_pi_and_says_why(tmp_path):
-    vio, stream = mock_depth_vio(tmp_path, "--depth-stream-encoding", "auto")
+@pytest.mark.parametrize("argv", [[], ["--no-stereo-subpixel"]], ids=["saved", "subpixel-off"])
+def test_the_mock_disparity_request_with_a_raw16_disparity_encodes_on_the_pi_and_says_why(tmp_path, argv):
+    vio, stream = mock_depth_vio(tmp_path, "--depth-stream-encoding", "disparity", *argv)
     meta = stream.meta()
-    assert (meta["variant"], meta["requested_variant"], meta["encoded_on"]) == ("host_jpeg", "auto", "pi")
-    assert meta["fallback"]["reason"] == depth_stream.SUBPIXEL_PROBLEM and meta["fallback"]["at_start"]
+    assert (meta["variant"], meta["requested_variant"], meta["encoded_on"]) == ("host_jpeg", "disparity", "pi")
+    assert meta["fallback"]["at_start"] and meta["fallback"]["reason"].startswith("disparity is RAW16")
+    assert meta["source"] == "stereo.depth" and meta["disparity_format"]["type"] == "RAW16"
     stream.close()
 
 
-@pytest.mark.parametrize("encoding, variant", [("auto", "disparity"), ("disparity", "disparity"),
-                                               ("manip", "manip"), ("nv12", "nv12"), ("yuv400p", "yuv400p")])
-def test_the_mock_reports_the_camera_variant_and_its_debug_log(tmp_path, encoding, variant):
-    vio, stream = mock_depth_vio(tmp_path, "--depth-stream-encoding", encoding, "--depth-stream-debug",
-                                 "--no-stereo-subpixel")
+def test_the_mock_auto_streams_the_rectified_left_image_on_the_camera(tmp_path):
+    import cv2
+    vio, stream = mock_depth_vio(tmp_path)  # the saved settings: auto, subpixel and speckle on
+    meta = stream.meta()
+    assert (meta["variant"], meta["requested_variant"], meta["encoded_on"]) == ("mono_features", "auto", "camera")
+    assert meta["encoding"] == "gray8-mono-rectified-left" and meta["source"] == "stereo.rectifiedLeft"
+    assert meta["fallback"] is None and meta["variant_reason"] is None
+    t = 1795000000.0
+    gray = cv2.imdecode(np.frombuffer(vio.encode_depth(t), np.uint8), cv2.IMREAD_GRAYSCALE)
+    # The image the mock features are on (rect_left), not depth
+    assert gray.shape == (400, 640)
+    assert np.abs(gray.astype(int) - vio.scene.frame("rect_left", t, vio.offset).astype(int)).mean() < 4
+    stream.close()
+
+
+@pytest.mark.parametrize("encoding, variant, argv", [
+    ("auto", "mono_features", []), ("mono_features", "mono_features", []),
+    ("disparity", "disparity", ["--no-stereo-subpixel", "--no-stereo-speckle-filter"]),
+    ("disparity", "disparity", ["--no-stereo-subpixel", "--stereo-median-last"]),
+    ("manip", "manip", []), ("nv12", "nv12", []), ("yuv400p", "yuv400p", [])])
+def test_the_mock_reports_the_camera_variant_and_its_debug_log(tmp_path, encoding, variant, argv):
+    vio, stream = mock_depth_vio(tmp_path, "--depth-stream-encoding", encoding, "--depth-stream-debug", *argv)
     meta = stream.meta()
     assert (meta["variant"], meta["requested_variant"], meta["encoded_on"]) == (variant, encoding, "camera")
     assert meta["encoding"] == depth_stream.encoding_for(variant) and meta["fallback"] is None
@@ -352,7 +371,8 @@ def test_the_depth_stream_sends_three_jpeg_parts(server):
         jpeg = jpeg[:-2] if jpeg.endswith(b"\r\n") else jpeg
         assert jpeg[:2] == b"\xff\xd8"
         image = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_UNCHANGED)
-        assert image.shape == (400, 640) and image.max() > 100 and (image < 8).mean() > 0.01
+        # auto = mono_features: the synthetic camera image, textured everywhere (no black no-depth band)
+        assert image.shape == (400, 640) and image.std() > 20 and (image[:, :8] > 8).mean() > 0.5
     deadline = time.monotonic() + 3.0
     while True:  # the metadata (with the centre depth) is rewritten once a second while streaming
         _, s = get_json(port, "/api/status")
@@ -384,9 +404,10 @@ def test_the_pose_stream_follows_the_mock_survey(server):
     _, s = get_json(port, "/api/status")
     assert s["pose"]["configured_source"] == "autopilot" and s["pose"]["attitude_source"] == "autopilot"
     assert s["pose"]["autopilot"]["fresh"] and "mock autopilot ATTITUDE (gaps)" in s["pose"]["autopilot"]["description"]
-    # auto with the default stereo_subpixel: StereoDepth's disparity is RAW16, so the Pi encodes
-    assert s["depth_stream"]["variant"] == "host_jpeg" and s["depth_stream"]["configured_encoding"] == "auto"
-    assert s["depth_stream"]["fallback"]["reason"] == depth_stream.SUBPIXEL_PROBLEM
+    # auto: the rectified-left camera image, encoded on the (mock) camera
+    assert s["depth_stream"]["variant"] == "mono_features" and s["depth_stream"]["configured_encoding"] == "auto"
+    assert s["depth_stream"]["encoded_on"] == "camera" and s["depth_stream"]["fallback"] is None
+    assert s["depth_stream"]["source"] == "stereo.rectifiedLeft"
 
 
 def test_the_feature_stream_yields_events(server):

@@ -176,8 +176,11 @@ def test_widget_page_is_self_contained_and_relative(client):
     assert not re.search(r"""['"`]/api""", page)
     # Fills the iframe without scrollbars; stops the streams while hidden
     assert "overflow: hidden" in page and "visibilityState" in page and "EventSource" in page
-    # The same state order as the server
-    assert "const STATES = " + json.dumps(list(feature_stream.STATES)).replace('"', "'") + ";" in page
+    # The same state order as the server, from the overlay shared with the main page (inlined before widget.js)
+    assert "const FEATURE_STATES = " + json.dumps(list(feature_stream.STATES)).replace('"', "'") + ";" in page
+    assert page.index("function featureToView") < page.index("function drawOverlay")
+    for element in ("depth-legend-box", "mono-label", "mono-rate"):
+        assert f'id="{element}"' in page
 
 
 def test_full_page_links_the_widget_and_works_behind_the_proxy(client):
@@ -236,6 +239,11 @@ def test_widget_status_from_live_telemetry():
                          "attitude_text": "gyro-integrated, drifting", "attitude_age_s": 7.5}
     assert s["depth"]["encoding"] == "gray8-disparity" and s["depth"]["blank"] == blank
     assert s["depth"]["disparity"] == {"nearest_mm": 347}
+    # mono_features: the widget shows the camera image, not depth, and says where it comes from
+    mono = {"encoding": "gray8-mono-rectified-left", "variant": "mono_features", "requested_variant": "auto",
+            "encoded_on": "camera", "source": "stereo.rectifiedLeft", "variant_reason": None}
+    s = cockpit_widget.widget_status(None, status, mono, False, now + 1)
+    assert {key: s["depth"][key] for key in mono} == mono
     # Stale telemetry shows nothing old
     status["stale"] = True
     stale = cockpit_widget.widget_status("VIO stopped", status, {}, False, now)

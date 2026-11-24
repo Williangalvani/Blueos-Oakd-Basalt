@@ -19,7 +19,7 @@ from stereo_config import (DEFAULT_LEVER_ARM_M, DEFAULT_REFRACTIVE_INDEX, DEPTH_
 
 DVL_SOURCES = ("auto", "off")
 # depth_stream.VARIANTS (kept here so the schema does not import the stream code)
-DEPTH_STREAM_ENCODINGS = ("auto", "disparity", "manip", "nv12", "yuv400p", "host_jpeg")
+DEPTH_STREAM_ENCODINGS = ("auto", "mono_features", "disparity", "manip", "nv12", "yuv400p", "host_jpeg")
 # pose_stream.ATTITUDE_MODES
 POSE_ATTITUDE_SOURCES = ("autopilot", "gyro")
 VEHICLE_IP_RE = re.compile(r"^[A-Za-z0-9.\-:\[\]]+$")
@@ -103,8 +103,8 @@ CONFIG_FIELDS = (
     ConfigField("snapshots", "bool", True, "Snapshots",
                 "PnP only: on-demand camera snapshots (live views); no bandwidth until requested"),
     ConfigField("depth_stream", "bool", True, "Live depth stream",
-                "PnP only: depth converted to 8 bit and MJPEG-encoded on the camera for the Live depth panel; "
-                "sent only while the panel is open"),
+                "PnP only: the camera image with the tracked features (or the depth), MJPEG-encoded on the "
+                "camera for the Live panel; sent only while the panel is open"),
     ConfigField("depth_stream_fps", "float", 5.0, "Depth Stream FPS",
                 "PnP only: the camera sends every round(FPS / this)-th depth frame", minimum=0.5, maximum=15.0,
                 step=0.5),
@@ -112,11 +112,13 @@ CONFIG_FIELDS = (
                 "PnP only: MJPEG quality on the camera (lower = less USB bandwidth)", minimum=10, maximum=100,
                 step=1),
     ConfigField("depth_stream_encoding", "choice", "auto", "Depth Stream Encoding",
-                "PnP only: auto = disparity, then host_jpeg if the camera sends no frames or blank ones (host_jpeg "
-                "at once with stereo Subpixel on); disparity = the camera's disparity (pixels) through ImageManip "
-                "to the camera encoder, needs Subpixel off; manip / nv12 / yuv400p = Script-built frames (blank or "
-                "none on an OAK-D-W, for diagnosis); host_jpeg = the Pi encodes (uses Pi CPU, capped at 25 % of a "
-                "core)",
+                "PnP only: auto = mono_features, then host_jpeg if the camera sends no frames or blank ones; "
+                "mono_features = the rectified-left camera image the features are tracked on, encoded on the "
+                "camera, with the tracked features drawn by the browser (Live camera); disparity = the camera's "
+                "disparity (pixels) straight to the camera encoder, needs an 8-bit disparity (Subpixel and "
+                "Extended off, Speckle off or Median filter last), else it runs as host_jpeg; manip / nv12 / "
+                "yuv400p = Script-built depth frames (blank or none on an OAK-D-W, for diagnosis); host_jpeg = the "
+                "Pi encodes the depth (uses Pi CPU, capped at 25 % of a core)",
                 choices=DEPTH_STREAM_ENCODINGS),
     ConfigField("depth_stream_debug", "bool", False, "Depth stream camera debug log",
                 "PnP only: while the depth stream runs, the camera logs at DEBUG level and the stream nodes' log "

@@ -1,55 +1,69 @@
 """
-Live depth stream of the PnP VIO for the web page, encoded on the OAK-D (or, as a last resort, on the Pi).
+Live stream of the PnP VIO for the web page: the camera image the VIO tracks its features on, or its depth,
+encoded on the OAK-D (or, as a last resort, depth on the Pi).
 
-Device (pnp_vio.build_depth_stream): a Script node takes stereo.depth (the same thresholded, filtered
-depth the VIO uses) from a non-blocking size-1 queue and, only while the host enabled it, every
-`every`-th frame turns the RAW16 millimetres into an 8-bit image with C-speed byte operations (strided
-byte slices, bytes.translate tables, one big-integer OR per chunk of rows; see device_script). A
-VideoEncoder node encodes it as MJPEG and only the JPEG crosses the link. The VIO process writes it as-is
-to DIRECTORY/depth_stream.jpg; main.py forwards it as multipart/x-mixed-replace. The browser colorizes
-the gray image.
+Device (pnp_vio.build_depth_stream): a Script node takes a StereoDepth output from a non-blocking size-1
+queue and, only while the host enabled it, passes every `every`-th frame on to a VideoEncoder node, which
+encodes it as MJPEG; only the JPEG crosses the link. The VIO process writes it as-is to
+DIRECTORY/depth_stream.jpg; main.py forwards it as multipart/x-mixed-replace. The browser shows the camera
+image with the tracked features on top, or colorizes the depth.
 
-Encoding variants (depth_stream_encoding, VARIANTS):
-    disparity  stereo.disparity -> Script (gate only: forwards StereoDepth's own frame) -> ImageManip (to
-               NV12) -> VideoEncoder. Needs stereo_subpixel off (then the disparity is RAW8, 0..95);
+Encoding variants (depth_stream_encoding, VARIANTS; the StereoDepth output each one shows is SOURCES):
+    mono_features  stereo.rectifiedLeft -> Script (gate only: forwards StereoDepth's own frame) ->
+               VideoEncoder. The camera image the FeatureTracker runs on (RAW8, full 0..255), so the page
+               draws the tracked features (feature_stream) on it; MONO_ENCODING. Works with any stereo
+               setting
+    disparity  stereo.disparity -> Script (gate only) -> VideoEncoder. Needs an 8-bit (RAW8) disparity:
+               subpixel off, extended off and no post-processing filter after the median
+               (stereo_config.disparity_format; with the speckle filter on after the median it is RAW16);
                image: the disparity itself (DISPARITY_ENCODING, see "Disparity encoding" below)
-    manip      Script -> GRAY8 frame -> ImageManip (to NV12) -> VideoEncoder. Blank on test12 (see below)
-    nv12       Script -> NV12 frame (the gray plane + a 128 chroma plane, w*h*3/2 bytes) -> VideoEncoder.
+    manip      stereo.depth -> Script -> GRAY8 frame -> ImageManip (to NV12) -> VideoEncoder. Blank on test12
+    nv12       stereo.depth -> Script -> NV12 frame (the gray plane + a 128 chroma plane) -> VideoEncoder.
                No output on test12
-    yuv400p    Script -> YUV400p frame (w*h bytes) -> VideoEncoder. No output on test12
+    yuv400p    stereo.depth -> Script -> YUV400p frame (w*h bytes) -> VideoEncoder. No output on test12
     host_jpeg  nothing extra on the camera: the VIO process converts the depth frame it already has and
                JPEG-encodes it on a worker thread (HostJpegEncoder), capped at HOST_CPU_BUDGET of a core
-    auto       (default) disparity when stereo_subpixel is off, else host_jpeg from the start (with the
-               reason in the metadata's fallback); switches to host_jpeg for the rest of the run if the
-               encoder stalls or its frames are blank
+    auto       (default) mono_features; host_jpeg from the start if the image size does not suit the
+               encoder; switches to host_jpeg for the rest of the run (with the reason in the metadata's
+               fallback) if the encoder stalls or its frames are blank. auto never picks disparity: it
+               depends on the stereo settings, so it is only built when asked for
 manip, nv12 and yuv400p (gray8-depth-linear, DEPTH_ENCODING) build their frame with the Script runtime's
 ImgFrame API (DEVICE_IMGFRAME_API). They are kept for diagnosis.
 
-Why only disparity can work on the camera (firmware a406121b strings, depthai-core v3.3.0 source, test12):
+Why only StereoDepth's own frames work on the camera (firmware a406121b strings, depthai-core v3.3.0
+source, test12, test13 and the stereo probe on an OAK-D-W, test14, depthai 3.3.0, 640x400 @ 10 fps):
 - A Script's new ImgFrame comes from a DynamicPool of size 0. ImageManip (PlgImageManipV2) needs an input
   pool of at least 2 ("Pool size of the input message is too small... Currently it is 0") and then sends a
   constant image (test12: every JPEG 4668 bytes, every pixel 1). The VideoEncoder drops pool-less frames
   with no log (test12: nv12 and yuv400p, 0 bytes).
 - StereoDepth's outputs come from its own pools (StereoDepth.setNumFramesPool, default 3; the pipeline
-  raises it), so a Script that forwards the frame it received (`node.io[...].send(frame)` with the same
-  object) keeps that pool. Not verified on hardware yet: if ImageManip still reports the pool error with
-  the disparity variant, blank detection falls back and the next thing to try is gating ImageManip through
-  its inputConfig instead of a Script.
-- ImageManip converts RAW8 / GRAY8 to NV12 (copies Y, chroma 128); it does not convert RAW16. stereo.depth
-  and the subpixel disparity are RAW16, so only the 8-bit disparity (subpixel off, extended off) fits.
-The disparity output is assumed to carry the same threshold and post-processing filters as stereo.depth
-(depthai applies them in the disparity domain before converting to depth).
+  raises it), and a Script that forwards the frame it received (the same object) keeps that pool
+  (test13: no pool error).
+- RAW8 frames go straight into the VideoEncoder (test14: the RAW8 disparity and rectifiedLeft /
+  rectifiedRight, 640x400 stride 640, encoded directly into 6.8-32 kB JPEGs), so these variants have no
+  ImageManip. A RAW16 frame (stereo.depth, the subpixel disparity, and the disparity with a filter after the
+  median) gets "Arrived frame type (14) is not either NV12 or YUV400p (8-bit Gray)" from the encoder and no
+  JPEG, and through ImageManip "Processing failed, potentially unsupported config" and a constant image
+  (test14 cases A and E: 4671-byte JPEGs, gray 1).
+The disparity output carries the same threshold and post-processing filters as stereo.depth (depthai
+applies them in the disparity domain before converting to depth).
 
 Disparity encoding (DISPARITY_ENCODING, disparity_scale): gray = disparity in pixels, 0..max_disparity
 (95), invalid = 0, so depth_mm = focal_px * baseline_mm / gray. Near is bright; far is dark and coarse
-(each gray level is one pixel of disparity: at 4 m and 75 mm baseline with fx 440, about 0.5 m per level).
-The page computes its legend from the scale in the metadata; GRAY_INVALID_BELOW for this encoding is
-DISPARITY_INVALID_BELOW (3), as JPEG rings around 0.
+(each gray level is one pixel of disparity: at 4 m and 75 mm baseline with fx 440, about 0.5 m per level;
+test14's scene used 0..34 of 95). The page stretches the display (colours or gray by depth) and labels its
+legend from the scale in the metadata; GRAY_INVALID_BELOW for this encoding is DISPARITY_INVALID_BELOW (3),
+as JPEG rings around 0.
+
+Mono encoding (MONO_ENCODING): gray = the rectified-left camera image, not depth. The tracked features'
+positions are on its pixel grid (scaled to the depth grid if decimated, feature_stream.py), and the VIO
+publishes the features of the frame each image comes from (feature_stream.FeatureStreamService.publish_for).
 
 VideoEncoder (MJPEG) input requirements, from the RVC2 firmware a406121b (depthai-core v3.3.0) strings and
-asserts of its PlgVidEnc and the depthai-core source:
-- type NV12 or YUV400p ("Arrived frame type ({}) is not either NV12 or YUV400p (8-bit Gray)"); GRAY8 (30)
-  is dropped, which is why manip converts to NV12 first;
+asserts of its PlgVidEnc, the depthai-core source and test14:
+- an 8-bit type: NV12, YUV400p, or RAW8 from a StereoDepth pool (test14); the warning names only NV12 and
+  YUV400p ("Arrived frame type ({}) is not either NV12 or YUV400p (8-bit Gray)"). GRAY8 (30) is dropped
+  (test10), which is why manip converts to NV12 first, and RAW16 (14) too (test14);
 - width a multiple of 32 and height a multiple of 2 ("Width must be multiple of 32, height multiple of 2
   for MJPEG encoder profile"), at most 16384 x 8192;
 - every frame the size of the first one ("Arrived frame ({}, {}) does not match the encoder size"; asserts
@@ -83,9 +97,10 @@ no JPEG comes back. HostJpegEncoder sends the same reports, so the flag works fo
 Blank frames (blank): for a camera variant, frames byte-identical to the previous one or with a gray
 standard deviation below BLANK_STD, for BLANK_S and at least BLANK_MIN_SAMPLES samples, while the host's
 own depth (stereo.depth, sampled every EXPECT_INTERVAL_S) has valid pixels that vary. A view with no depth
-or one flat depth is constant and right, so it is not blank. auto falls back to host_jpeg ("blank frames
-from <variant>"); an explicit variant only reports it. Between them, encoder_stalled (no JPEG) and blank
-(useless JPEGs) cover what test12 saw from every camera variant.
+or one flat depth is constant and right, so it is not blank; a camera image whose depth varies is not
+constant either. auto falls back to host_jpeg ("blank frames from <variant>"); an explicit variant only
+reports it. Between them, encoder_stalled (no JPEG) and blank (useless JPEGs) cover what test12 and test14
+saw from the camera variants that can't work.
 
 Device log: DeviceLog keeps the camera's log lines (VideoEncoder, ImageManip and the stream Script first),
 which the metadata carries. With depth_stream_debug, DeviceLogDebug raises the device log level to DEBUG
@@ -148,28 +163,32 @@ DEVICE_IMGFRAME_API = frozenset({
     "getInstanceNum", "setInstanceNum", "getCategory", "setCategory", "getTransformation", "setTransformation",
 })
 # Frame types the RVC2 VideoEncoder takes; it drops others with "Arrived frame type (N) is not either NV12 or
-# YUV400p (8-bit Gray)" (GRAY8 is N = 30). YUV400p is GRAY8's single 8-bit plane.
-DEVICE_ENCODER_INPUT_TYPES = frozenset({"NV12", "YUV400p"})
+# YUV400p (8-bit Gray)" (GRAY8 is N = 30 on test10, RAW16 N = 14 on test14). YUV400p is GRAY8's single 8-bit
+# plane; RAW8 from StereoDepth's pool (the disparity, rectifiedLeft/Right) encodes too (test14).
+DEVICE_ENCODER_INPUT_TYPES = frozenset({"NV12", "YUV400p", "RAW8"})
 # MJPEG profile: width a multiple of 32, height a multiple of 2
 WIDTH_ALIGN = 32
 HEIGHT_ALIGN = 2
 
-AUTO, DISPARITY, MANIP, NV12, YUV400P, HOST_JPEG = "auto", "disparity", "manip", "nv12", "yuv400p", "host_jpeg"
-VARIANTS = (AUTO, DISPARITY, MANIP, NV12, YUV400P, HOST_JPEG)
+AUTO, MONO_FEATURES, DISPARITY, MANIP, NV12, YUV400P, HOST_JPEG = (
+    "auto", "mono_features", "disparity", "manip", "nv12", "yuv400p", "host_jpeg")
+VARIANTS = (AUTO, MONO_FEATURES, DISPARITY, MANIP, NV12, YUV400P, HOST_JPEG)
 DEFAULT_VARIANT = AUTO
 # The frame type the Script builds for each variant that runs on the camera (None: it forwards the
-# StereoDepth frame unchanged)
-SCRIPT_FRAME_TYPES = {DISPARITY: None, MANIP: "GRAY8", NV12: "NV12", YUV400P: "YUV400p"}
+# StereoDepth frame unchanged, straight into the encoder)
+SCRIPT_FRAME_TYPES = {MONO_FEATURES: None, DISPARITY: None, MANIP: "GRAY8", NV12: "NV12", YUV400P: "YUV400p"}
 CAMERA_VARIANTS = tuple(SCRIPT_FRAME_TYPES)
+FORWARD_VARIANTS = tuple(v for v, frame_type in SCRIPT_FRAME_TYPES.items() if frame_type is None)
+# The StereoDepth output each variant shows (info "source")
+SOURCES = {MONO_FEATURES: "rectifiedLeft", DISPARITY: "disparity", MANIP: "depth", NV12: "depth",
+           YUV400P: "depth", HOST_JPEG: "depth"}
 # What the gray values mean (info "encoding")
-DEPTH_ENCODING, DISPARITY_ENCODING = "gray8-depth-linear", "gray8-disparity"
+DEPTH_ENCODING, DISPARITY_ENCODING, MONO_ENCODING = "gray8-depth-linear", "gray8-disparity", "gray8-mono-rectified-left"
 # StereoDepth's disparity search range without subpixel and extended disparity (stereo_config sets
 # extended off): RAW8 0..95, 0 = invalid
 DISPARITY_MAX = 95
 # Disparity gray below this is invalid (0) or JPEG ringing around it: under 3 px is > 10 m on an OAK-D
 DISPARITY_INVALID_BELOW = 3
-SUBPIXEL_PROBLEM = ("the disparity variant needs stereo Subpixel off: with subpixel the disparity is RAW16, "
-                    "which ImageManip cannot convert for the encoder")
 # host_jpeg: at most this fraction of one Pi core on average
 HOST_CPU_BUDGET = 0.25
 HOST_STATS_EVERY = 50
@@ -186,29 +205,48 @@ STREAM_NODE_TYPES = ("VideoEncoder", "ImageManip")
 
 
 def device_variant(variant):
-    """The variant that runs on the camera at the start (auto starts with disparity), None for host_jpeg."""
+    """The variant that runs on the camera at the start (auto starts with mono_features), None for host_jpeg."""
     if variant == AUTO:
-        return DISPARITY
+        return MONO_FEATURES
     return variant if variant in SCRIPT_FRAME_TYPES else None
 
 
-def resolve_variant(requested, subpixel=False, problem=None):
+def disparity_problem(disparity_format):
     """
-    (variant built at the start, None for host_jpeg; why it is not the requested one, or None). auto: disparity,
-    or host_jpeg straight away if the size does not suit the encoder or stereo subpixel is on (the Script-made
-    manip/nv12/yuv400p frames came out blank or not at all on an OAK-D-W, test12). An explicit disparity request
-    with subpixel on also runs as host_jpeg; the other explicit variants are built as asked (diagnosis).
+    Why the disparity variant can't run, or None: it needs a RAW8 disparity (stereo_config.disparity_format of the
+    applied stereo config). RAW16 neither goes into the encoder nor through ImageManip (test14).
+    """
+    if disparity_format is None:
+        return "the disparity format is unknown"
+    if disparity_format.get("raw8"):
+        return None
+    return f"{disparity_format.get('reason') or 'disparity is RAW16'}; or use mono_features"
+
+
+def resolve_variant(requested, disparity_problem=None, problem=None):
+    """
+    (variant built at the start, None for host_jpeg; why it is not the requested one, or None). auto:
+    mono_features, or host_jpeg straight away if the size does not suit the encoder (problem). An explicit
+    disparity request runs as host_jpeg when the disparity is not RAW8 (disparity_problem, with the reason);
+    the other explicit variants are built as asked (manip/nv12/yuv400p for diagnosis: their Script-made frames
+    came out blank or not at all on an OAK-D-W, test12).
     """
     variant = device_variant(requested)
     if requested == AUTO and problem:
         return None, problem
-    if variant == DISPARITY and subpixel:
-        return None, SUBPIXEL_PROBLEM
+    if variant == DISPARITY and disparity_problem:
+        return None, disparity_problem
     return variant, None
 
 
 def encoding_for(variant):
-    return DISPARITY_ENCODING if variant == DISPARITY else DEPTH_ENCODING
+    return {DISPARITY: DISPARITY_ENCODING, MONO_FEATURES: MONO_ENCODING}.get(variant, DEPTH_ENCODING)
+
+
+def source_for(variant):
+    """The StereoDepth output a variant shows, as "stereo.<output>" (None if unknown)."""
+    output = SOURCES.get(variant)
+    return None if output is None else f"stereo.{output}"
 
 
 def disparity_scale(focal_px, baseline_m, min_mm, max_mm, max_disparity=DISPARITY_MAX):
@@ -338,14 +376,15 @@ def _frame_builder(frame_type):
 def device_script(every, min_mm, max_mm, chunk_rows=CHUNK_ROWS, stats_every=150, report_interval=REPORT_INTERVAL_S,
                   frame_type="YUV400p"):
     """
-    Script node source: inputs 'depth' (RAW16 mm) and 'control' (Buffer, sequence number 1 = stream,
-    0 = stop); outputs 'gray' (an 8-bit ImgFrame of frame_type) for the VideoEncoder or ImageManip and
-    'status' (Buffer, see parse_device_status) for the host. Plain CPython builtins only.
+    Script node source: inputs 'depth' (the source frame: RAW16 mm, or what a forwarding variant shows) and
+    'control' (Buffer, sequence number 1 = stream, 0 = stop); outputs 'gray' (an 8-bit ImgFrame) for the
+    VideoEncoder or ImageManip and 'status' (Buffer, see parse_device_status) for the host. Plain CPython
+    builtins only.
 
     frame_type (SCRIPT_FRAME_TYPES): "YUV400p" (w*h bytes) or "NV12" (the gray plane then a 128 chroma
-    plane, w*h*3/2 bytes) for the VideoEncoder, "GRAY8" (w*h bytes) for ImageManip. None (FORWARD, the
-    disparity variant): a gate only, the received frame is sent on unchanged (the same message, so it keeps
-    its pool buffer and metadata; min_mm and max_mm are not used).
+    plane, w*h*3/2 bytes) for the VideoEncoder, "GRAY8" (w*h bytes) for ImageManip. None (FORWARD_VARIANTS:
+    mono_features, disparity): a gate only, the received RAW8 frame is sent on unchanged (the same message,
+    so it keeps its pool buffer and metadata; min_mm and max_mm are not used).
 
     Only the on-device message API (the RVC2 firmware's Script bindings, not the host's): ImgFrame(size in
     bytes) and Buffer(size in bytes), each filled with setData; ImgFrame.setType/setWidth/setHeight (no
@@ -825,8 +864,9 @@ class DepthStreamService:
     Variants: info["variant"] is the one running (info["requested_variant"] the configured one). With a
     host_encoder (HostJpegEncoder), host_jpeg is encoded on the Pi: tick(depth, sequence) feeds it and
     publishes its JPEGs and reports, and set_enabled (the camera's control) is not used. A requested "auto"
-    falls back from the camera to host_jpeg the first time the encoder stalls (fallback, logged once);
-    reports and JPEGs from the camera are ignored after that.
+    falls back from the camera to host_jpeg the first time the encoder stalls or its frames are blank
+    (fallback, logged once); reports and JPEGs from the camera are ignored after that. The metadata's
+    encoding and source follow the variant running, so a fallback from mono_features shows depth.
 
     device_log (DeviceLog) adds the camera's log lines to the metadata; debug (DeviceLogDebug) is started
     while a camera variant streams and stopped when it stops.
@@ -954,7 +994,7 @@ class DepthStreamService:
         self.host_encoder.set_enabled(self.enabled)
 
     def on_frame(self, jpeg, sequence=None):
-        """An encoded frame from the camera (ignored once encoding moved to the Pi)."""
+        """An encoded frame from the camera (ignored once encoding moved to the Pi); True if it was published."""
         if self.on_host:
             return False
         data = bytes(jpeg)
@@ -1109,7 +1149,8 @@ class DepthStreamService:
         now = self.clock() if now is None else now
         fps, kbps = self.rates(now)
         last = self.last_frame
-        return {**self.info, "encoding": encoding_for(self.variant), "blank": self.blank, "bad_frames": self.bad_frames,
+        return {**self.info, "encoding": encoding_for(self.variant), "source": source_for(self.variant),
+                "blank": self.blank, "bad_frames": self.bad_frames,
                 "pid": os.getpid(), "unix_time": now, "streaming": self.enabled,
                 "frames_total": self.frames, "bytes_total": self.bytes, "fps": fps, "kbps": kbps,
                 "last_frame": None if last is None else {"unix_time": last[0], "bytes": last[1], "sequence": last[2]},

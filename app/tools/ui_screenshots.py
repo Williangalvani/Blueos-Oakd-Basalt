@@ -12,6 +12,8 @@ main: the full page with live views refreshed and a depth probe (main.png), the 
 dialog (confirm-dialog.png), its result after confirming against the fake autopilot (write-result.png), a
 settings validation error (settings-error.png) and the page after Stop (vio-stopped.png).
 armed: the confirm dialog and the server's refusal while the fake autopilot is armed (armed-refusal.png).
+live: against a mock server (main.py --mock), the Live camera panel streaming with the tracked features
+drawn on it (live-camera.png) and the Cockpit widget (widget-camera.png).
 """
 
 import argparse
@@ -152,11 +154,32 @@ def scenario_armed(browser, url, out):
     browser.screenshot(out / "armed-refusal.png")
 
 
+def scenario_live(browser, url, out):
+    browser.viewport(1000)
+    browser.send("Page.enable")
+    browser.send("Page.navigate", url=url)
+    browser.wait_for("document.readyState === 'complete'")
+    browser.js("document.getElementById('depth-stream-on').checked = true; toggleDepthStream();"
+               "document.getElementById('panel-depth-stream').scrollIntoView()")
+    browser.wait_for("document.getElementById('depth-stream-img').naturalWidth > 1", timeout=20)
+    browser.wait_for("depthStream.features && depthStream.features.points.length > 0", timeout=20)
+    time.sleep(2.0)
+    browser.js("document.getElementById('panel-depth-stream').scrollIntoView()")
+    browser.screenshot(out / "live-camera.png")
+    browser.js("document.getElementById('depth-stream-on').checked = false; toggleDepthStream()")
+    browser.send("Emulation.setDeviceMetricsOverride", width=800, height=520, deviceScaleFactor=1, mobile=False)
+    browser.send("Page.navigate", url=urllib.parse.urljoin(url, "widget/depth"))
+    browser.wait_for("document.readyState === 'complete'")
+    browser.wait_for("w.frame !== null && w.features !== null", timeout=20)
+    time.sleep(2.0)
+    browser.screenshot(out / "widget-camera.png")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--url", default="http://127.0.0.1:8099/")
     parser.add_argument("--out", type=Path, default=Path.home() / "oakd-stage1/ui-impl")
-    parser.add_argument("--scenario", choices=("main", "armed"), default="main")
+    parser.add_argument("--scenario", choices=("main", "armed", "live"), default="main")
     parser.add_argument("--chrome", default=CHROME)
     parser.add_argument("--debug-port", type=int, default=9333)
     args = parser.parse_args()
@@ -167,7 +190,8 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     browser = Browser(args.chrome, args.debug_port)
     try:
-        {"main": scenario_main, "armed": scenario_armed}[args.scenario](browser, args.url, args.out)
+        {"main": scenario_main, "armed": scenario_armed, "live": scenario_live}[args.scenario](browser, args.url,
+                                                                                              args.out)
     finally:
         browser.close()
 

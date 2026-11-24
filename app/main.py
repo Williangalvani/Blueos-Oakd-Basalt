@@ -316,7 +316,8 @@ def render_page(config: dict) -> str:
     html = (STATIC_DIR / "ui.html").read_text()
     parts = {
         "<!--UI_CSS-->": f"<style>\n{(STATIC_DIR / 'ui.css').read_text()}\n</style>",
-        "<!--UI_JS-->": f"<script>\n{(STATIC_DIR / 'ui.js').read_text()}\n</script>",
+        "<!--UI_JS-->": f"<script>\n{(STATIC_DIR / 'features_overlay.js').read_text()}\n</script>\n"
+                        f"<script>\n{(STATIC_DIR / 'ui.js').read_text()}\n</script>",
         "<!--FIELDS_STEREO-->": stereo_form_fields(config),
     }
     for group, _ in config_schema.GROUPS:
@@ -339,10 +340,12 @@ def index():
 
 
 def render_widget() -> str:
-    """widget.html with widget.css and widget.js inlined, like render_page."""
+    """widget.html with widget.css, features_overlay.js and widget.js inlined, like render_page."""
     html = (STATIC_DIR / "widget.html").read_text()
     html = html.replace("<!--WIDGET_CSS-->", f"<style>\n{(STATIC_DIR / 'widget.css').read_text()}\n</style>")
-    return html.replace("<!--WIDGET_JS-->", f"<script>\n{(STATIC_DIR / 'widget.js').read_text()}\n</script>")
+    scripts = "\n".join(f"<script>\n{(STATIC_DIR / name).read_text()}\n</script>"
+                        for name in ("features_overlay.js", "widget.js"))
+    return html.replace("<!--WIDGET_JS-->", scripts)
 
 
 @app.get(cockpit_widget.WIDGET_PATH, response_class=HTMLResponse)
@@ -975,7 +978,7 @@ def run_stereo_probe(cases: list) -> tuple:
 def post_stereo_probe(cases: Optional[str] = None):
     """
     Diagnostics of StereoDepth's outputs and the camera's MJPEG encoder (stereo_probe.py): stops the VIO, runs
-    short pipelines with several stereo configurations (cases A-F, or a comma-separated subset in `cases`) for
+    short pipelines with several stereo configurations (cases A-G, or a comma-separated subset in `cases`) for
     about 90 s, then restarts the VIO, also after a failure or a timeout. Returns the probe's JSON plus the end
     of its stderr, also saved as probe/stereo-<unix time>.json in the data directory. 409 while one runs; 403
     in mock mode (no camera).

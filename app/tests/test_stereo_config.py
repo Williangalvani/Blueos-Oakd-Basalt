@@ -29,6 +29,7 @@ EXPECTED_DEFAULTS = {
     "stereo_subpixel": True,
     "stereo_subpixel_bits": 3,
     "stereo_median": "7x7",
+    "stereo_median_last": False,
     "stereo_distortion_correction": True,
     "stereo_alpha": 0.0,
     "stereo_edge_fill_color": 0,

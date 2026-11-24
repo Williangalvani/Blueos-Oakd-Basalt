@@ -97,10 +97,11 @@
 </section>
 
 <section class="c12" id="panel-depth-stream">
-  <h2>Live depth <span class="muted">(stereo depth as MJPEG, encoded on the camera, or on the Pi as a fallback; only sent while streaming)</span></h2>
+  <h2><span id="depth-stream-title">Live camera</span> <span class="muted" id="depth-stream-subtitle">(the rectified left camera image the features are tracked on, with the tracked features, MJPEG-encoded on the camera; only sent while streaming)</span></h2>
   <div class="controls">
     <label class="inline"><input type="checkbox" id="depth-stream-on"> stream</label>
-    <label class="inline"><input type="checkbox" id="depth-stream-color" checked> colorize (near red, far blue, no depth black)</label>
+    <label class="inline"><input type="checkbox" id="depth-stream-features" checked> features</label>
+    <label class="inline" id="depth-stream-color-label" hidden><input type="checkbox" id="depth-stream-color" checked> colorize (near red, far blue, no depth black)</label>
     <span class="muted" id="depth-stream-state">off</span>
   </div>
   <div class="depth-stream">
@@ -108,13 +109,26 @@
       <div class="depth-frame">
         <img id="depth-stream-img" alt="">
         <canvas id="depth-stream-canvas" width="640" height="400" hidden></canvas>
+        <canvas class="depth-overlay" id="depth-stream-overlay"></canvas>
         <div class="depth-crosshair" id="depth-stream-crosshair" hidden></div>
       </div>
-      <figcaption class="muted" id="depth-stream-caption">Tick "stream" to watch the depth the VIO uses, live.</figcaption>
+      <figcaption class="muted" id="depth-stream-caption">Tick "stream" to watch what the VIO sees, live.</figcaption>
     </figure>
     <div class="depth-side">
-      <canvas id="depth-legend" class="depth-legend" width="256" height="1"></canvas>
-      <div class="legend-labels"><span id="legend-near">–</span><span id="legend-mid">–</span><span id="legend-far">–</span></div>
+      <div id="depth-legend-box" hidden>
+        <canvas id="depth-legend" class="depth-legend" width="256" height="1"></canvas>
+        <div class="legend-labels"><span id="legend-near">–</span><span id="legend-mid">–</span><span id="legend-far">–</span></div>
+      </div>
+      <div id="feature-legend-box">
+        <div class="muted" id="feature-legend-title">camera image (rectified left), not depth; the tracked features:</div>
+        <div class="feature-keys">
+          <span class="key"><i class="dot inlier"></i><span id="ds-n-inlier">–</span> inlier</span>
+          <span class="key"><i class="dot outlier"></i><span id="ds-n-outlier">–</span> rejected</span>
+          <span class="key"><i class="dot matched"></i><span id="ds-n-matched">–</span> matched</span>
+          <span class="key"><i class="dot depth"></i><span id="ds-n-depth">–</span> depth</span>
+          <span class="key"><i class="dot no_depth"></i><span id="ds-n-no_depth">–</span> no depth</span>
+        </div>
+      </div>
       <div class="kv">
         <span>centre depth (raw, 5×5 median)</span><span id="ds-center">–</span>
         <span>centre pixel (raw)</span><span id="ds-center-pixel">–</span>
@@ -124,17 +138,20 @@
         <span>bandwidth</span><span id="ds-kbps">–</span>
         <span>JPEG</span><span id="ds-jpeg">–</span>
         <span>encoding</span><span id="ds-encoding">–</span>
+        <span>source</span><span id="ds-source">–</span>
+        <span>features</span><span id="ds-features">–</span>
         <span>camera conversion</span><span id="ds-cost">–</span>
         <span>camera errors</span><span id="ds-errors">–</span>
       </div>
       <details id="ds-log-box" hidden><summary class="muted" id="ds-log-summary">camera log</summary>
         <pre id="ds-log" class="probe"></pre></details>
-      <div class="hint">The camera turns the VIO's depth (after the stereo filters and the min/max depth thresholds) into
-        8-bit gray, linear in depth, and encodes it; the Pi only forwards the JPEGs. Raw = device depth in air, before
-        the refractive index and depth scale. The crosshair marks the centre pixel.</div>
-      <div class="hint widget-link"><a id="widget-link" href="widget/depth" target="_blank" rel="noopener">Depth +
-        tracked features widget</a>: the same live depth with the PnP features drawn on top and a status line, for a
-        Cockpit widget (Edit mode → widget list → "OAK-D VIO depth", offered by BlueOS) or a browser tab.</div>
+      <div class="hint" id="depth-stream-hint">The camera encodes the rectified left image the feature tracker works on;
+        the Pi only forwards the JPEGs, and the browser draws the tracked features on it. Raw = device depth in air,
+        before the refractive index and depth scale. The crosshair marks the centre pixel.</div>
+      <div class="hint widget-link"><a id="widget-link" href="widget/depth" target="_blank" rel="noopener">Live +
+        tracked features widget</a>: the same live image (camera or depth) with the PnP features drawn on top and a
+        status line, for a Cockpit widget (Edit mode → widget list → "OAK-D VIO depth", offered by BlueOS) or a
+        browser tab.</div>
     </div>
   </div>
 </section>

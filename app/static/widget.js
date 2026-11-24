@@ -2,9 +2,12 @@
 // OAK-D VIO depth widget (Cockpit external widget, also usable on its own).
 // Sources, both only while this page is visible (the camera and the VIO stop publishing a few seconds
 // after the last client leaves):
-//   api/stream/depth     MJPEG, gray linear in depth (depth_stream.py), colorized here on a canvas
+//   api/stream/depth     MJPEG (depth_stream.py): with mono_features (the default) the rectified-left camera
+//                        image the features are tracked on, shown as it is; else gray linear in depth (or
+//                        disparity), colorized here on a canvas. status.depth.encoding says which
 //   api/stream/features  server-sent events: "features" (points [u, v, state] on the depth image's
-//                        pixel grid, feature_stream.py) and "status" (cockpit_widget.widget_status)
+//                        pixel grid, feature_stream.py; drawn by features_overlay.js, inlined before this)
+//                        and "status" (cockpit_widget.widget_status)
 // URLs are relative to the extension's base, so the page works on port 8095 and behind BlueOS's
 // /extensionv2/<name>/ proxy. Query options: colorize=0 (gray depth), features=0, status=0.
 
@@ -18,7 +21,7 @@ const SHOW_FEATURES = option('features', true);
 const SHOW_STATUS = option('status', true);
 const FEATURES_STALE_MS = 2000;
 const RETRY_MS = 3000;
-const STATES = ['no_depth', 'depth', 'matched', 'outlier', 'inlier'];
+const MONO_ENCODING = 'gray8-mono-rectified-left';
 const BLANK_GIF = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
 
 const $ = id => document.getElementById(id);
@@ -38,8 +41,10 @@ function jet(x) {
 
 // d.encoding "gray8-depth-linear": gray linear in depth (gray_far at max_mm .. gray_near at min_mm);
 // "gray8-disparity": gray = disparity in px, depth_mm = d.disparity.depth_times_disparity / gray. 0 = no depth.
+// "gray8-mono-rectified-left": the camera image, no depth scale (kind 'mono', shown without a lookup table).
 function streamScale(d) {
   const range = (d && d.depth_range_mm) || [300, 4000];
+  if (d && d.encoding === MONO_ENCODING) return { kind: 'mono', min: range[0], max: range[1] };
   const disparity = d && d.encoding === 'gray8-disparity' && d.disparity;
   if (disparity && disparity.depth_times_disparity > 0) {
     return { kind: 'disparity', min: range[0], max: range[1], far: disparity.gray_far, near: disparity.gray_near,
@@ -95,13 +100,16 @@ function colorize() {
   }
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
   try { ctx.drawImage(img, 0, 0); } catch (e) { return; }
-  const frame = ctx.getImageData(0, 0, canvas.width, canvas.height), px = frame.data;
-  const lut = depthLut(w.scale || streamScale(null));
-  for (let i = 0; i < px.length; i += 4) {
-    const k = px[i] * 3;
-    px[i] = lut[k]; px[i + 1] = lut[k + 1]; px[i + 2] = lut[k + 2];
+  const scale = w.scale || streamScale(null);
+  if (scale.kind !== 'mono') {
+    const frame = ctx.getImageData(0, 0, canvas.width, canvas.height), px = frame.data;
+    const lut = depthLut(scale);
+    for (let i = 0; i < px.length; i += 4) {
+      const k = px[i] * 3;
+      px[i] = lut[k]; px[i + 1] = lut[k + 1]; px[i + 2] = lut[k + 2];
+    }
+    ctx.putImageData(frame, 0, 0);
   }
-  ctx.putImageData(frame, 0, 0);
   if (!w.frame || w.frame[0] !== canvas.width || w.frame[1] !== canvas.height) {
     w.frame = [canvas.width, canvas.height];
     drawOverlay();
@@ -152,42 +160,7 @@ function syncDepth() {
 
 // --- features overlay -----------------------------------------------------------------------------
 
-// Where the depth frame (frame_size, letterboxed like object-fit: contain) sits in the view, in CSS px
-function frameRect(frameSize, width, height) {
-  const s = Math.min(width / frameSize[0], height / frameSize[1]);
-  const dw = frameSize[0] * s, dh = frameSize[1] * s;
-  return { x: (width - dw) / 2, y: (height - dh) / 2, w: dw, h: dh };
-}
-
-function marker(ctx, state, x, y) {
-  ctx.beginPath();
-  if (state === 4) {  // inlier
-    ctx.arc(x, y, 3.5, 0, 2 * Math.PI);
-    ctx.fillStyle = '#00ff66';
-    ctx.fill();
-    ctx.stroke();
-  } else if (state === 3) {  // outlier: rejected by RANSAC
-    ctx.rect(x - 3, y - 3, 6, 6);
-    ctx.fillStyle = '#ff2bd6';
-    ctx.fill();
-    ctx.stroke();
-  } else if (state === 2) {  // matched, no RANSAC result
-    ctx.arc(x, y, 3.5, 0, 2 * Math.PI);
-    ctx.lineWidth = 3; ctx.stroke();
-    ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1.5; ctx.stroke();
-    ctx.strokeStyle = '#000'; ctx.lineWidth = 1;
-  } else if (state === 1) {  // valid depth, not in the reference
-    ctx.arc(x, y, 2, 0, 2 * Math.PI);
-    ctx.fillStyle = '#8fd3ff';
-    ctx.fill();
-    ctx.stroke();
-  } else {  // no depth
-    ctx.arc(x, y, 2, 0, 2 * Math.PI);
-    ctx.strokeStyle = '#9aa4b0';
-    ctx.stroke();
-    ctx.strokeStyle = '#000';
-  }
-}
+// featureContainRect, drawFeatures: features_overlay.js
 
 function drawOverlay() {
   const canvas = $('overlay'), view = $('view');
@@ -202,28 +175,20 @@ function drawOverlay() {
   ctx.clearRect(0, 0, width, height);
   const f = w.features;
   const fresh = f && performance.now() - w.featuresAt < FEATURES_STALE_MS;
-  const frameSize = w.frame || (f && f.frame_size) || [640, 400];
-  const rect = frameRect(frameSize, width, height);
+  // The shown JPEG's own size (depth: frame_size, mono_features: image_size; the same field of view)
+  const frameSize = w.frame || (f && (f.image_size || f.frame_size)) || [640, 400];
+  const rect = featureContainRect(frameSize, width, height);
   if (!w.frame) {
     ctx.strokeStyle = '#2a3442';
     ctx.strokeRect(rect.x + 0.5, rect.y + 0.5, rect.w - 1, rect.h - 1);
   }
-  if (!SHOW_FEATURES || !fresh || !f.frame_size) return;
-  // Points are on the depth image's grid (frame_size); the shown JPEG covers the same field of view
-  const sx = rect.w / f.frame_size[0], sy = rect.h / f.frame_size[1];
-  ctx.strokeStyle = '#000';
-  ctx.lineWidth = 1;
-  for (const state of [0, 1, 2, 3, 4]) {  // best on top
-    for (const p of f.points) {
-      if (p[2] === state) marker(ctx, state, rect.x + (p[0] + 0.5) * sx, rect.y + (p[1] + 0.5) * sy);
-    }
-  }
+  if (SHOW_FEATURES && fresh) drawFeatures(ctx, f, rect);
 }
 
 function renderFeatureKeys() {
   const f = w.features;
   const fresh = f && performance.now() - w.featuresAt < FEATURES_STALE_MS;
-  for (const state of STATES) {
+  for (const state of FEATURE_STATES) {
     $('n-' + state).textContent = fresh && f.counts && isNum(f.counts[state]) ? f.counts[state] : '–';
   }
 }
@@ -241,13 +206,20 @@ function renderStatus(s) {
   w.status = s;
   const d = s.depth || {};
   w.scale = streamScale(d);
+  const mono = w.scale.kind === 'mono';
   const key = JSON.stringify(w.scale);
   if (renderStatus.legend !== key) {
-    drawLegend(w.scale);
+    if (!mono) drawLegend(w.scale);
     renderStatus.legend = key;
   }
-  $('depth-rate').textContent = d.streaming && isNum(d.fps) ? d.fps.toFixed(1) + ' fps'
-    : d.enabled === false ? 'depth stream off' : '';
+  // The legend is a depth scale: only for the depth and disparity images
+  $('depth-legend-box').hidden = mono;
+  $('mono-label').hidden = !mono;
+  document.title = mono ? 'OAK-D VIO camera' : 'OAK-D VIO depth';
+  const rate = d.streaming && isNum(d.fps) ? d.fps.toFixed(1) + ' fps' : d.enabled === false ? 'stream off' : '';
+  $('depth-rate').textContent = rate;
+  $('mono-rate').textContent = rate;
+  const what = mono ? 'camera' : 'depth';
 
   const line = $('status-line');
   line.hidden = !SHOW_STATUS;
@@ -274,21 +246,20 @@ function renderStatus(s) {
     parts.push(span('last fail: ' + String(failure.reason).split(':')[0] + age, failure.age_s < 2 ? 'bad' : 'muted'));
   }
   if (!s.problem && d.errors) {
-    const error = span('depth: ' + d.errors + ' camera errors', 'bad');
+    const error = span(what + ': ' + d.errors + ' camera errors', 'bad');
     if (d.last_error) error.title = d.last_error.text;
     parts.push(error);
   }
   if (!s.problem && d.encoder_stalled) {
-    const stalled = span('depth: ' + (d.encoded_on === 'pi' ? 'Pi' : 'camera') + ' encoder outputs nothing', 'bad');
+    const stalled = span(what + ': ' + (d.encoded_on === 'pi' ? 'Pi' : 'camera') + ' encoder outputs nothing', 'bad');
     if (d.last_error) stalled.title = d.last_error.text;
     parts.push(stalled);
   } else if (!s.problem && d.blank && d.encoded_on !== 'pi') {
-    const blank = span('depth: blank frames from ' + d.blank.variant, 'bad');
+    const blank = span(what + ': blank frames from ' + d.blank.variant, 'bad');
     blank.title = d.blank.text;
     parts.push(blank);
   } else if (!s.problem && d.streaming && d.encoded_on === 'pi') {
-    const pi = span('depth: encoded on the Pi' + (d.fallback ? ' (fallback: ' + d.fallback.reason + ')' : ''), 'muted');
-    if (d.fallback && d.fallback.detail) pi.title = d.fallback.detail;
+    const pi = span('depth: encoded on the Pi' + (d.fallback ? ' (fallback: ' + d.fallback.reason + ')' : ''), 'muted');    if (d.fallback && d.fallback.detail) pi.title = d.fallback.detail;
     parts.push(pi);
   }
   const pose = s.pose;
@@ -300,7 +271,7 @@ function renderStatus(s) {
   line.replaceChildren(...parts);
 
   let message = s.problem || '';
-  if (!message && !d.enabled) message = 'depth stream off in the settings: features only';
+  if (!message && !d.enabled) message = 'live stream off in the settings: features only';
   else if (!message && !w.frame && !(w.features && performance.now() - w.featuresAt < FEATURES_STALE_MS)) message = 'waiting for frames…';
   $('message').textContent = message;
   syncDepth();

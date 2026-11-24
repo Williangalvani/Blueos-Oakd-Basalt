@@ -75,15 +75,20 @@ def test_page_is_one_self_contained_offline_page(client):
     for panel in ("panel-status", "panel-views", "panel-trajectory", "panel-velocity", "panel-vxvy",
                   "panel-inliers", "panel-settings", "panel-autopilot", "plot-dial", "plot-vbar", "ap-dialog",
                   "panel-depth-stream", "depth-stream-img", "depth-stream-canvas", "depth-legend", "ds-cost",
-                  "ds-errors"):
+                  "ds-errors", "depth-stream-title", "depth-stream-overlay", "depth-stream-features",
+                  "depth-legend-box", "feature-legend-box", "ds-source", "ds-features", "ds-n-inlier",
+                  "ds-n-no_depth"):
         assert f'id="{panel}"' in page
+    # The shared features overlay is inlined before ui.js, which uses it
+    assert page.index("const FEATURE_STATES = ") < page.index("function drawStreamFeatures")
     assert "integrated, drifts" in page
     # Every configuration field is in the form
     for field in config_schema.CONFIG_FIELDS:
         assert f'name="{field.key}"' in page, field.key
 
 
-@pytest.mark.parametrize("asset, kind", [("ui.css", "text/css"), ("ui.js", "javascript"), ("ui.html", "text/html")])
+@pytest.mark.parametrize("asset, kind", [("ui.css", "text/css"), ("ui.js", "javascript"), ("ui.html", "text/html"),
+                                         ("features_overlay.js", "javascript")])
 def test_static_assets_are_served_without_external_urls(client, asset, kind):
     main, http = client
     response = http.get(f"/static/{asset}")
@@ -95,7 +100,11 @@ def test_page_polls_politely(client):
     main, http = client
     js = http.get("/static/ui.js").text
     assert "visibilityState" in js and "If-None-Match" in js
-    assert "WebSocket" not in js and "EventSource" not in js
+    assert "WebSocket" not in js
+    # The only event stream: the tracked features, opened only while the live stream runs (startDepthStream)
+    assert js.count("new EventSource(") == 1 and "new EventSource(FEATURES_URL)" in js
+    guard = "if (depthStream.events || !$('depth-stream-features').checked || !depthStream.on || !visible()) return;"
+    assert guard in js
     assert "setInterval(tick, 1000)" in js
 
 

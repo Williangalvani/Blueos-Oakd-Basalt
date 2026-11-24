@@ -21,6 +21,7 @@ body { color: #e8eef6; font: 11px/1.35 system-ui, -apple-system, "Segoe UI", Rob
 .bar .mock { padding: 0 4px; border-radius: 3px; background: #7a3db8; color: #fff; font-weight: 700; }
 .muted { color: #8fa0b5; }
 .legend { display: inline-flex; align-items: center; gap: 4px; }
+[hidden] { display: none !important; }
 #depth-legend { width: 96px; height: 8px; border-radius: 2px; image-rendering: pixelated; }
 .keys { display: inline-flex; flex-wrap: wrap; gap: 0 8px; }
 .key { display: inline-flex; align-items: center; gap: 3px; }

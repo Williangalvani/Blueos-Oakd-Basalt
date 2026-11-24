@@ -20,8 +20,8 @@ SAVED = resolve_stereo_settings(STEREO_DEFAULTS)
 # --- pure helpers ---------------------------------------------------------------------------------------
 
 def test_case_names():
-    assert stereo_probe.parse_case_names(None) == ["A", "B", "C", "D", "E", "F"]
-    assert stereo_probe.parse_case_names(" ") == ["A", "B", "C", "D", "E", "F"]
+    assert stereo_probe.parse_case_names(None) == ["A", "B", "C", "D", "E", "F", "G"]
+    assert stereo_probe.parse_case_names(" ") == ["A", "B", "C", "D", "E", "F", "G"]
     assert stereo_probe.parse_case_names("e, a,E") == ["E", "A"]
     with pytest.raises(ValueError, match="unknown case"):
         stereo_probe.parse_case_names("A,Z")
@@ -421,7 +421,8 @@ def fake_dai():
         ImgFrame=SimpleNamespace(Type=SimpleNamespace(NV12="NV12")),
         VideoEncoderProperties=SimpleNamespace(Profile=SimpleNamespace(MJPEG="MJPEG")),
         MedianFilter=Median,
-        StereoDepthConfig=SimpleNamespace(AlgorithmControl=SimpleNamespace(DepthAlign=DepthAlign)),
+        StereoDepthConfig=SimpleNamespace(AlgorithmControl=SimpleNamespace(DepthAlign=DepthAlign),
+                                          PostProcessing=SimpleNamespace(Filter=Filter)),
         node=SimpleNamespace(Camera=FakeCamera, StereoDepth=SimpleNamespace(PresetMode=SimpleNamespace(
             ROBOTICS="ROBOTICS", NONE="NONE")), ImageManip=FakeImageManip, VideoEncoder=FakeVideoEncoder),
         Pipeline=FakePipeline,
@@ -489,6 +490,30 @@ def test_run_case_d_keeps_the_disparity_8_bit(dai):
     assert list(result["encode"]) == ["disparity"]
     assert result["encode"]["disparity"]["manip"]["samples"][0]["gray_std"] > 5
     assert result["device_log"]["lines"] == 0
+    assert result["disparity_format"]["raw8"] is True and result["disparity_format"]["reason"] is None
+
+
+def test_run_case_g_keeps_the_speckle_filter_with_the_median_last(dai):
+    clock = FakeClock()
+    result = stereo_probe.run_case(stereo_probe.CASES_BY_NAME["G"], SAVED, probe_args(), dai, FakeDevice,
+                                   clock=clock, sleep=clock.sleep)
+    assert result["error"] is None, result.get("traceback")
+    applied = result["applied"]
+    assert applied["filteringOrder"] == ["DECIMATION", "SPECKLE", "SPATIAL", "TEMPORAL", "MEDIAN"]
+    assert applied["speckleFilter"] is True and applied["median"] == "KERNEL_7x7" and applied["enableSubpixel"] is False
+    assert result["executed_filters"] == ["SPECKLE", "MEDIAN"] and result["predicted_max_disparity"] == 95.0
+    assert result["disparity_format"]["raw8"] is True and result["disparity_format"]["from_settings"] == []
+    assert result["streams"]["disparity"]["samples"][0]["type"] == "RAW8"
+
+
+def test_run_case_a_says_why_the_disparity_is_raw16(dai):
+    clock = FakeClock()
+    result = stereo_probe.run_case(stereo_probe.CASES_BY_NAME["A"], SAVED, probe_args(), dai, FakeDevice,
+                                   clock=clock, sleep=clock.sleep)
+    fmt = result["disparity_format"]
+    assert fmt["raw8"] is False and fmt["max_disparity"] == fmt["camera_max_disparity"] == pytest.approx(8192.0)
+    assert fmt["reason"].startswith("disparity is RAW16 (max disparity 8192) with the speckle filter on "
+                                    "(it runs after the median); turn the speckle filter off")
 
 
 def test_a_failing_case_is_recorded_and_the_next_one_runs(dai, tmp_path, capsys):
@@ -527,7 +552,7 @@ def test_the_budget_skips_cases(dai, capsys):
                       dai=dai, open_device=slow_device, clock=clock, sleep=clock.sleep)
     printed = json.loads(capsys.readouterr().out)
     assert [c["name"] for c in printed["cases"]] == ["A", "B"]
-    assert [s["name"] for s in printed["skipped"]] == ["C", "D", "E", "F"]
+    assert [s["name"] for s in printed["skipped"]] == ["C", "D", "E", "F", "G"]
     assert "time budget" in printed["skipped"][0]["reason"]
 
 
@@ -601,7 +626,7 @@ def test_the_probe_result_can_come_from_stdout(client, monkeypatch):
                         lambda cmd, timeout: (0, "depthai noise\n" + json.dumps(complete_document()) + "\n", ""))
     response = http.post("/api/stereo_probe")
     assert response.status_code == 200 and response.json()["probe"] == complete_document()
-    assert response.json()["cases"] == ["A", "B", "C", "D", "E", "F"]
+    assert response.json()["cases"] == ["A", "B", "C", "D", "E", "F", "G"]
 
 
 @pytest.mark.parametrize("outcome, status", [("crash", 502), ("exit", 502), ("garbage", 502), ("timeout", 504)])

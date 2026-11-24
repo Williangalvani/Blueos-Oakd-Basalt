@@ -579,21 +579,33 @@ function focalCheck() {
     data => (data.ok ? 'OK: ' : 'CHECK: ') + data.message);
 }
 
-// --- live depth stream --------------------------------------------------------------------------
-// The stream's gray (depth_stream.py, d.encoding): "gray8-depth-linear" is linear in depth, 0 = no depth,
-// gray_far (max_mm) .. gray_near (min_mm); "gray8-disparity" (the disparity variant) is the camera's
-// disparity in pixels, 0 = no depth, depth_mm = d.disparity.depth_times_disparity / gray. Both are colored
-// by depth on the same jet scale (min_mm red .. max_mm blue), with a 256-entry lookup table on a canvas.
+// --- live stream (camera image + features, or depth) --------------------------------------------
+// The stream's gray (depth_stream.py, d.encoding): "gray8-mono-rectified-left" (mono_features, the default)
+// is the rectified left camera image the features are tracked on, shown as it is, with the tracked features
+// (api/stream/features, drawn by features_overlay.js) on top. "gray8-depth-linear" is linear in depth,
+// 0 = no depth, gray_far (max_mm) .. gray_near (min_mm); "gray8-disparity" (the disparity variant) is the
+// camera's disparity in pixels, 0 = no depth, depth_mm = d.disparity.depth_times_disparity / gray. Both depth
+// kinds are redrawn by depth on a canvas with a 256-entry lookup table: jet (min_mm red .. max_mm blue), or
+// with colorize off gray linear in depth (near bright), so the contrast is stretched; the JPEG itself is
+// unchanged and the legend shows the scale drawn.
 
-const depthStream = { on: false, retry: null, timer: null, lut: null, lutKey: '', scale: null };
+const MONO_ENCODING = 'gray8-mono-rectified-left';
+const FEATURES_URL = 'api/stream/features';
+const FEATURES_STALE_MS = 2000;
+const depthStream = { on: false, retry: null, timer: null, lut: null, lutKey: '', scale: null, events: null,
+                      features: null, featuresAt: 0 };
 
 function jet(x) {
   const c = v => Math.round(255 * Math.max(0, Math.min(1, v)));
   return [c(1.5 - Math.abs(4 * x - 3)), c(1.5 - Math.abs(4 * x - 2)), c(1.5 - Math.abs(4 * x - 1))];
 }
 
+// Until the VIO publishes (stale), the configured encoding says what will be shown
+const monoConfigured = d => d.stale && ['auto', 'mono_features'].includes(d.configured_encoding);
+
 function streamScale(d) {
   const range = (d && d.depth_range_mm) || [300, 4000];
+  if (d && (d.stale ? monoConfigured(d) : d.encoding === MONO_ENCODING)) return { kind: 'mono', min: range[0], max: range[1] };
   const disparity = d && d.encoding === 'gray8-disparity' && d.disparity;
   if (disparity && disparity.depth_times_disparity > 0) {
     return { kind: 'disparity', min: range[0], max: range[1], far: disparity.gray_far, near: disparity.gray_near,
@@ -604,6 +616,9 @@ function streamScale(d) {
            invalid: (d && d.gray_invalid_below) || 8 };
 }
 
+const isMono = scale => scale.kind === 'mono';
+const colorOn = () => $('depth-stream-color').checked;
+
 // Depth (mm) of a gray value on the scale, NaN for no depth
 function grayDepth(scale, g) {
   if (g < scale.invalid) return NaN;
@@ -611,38 +626,46 @@ function grayDepth(scale, g) {
   return scale.max - (scale.max - scale.min) * (g - scale.far) / (scale.near - scale.far);
 }
 
-function depthColor(scale, mm) {
-  return Number.isNaN(mm) ? [0, 0, 0] : jet((scale.max - mm) / (scale.max - scale.min));
+// Colour drawn for a depth (mm): jet, or gray linear in depth (near bright) with colorize off; black = none
+function depthColor(scale, mm, color) {
+  if (Number.isNaN(mm)) return [0, 0, 0];
+  const x = (scale.max - mm) / (scale.max - scale.min);
+  if (color) return jet(x);
+  const g = Math.round(16 + 239 * Math.max(0, Math.min(1, x)));
+  return [g, g, g];
 }
 
-function depthLut(scale) {
-  const key = [scale.kind, scale.far, scale.near, scale.invalid, scale.k, scale.min, scale.max].join(',');
+function depthLut(scale, color) {
+  const key = [scale.kind, scale.far, scale.near, scale.invalid, scale.k, scale.min, scale.max, color].join(',');
   if (depthStream.lutKey === key) return depthStream.lut;
   const lut = new Uint8ClampedArray(256 * 3);
-  for (let g = 0; g < 256; g++) lut.set(depthColor(scale, grayDepth(scale, g)), g * 3);
+  for (let g = 0; g < 256; g++) lut.set(depthColor(scale, grayDepth(scale, g), color), g * 3);
   depthStream.lut = lut;
   depthStream.lutKey = key;
   return lut;
 }
 
-function drawDepthLegend(scale) {
+function drawDepthLegend(scale, color) {
   const canvas = $('depth-legend');
   const ctx = canvas.getContext('2d');
   const image = ctx.createImageData(canvas.width, 1);
   for (let i = 0; i < canvas.width; i++) {
-    image.data.set(depthColor(scale, scale.min + (scale.max - scale.min) * i / (canvas.width - 1)), i * 4);
+    image.data.set(depthColor(scale, scale.min + (scale.max - scale.min) * i / (canvas.width - 1), color), i * 4);
     image.data[i * 4 + 3] = 255;
   }
   ctx.putImageData(image, 0, 0);
   const m = mm => (mm / 1000).toFixed(2) + ' m';
-  const nearest = scale.kind === 'disparity' && scale.nearest > scale.min ? ' (disparity: nearest ' + m(scale.nearest) + ')' : '';
-  setText('legend-near', m(scale.min) + ' near' + nearest);
-  setText('legend-mid', m((scale.min + scale.max) / 2));
-  setText('legend-far', m(scale.max) + ' far');
+  // The disparity image's own values at each label: gray = disparity in px
+  const px = mm => (scale.kind === 'disparity' ? ' = ' + Math.min(scale.k / mm, scale.near).toFixed(1) + ' px' : '');
+  const nearest = scale.kind === 'disparity' && scale.nearest > scale.min ? ' (nearest ' + m(scale.nearest) + ')' : '';
+  setText('legend-near', m(scale.min) + px(scale.min) + ' near' + nearest);
+  setText('legend-mid', m((scale.min + scale.max) / 2) + px((scale.min + scale.max) / 2));
+  setText('legend-far', m(scale.max) + px(scale.max) + ' far');
 }
 
 // "16 mm steps, 240 gray levels" or, for disparity, the depth step of one pixel at 1 m and at max_mm
 function quantizationText(d, scale) {
+  if (isMono(scale)) return 'camera image (8-bit gray), not depth';
   if (scale.kind === 'disparity') {
     const step = mm => (mm * mm / scale.k).toFixed(0) + ' mm';
     return 'disparity ' + scale.far.toFixed(1) + '–' + scale.near.toFixed(1) + ' px (1 px = ' + step(1000)
@@ -655,12 +678,15 @@ const STREAM_URL = 'api/stream/depth';
 const BLANK_GIF = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
 const depthStreaming = () => ($('depth-stream-img').getAttribute('src') || '').startsWith(STREAM_URL);
 
+// The depth kinds are always redrawn on the canvas (by depth, see above); the camera image is shown as it is
 function colorizeDepth() {
   const img = $('depth-stream-img'), canvas = $('depth-stream-canvas');
-  const color = $('depth-stream-color').checked && depthStreaming();
-  canvas.hidden = !color;
-  img.classList.toggle('under', color);
-  if (!color || !img.naturalWidth) return;
+  const scale = depthStream.scale || streamScale(null);
+  const draw = !isMono(scale) && depthStreaming();
+  canvas.hidden = !draw;
+  img.classList.toggle('under', draw);
+  drawStreamFeatures();
+  if (!draw || !img.naturalWidth) return;
   if (canvas.width !== img.naturalWidth || canvas.height !== img.naturalHeight) {
     canvas.width = img.naturalWidth;
     canvas.height = img.naturalHeight;
@@ -668,12 +694,64 @@ function colorizeDepth() {
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
   try { ctx.drawImage(img, 0, 0); } catch (e) { return; }
   const frame = ctx.getImageData(0, 0, canvas.width, canvas.height), px = frame.data;
-  const lut = depthLut(depthStream.scale || streamScale(null));
+  const lut = depthLut(scale, colorOn());
   for (let i = 0; i < px.length; i += 4) {
     const k = px[i] * 3;
     px[i] = lut[k]; px[i + 1] = lut[k + 1]; px[i + 2] = lut[k + 2];
   }
   ctx.putImageData(frame, 0, 0);
+}
+
+// --- tracked features on the live image (only while streaming with "features" ticked) ---
+
+const featuresFresh = () => depthStream.features && performance.now() - depthStream.featuresAt < FEATURES_STALE_MS;
+
+function drawStreamFeatures() {
+  const canvas = $('depth-stream-overlay'), frame = canvas.parentElement;
+  const dpr = window.devicePixelRatio || 1;
+  const width = frame.clientWidth, height = frame.clientHeight;
+  if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+  }
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  const img = $('depth-stream-img'), f = depthStream.features;
+  if (!depthStreaming() || !img.naturalWidth || img.naturalWidth < 2 || !featuresFresh()) return;
+  // The shown JPEG's own size: the overlay maps the points onto it (features_overlay.js)
+  drawFeatures(ctx, f, featureContainRect([img.naturalWidth, img.naturalHeight], width, height));
+}
+
+function renderFeatureCounts() {
+  const f = featuresFresh() ? depthStream.features : null;
+  for (const state of FEATURE_STATES) {
+    setText('ds-n-' + state, f && f.counts && isNum(f.counts[state]) ? f.counts[state] : '–');
+  }
+  setText('ds-features', !$('depth-stream-features').checked ? 'off' : !depthStream.events ? '–'
+    : !f ? 'waiting…' : f.points.length + ' tracked · frame ' + f.sequence
+      + (f.image_sequence == null ? ' (latest)' : f.synced ? ' (same frame as the image)' : ' (image frame ' + f.image_sequence + ')'));
+}
+
+function startFeatureEvents() {
+  if (depthStream.events || !$('depth-stream-features').checked || !depthStream.on || !visible()) return;
+  const es = new EventSource(FEATURES_URL);
+  depthStream.events = es;
+  es.addEventListener('features', e => {
+    try { depthStream.features = JSON.parse(e.data); } catch (err) { return; }
+    depthStream.featuresAt = performance.now();
+    renderFeatureCounts();
+    drawStreamFeatures();
+  });
+  es.onerror = () => { if (es.readyState === EventSource.CLOSED) stopFeatureEvents(); };  // the next status retries
+}
+
+function stopFeatureEvents() {
+  if (depthStream.events) depthStream.events.close();
+  depthStream.events = null;
+  depthStream.features = null;
+  renderFeatureCounts();
+  drawStreamFeatures();
 }
 
 function startDepthStream() {
@@ -685,6 +763,7 @@ function startDepthStream() {
   const fps = (ui.status && ui.status.depth_stream && ui.status.depth_stream.fps_target) || 5;
   clearInterval(depthStream.timer);
   depthStream.timer = setInterval(colorizeDepth, Math.max(60, Math.min(500, 500 / fps)));
+  startFeatureEvents();
 }
 
 function stopDepthStream(state) {
@@ -696,6 +775,7 @@ function stopDepthStream(state) {
     img.src = BLANK_GIF;  // aborts the multipart request, so the camera stops streaming
     img.removeAttribute('src');
   }
+  stopFeatureEvents();
   colorizeDepth();
   $('depth-stream-crosshair').hidden = true;
   $('depth-stream-view').classList.add('empty');
@@ -715,10 +795,21 @@ function toggleDepthStream() {
   if (ui.status) renderDepthStream(ui.status);
 }
 
+function toggleStreamFeatures() {
+  if ($('depth-stream-features').checked && depthStreaming()) startFeatureEvents();
+  else stopFeatureEvents();
+}
+
+function toggleStreamColor() {
+  renderDepthStream.legend = null;
+  if (ui.status) renderDepthStream(ui.status);
+  colorizeDepth();
+}
+
 function depthStreamProblem(s) {
   const d = s.depth_stream || {};
-  if (s.algorithm !== 'pnp') return 'the depth stream needs the PnP algorithm (current: ' + s.algorithm + ')';
-  if (!d.enabled) return 'the depth stream is off in the settings (Live depth stream)';
+  if (s.algorithm !== 'pnp') return 'the live stream needs the PnP algorithm (current: ' + s.algorithm + ')';
+  if (!d.enabled) return 'the live stream is off in the settings (Live depth stream)';
   if (!s.running) return 'VIO stopped';
   if (d.stale) return 'waiting for the VIO process…';
   return null;
@@ -728,8 +819,10 @@ function depthEncodingText(d) {
   if (d.stale || !d.variant) return d.configured_encoding ? d.configured_encoding + ' (configured)' : '–';
   const parts = [d.variant + (d.encoded_on === 'pi' ? ' · encoded on the Pi' : ' · encoded on the camera')];
   if (d.requested_variant && d.requested_variant !== d.variant) parts.push('requested ' + d.requested_variant);
+  if (d.variant_reason && d.requested_variant !== 'auto') parts.push(d.variant_reason);
   if (d.fallback) parts.push('fallback: ' + d.fallback.reason + (d.fallback.at_start ? '' : ' (from ' + d.fallback.from + ')'));
   if (d.encoding === 'gray8-disparity') parts.push('gray = disparity (px), depth = f·B / disparity');
+  if (d.encoding === MONO_ENCODING) parts.push('gray = the camera image, not depth');
   const host = d.host_encoder;
   if (d.encoded_on === 'pi' && host) {
     parts.push('Pi CPU ' + fmt(host.cpu_percent, 1) + ' % of a core (cap ' + fmt(host.cpu_budget_percent, 0) + ' %)'
@@ -764,9 +857,29 @@ function renderDeviceLog(d, now) {
 function renderDepthStream(s) {
   const d = s.depth_stream || {};
   depthStream.scale = streamScale(d);
-  const legendKey = JSON.stringify(depthStream.scale);
-  if (renderDepthStream.legend !== legendKey) {
-    drawDepthLegend(depthStream.scale);
+  const mono = isMono(depthStream.scale);
+  // The title, legend and hint follow what is shown: the camera image (mono_features) or depth
+  setText('depth-stream-title', mono ? 'Live camera' : 'Live depth');
+  setText('depth-stream-subtitle', mono
+    ? '(the rectified left camera image the features are tracked on, with the tracked features, MJPEG-encoded on the camera; only sent while streaming)'
+    : '(stereo ' + (depthStream.scale.kind === 'disparity' ? 'disparity' : 'depth') + ' as MJPEG, encoded on the '
+      + (d.encoded_on === 'pi' ? 'Pi' : 'camera') + ', with the tracked features; only sent while streaming)');
+  $('depth-legend-box').hidden = mono;
+  $('depth-stream-color-label').hidden = mono;
+  setText('feature-legend-title', mono ? 'camera image (rectified left), not depth; the tracked features:'
+    : 'the tracked features:');
+  setText('depth-stream-hint', mono
+    ? 'The camera encodes the rectified left image the feature tracker works on; the Pi only forwards the JPEGs, and '
+      + 'the browser draws the tracked features on it. Raw = device depth in air, before the refractive index and '
+      + 'depth scale. The crosshair marks the centre pixel.'
+    : (depthStream.scale.kind === 'disparity'
+      ? 'The camera encodes its 8-bit disparity (gray = disparity in px); the browser redraws it by depth. '
+      : 'The VIO\'s depth (after the stereo filters and the min/max depth thresholds) as 8-bit gray, linear in depth; '
+        + 'the browser redraws it by depth. ')
+      + 'Raw = device depth in air, before the refractive index and depth scale. The crosshair marks the centre pixel.');
+  const legendKey = JSON.stringify(depthStream.scale) + colorOn();
+  if (!mono && renderDepthStream.legend !== legendKey) {
+    drawDepthLegend(depthStream.scale, colorOn());
     renderDepthStream.legend = legendKey;
   }
   const camera = s.camera || {};
@@ -786,16 +899,20 @@ function renderDepthStream(s) {
   const last = d.last_frame;
   setText('ds-jpeg', (isNum(d.quality) ? 'quality ' + d.quality : '–') + (d.streaming && last ? ' · ' + (last.bytes / 1024).toFixed(1) + ' KiB/frame' : ''));
   setText('ds-encoding', depthEncodingText(d));
+  setText('ds-source', d.stale || !d.source ? '–' : d.source + (d.image_size ? ' · ' + d.image_size.join('×') : ''));
   const cost = d.stale ? null : d.device_stats;
   setText('ds-cost', cost ? (d.encoded_on === 'pi' ? 'Pi encode ' : '') + fmt(cost.convert_ms_mean, 1) + ' ms mean, '
     + fmt(cost.convert_ms_max, 1) + ' ms max' : '–');
   setText('ds-errors', depthErrorsText(d, s.server_time));
   renderDeviceLog(d, s.server_time);
+  renderFeatureCounts();
 
   const problem = depthStreamProblem(s);
   const img = $('depth-stream-img');
+  const what = mono ? 'camera image' : 'depth';
   if (!depthStream.on) {
-    setText('depth-stream-caption', problem ? 'Live depth unavailable: ' + problem : 'Tick "stream" to watch the depth the VIO uses, live.');
+    setText('depth-stream-caption', problem ? 'Live stream unavailable: ' + problem
+      : 'Tick "stream" to watch what the VIO sees, live (' + what + ' and the tracked features).');
     return;
   }
   const showing = depthStreaming() && img.naturalWidth > 1;
@@ -803,10 +920,11 @@ function renderDepthStream(s) {
   $('depth-stream-crosshair').hidden = !showing;
   if (problem) setText('depth-stream-caption', problem);
   else if (!d.streaming) setText('depth-stream-caption', 'asking the camera to stream…');
-  else setText('depth-stream-caption', 'depth ' + (d.image_size ? d.image_size.join('×') : '') + ' · '
+  else setText('depth-stream-caption', what + ' ' + (d.image_size ? d.image_size.join('×') : '') + ' · '
     + (d.frames_total || 0) + ' frames this run · ' + new Date().toLocaleTimeString());
   if (showing) setText('depth-stream-state', 'streaming');
   if (!problem && !depthStreaming() && !depthStream.retry) startDepthStream();
+  else if (depthStreaming()) startFeatureEvents();
 }
 
 // --- process control ----------------------------------------------------------------------------
@@ -1276,9 +1394,12 @@ document.addEventListener('visibilitychange', () => {
   if (visible()) { tick(); startDepthStream(); } else if (depthStream.on) stopDepthStream('paused (tab hidden)');
 });
 $('depth-stream-on').addEventListener('change', toggleDepthStream);
-$('depth-stream-color').addEventListener('change', colorizeDepth);
+$('depth-stream-color').addEventListener('change', toggleStreamColor);
+$('depth-stream-features').addEventListener('change', toggleStreamFeatures);
 $('depth-stream-img').addEventListener('error', depthStreamError);
 $('depth-stream-img').addEventListener('load', () => { if (depthStreaming()) colorizeDepth(); });
+if (window.ResizeObserver) new ResizeObserver(drawStreamFeatures).observe($('depth-stream-img').parentElement);
+setInterval(() => { renderFeatureCounts(); drawStreamFeatures(); }, 1000);  // let stale features fade out
 for (const figure of document.querySelectorAll('.view')) figure.classList.add('empty');
 
 initSettings();

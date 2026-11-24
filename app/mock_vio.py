@@ -55,7 +55,7 @@ import pose_stream
 import snapshots
 import vio_log
 import vio_telemetry
-from stereo_config import add_stereo_arguments, resolve_stereo_settings
+from stereo_config import add_stereo_arguments, disparity_format, resolve_stereo_settings
 
 BASELINE_M = 0.075
 # fx at 640 px wide, scaled with the width
@@ -398,7 +398,9 @@ class FakeVio:
         min_mm, max_mm = self.depth_range
         requested = self.args.depth_stream_encoding
         problem = depth_stream.size_problem(self.width, self.height)
-        variant, reason = depth_stream.resolve_variant(requested, bool(self.stereo["stereo_subpixel"]), problem)
+        fmt = disparity_format(None, self.stereo)
+        disparity_problem = depth_stream.disparity_problem(fmt)
+        variant, reason = depth_stream.resolve_variant(requested, disparity_problem, problem)
         info = {"encoding": depth_stream.encoding_for(variant), "codec": "mjpeg",
                 "fps_target": self.args.fps / every, "every": every, "camera_fps": self.args.fps,
                 "quality": self.args.depth_stream_quality, "image_size": [self.width, self.height],
@@ -406,10 +408,12 @@ class FakeVio:
                 "gray_far": depth_stream.GRAY_FAR, "gray_near": depth_stream.GRAY_NEAR,
                 "gray_invalid_below": depth_stream.GRAY_INVALID_BELOW, "requested_variant": requested,
                 "variant": variant or depth_stream.HOST_JPEG, "variant_reason": reason, "size_problem": problem,
-                "mock": True}
+                "source": depth_stream.source_for(variant or depth_stream.HOST_JPEG), "disparity_format": fmt,
+                "disparity_problem": disparity_problem, "mock": True}
         if variant == depth_stream.DISPARITY:
-            info["disparity_max"] = depth_stream.DISPARITY_MAX
-            info["disparity"] = depth_stream.disparity_scale(self.scene.fx, BASELINE_M, min_mm, max_mm)
+            info["disparity_max"] = int(fmt["max_disparity"])
+            info["disparity"] = depth_stream.disparity_scale(self.scene.fx, BASELINE_M, min_mm, max_mm,
+                                                             info["disparity_max"])
         return info
 
     def make_depth_stream(self):
@@ -418,7 +422,10 @@ class FakeVio:
         if info["variant"] == depth_stream.HOST_JPEG or info["requested_variant"] == depth_stream.AUTO:
             host = depth_stream.HostJpegEncoder(*self.depth_range, self.args.depth_stream_quality, info["every"])
         if info["variant"] != depth_stream.HOST_JPEG:
-            device_log = depth_stream.DeviceLog(("Script(4)", "VideoEncoder(5)", "ImageManip(6)"))
+            names = ("Script(4)", "VideoEncoder(5)")
+            if info["variant"] == depth_stream.MANIP:
+                names += ("ImageManip(6)",)
+            device_log = depth_stream.DeviceLog(names)
             if self.args.depth_stream_debug:
                 self.log_device = MockLogDevice(device_log)
                 debug = depth_stream.DeviceLogDebug(self.log_device, "DEBUG", log=print)
@@ -427,12 +434,19 @@ class FakeVio:
         return self.stream
 
     def encode_depth(self, t):
-        """What the camera's Script + VideoEncoder produce, then the device's timing report every STATS_EVERY."""
+        """
+        What the camera's Script + VideoEncoder produce (mono_features: the synthetic rectified-left image the
+        mock features are on), then the device's timing report every STATS_EVERY.
+        """
         import cv2
         start = time.perf_counter()
         depth = self.scene.depth_image(t, self.offset, self.turbidity(t))
-        if self.stream.variant == depth_stream.DISPARITY:
-            gray = depth_stream.gray_disparity_reference(depth, self.scene.fx, BASELINE_M)
+        if self.stream.variant == depth_stream.MONO_FEATURES:
+            gray = self.scene.frame("rect_left", t, self.offset)
+        elif self.stream.variant == depth_stream.DISPARITY:
+            gray = depth_stream.gray_disparity_reference(depth, self.scene.fx, BASELINE_M,
+                                                         self.stream.info.get("disparity_max",
+                                                                              depth_stream.DISPARITY_MAX))
         else:
             gray = depth_stream.gray_reference(depth, *self.depth_range)
         ok, jpeg = cv2.imencode(".jpg", gray, [cv2.IMWRITE_JPEG_QUALITY, int(self.args.depth_stream_quality)])
@@ -547,8 +561,9 @@ class FakeVio:
                     if self.stream_count >= every:
                         self.stream_count = 0
                         jpeg = self.encode_depth(t)
-                        if jpeg is not None:
-                            stream.on_frame(jpeg, sequence)
+                        if (jpeg is not None and stream.on_frame(jpeg, sequence)
+                                and stream.variant == depth_stream.MONO_FEATURES):
+                            features_out.publish_for(sequence)
                 else:
                     self.stream_count = every - 1
 

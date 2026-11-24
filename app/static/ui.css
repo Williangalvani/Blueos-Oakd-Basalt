@@ -65,6 +65,16 @@ details > summary { cursor: pointer; }
 .depth-frame img, .depth-frame canvas { display: block; width: 100%; height: auto; border-radius: 4px; }
 .depth-frame img:not([src]) { display: none; }
 .depth-frame img.under { visibility: hidden; position: absolute; top: 0; left: 0; }
+.depth-frame [hidden], #panel-depth-stream [hidden] { display: none; }
+.depth-frame canvas.depth-overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.feature-keys { display: flex; flex-wrap: wrap; gap: 2px 12px; font-size: 12px; margin: 4px 0 10px; }
+.feature-keys .key { display: inline-flex; align-items: center; gap: 4px; }
+.feature-keys .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; box-shadow: 0 0 0 1px #000; }
+.feature-keys .dot.inlier { background: #00ff66; }
+.feature-keys .dot.outlier { background: #ff2bd6; border-radius: 1px; }
+.feature-keys .dot.matched { background: transparent; box-shadow: inset 0 0 0 2px #fff, 0 0 0 1px #000; }
+.feature-keys .dot.depth { background: #8fd3ff; width: 6px; height: 6px; }
+.feature-keys .dot.no_depth { background: transparent; box-shadow: inset 0 0 0 1px #9aa4b0; width: 6px; height: 6px; }
 .depth-crosshair { position: absolute; left: 50%; top: 50%; width: 18px; height: 18px; margin: -9px 0 0 -9px;
                    pointer-events: none; }
 .depth-crosshair::before, .depth-crosshair::after { content: ""; position: absolute; background: #fff;

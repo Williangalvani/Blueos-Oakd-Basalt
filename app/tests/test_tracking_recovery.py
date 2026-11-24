@@ -466,41 +466,77 @@ def build_fake_pipeline(module, argv):
     return handles, created
 
 
-def test_build_pipeline_encodes_the_disparity_on_the_camera(pnp_vio):
-    """auto with subpixel off: stereo.disparity (pooled RAW8) -> gate Script (forwards it) -> ImageManip -> encoder."""
+def test_build_pipeline_streams_the_rectified_left_image_by_default(pnp_vio):
+    """auto: stereo.rectifiedLeft (pooled RAW8, the tracker's image) -> gate Script (forwards it) -> encoder."""
     dai = pnp_vio.dai
-    handles, created = build_fake_pipeline(pnp_vio, ["--stereo-depth-max-mm", "4000", "--no-stereo-subpixel"])
+    handles, created = build_fake_pipeline(pnp_vio, [])
     (stereo,) = nodes_of(created, dai.node.StereoDepth)
+    (tracker,) = nodes_of(created, dai.node.FeatureTracker)
     snapshot_script, stream_script = nodes_of(created, dai.node.Script)
     (encoder,) = nodes_of(created, dai.node.VideoEncoder)
-    (manip,) = nodes_of(created, dai.node.ImageManip)
-    disparity_in = stream_script.inputs["depth"]
-    stereo.disparity.link.assert_called_once_with(disparity_in)
-    assert mock.call(disparity_in) not in stereo.depth.link.call_args_list
-    disparity_in.setBlocking.assert_called_with(False)
-    disparity_in.setMaxSize.assert_called_with(1)
-    stream_script.outputs["gray"].link.assert_called_once_with(manip.inputImage)
-    manip.out.link.assert_called_once_with(encoder.input)
-    manip.initialConfig.setFrameType.assert_called_once_with(dai.ImgFrame.Type.NV12)
-    manip.setNumFramesPool.assert_called_once_with(3)
+    assert nodes_of(created, dai.node.ImageManip) == []
+    mono_in = stream_script.inputs["depth"]
+    assert mock.call(mono_in) in stereo.rectifiedLeft.link.call_args_list
+    assert mock.call(tracker.inputImage) in stereo.rectifiedLeft.link.call_args_list  # the same image as the features
+    assert mock.call(mono_in) not in stereo.depth.link.call_args_list + stereo.disparity.link.call_args_list
+    mono_in.setBlocking.assert_called_with(False)
+    mono_in.setMaxSize.assert_called_with(1)
+    stream_script.outputs["gray"].link.assert_called_once_with(encoder.input)
+    encoder.input.setBlocking.assert_called_with(False)
+    encoder.input.setMaxSize.assert_called_with(1)
+    encoder.setDefaultProfilePreset.assert_called_once_with(5.0, dai.VideoEncoderProperties.Profile.MJPEG)
     code = stream_script.setScript.call_args[0][0]
     compile(code, "depth_stream_script", "exec")
     assert "out = frame" in code and "ImgFrame(" not in code and "to_gray" not in code
     info = handles.depth_stream_info
-    assert (info["requested_variant"], info["variant"], info["variant_reason"]) == ("auto", "disparity", None)
-    assert info["encoding"] == "gray8-disparity" and isinstance(info["disparity_max"], int)
-    # snapshots 1, and 3 for the disparity frame in the Script's queue, in the Script, in ImageManip's queue
+    assert (info["requested_variant"], info["variant"], info["variant_reason"]) == ("auto", "mono_features", None)
+    assert info["encoding"] == "gray8-mono-rectified-left" and info["source"] == "stereo.rectifiedLeft"
+    # The saved defaults: a RAW16 disparity, said in the status, though auto does not need it
+    assert info["disparity_format"]["type"] == "RAW16" and "speckle" in info["disparity_problem"]
+    assert len(handles.depth_stream_nodes) == 2  # the Script and the encoder
+    # snapshots 1, and 3 for the rectified frame in the Script's queue, in the Script, in the encoder's queue
     stereo.setNumFramesPool.assert_called_once_with(pnp_vio.STEREO_FRAMES_POOL + 4)
 
 
-@pytest.mark.parametrize("encoding", ["auto", "disparity"])
-def test_build_pipeline_disparity_needs_subpixel_off(pnp_vio, encoding):
+@pytest.mark.parametrize("argv", [["--no-stereo-subpixel", "--no-stereo-speckle-filter"],
+                                  ["--no-stereo-subpixel", "--stereo-median-last"]], ids=["speckle-off", "median-last"])
+def test_build_pipeline_encodes_a_raw8_disparity_on_the_camera(pnp_vio, argv):
+    """disparity (explicit) with a RAW8 disparity: stereo.disparity -> gate Script -> encoder, no ImageManip."""
     dai = pnp_vio.dai
-    handles, created = build_fake_pipeline(pnp_vio, ["--depth-stream-encoding", encoding])  # subpixel on (default)
+    handles, created = build_fake_pipeline(pnp_vio, ["--depth-stream-encoding", "disparity", *argv])
+    (stereo,) = nodes_of(created, dai.node.StereoDepth)
+    _, stream_script = nodes_of(created, dai.node.Script)
+    (encoder,) = nodes_of(created, dai.node.VideoEncoder)
+    assert nodes_of(created, dai.node.ImageManip) == []
+    disparity_in = stream_script.inputs["depth"]
+    stereo.disparity.link.assert_called_once_with(disparity_in)
+    stream_script.outputs["gray"].link.assert_called_once_with(encoder.input)
+    info = handles.depth_stream_info
+    assert (info["requested_variant"], info["variant"], info["variant_reason"]) == ("disparity", "disparity", None)
+    assert info["encoding"] == "gray8-disparity" and info["source"] == "stereo.disparity"
+    assert info["disparity_max"] == 95 and info["disparity_format"]["raw8"] is True
+    stereo.setNumFramesPool.assert_called_once_with(pnp_vio.STEREO_FRAMES_POOL + 4)
+
+
+def test_build_pipeline_median_last_sets_the_filtering_order(pnp_vio):
+    dai = pnp_vio.dai
+    Filter = dai.StereoDepthConfig.PostProcessing.Filter
+    _, created = build_fake_pipeline(pnp_vio, ["--stereo-median-last"])
+    (stereo,) = nodes_of(created, dai.node.StereoDepth)
+    assert stereo.initialConfig.postProcessing.filteringOrder == [
+        Filter.DECIMATION, Filter.SPECKLE, Filter.SPATIAL, Filter.TEMPORAL, Filter.MEDIAN]
+
+
+@pytest.mark.parametrize("argv, reason", [([], "Subpixel on"),
+                                          (["--no-stereo-subpixel"], "speckle filter on (it runs after the median)")])
+def test_build_pipeline_runs_a_raw16_disparity_request_on_the_pi(pnp_vio, argv, reason):
+    dai = pnp_vio.dai
+    handles, created = build_fake_pipeline(pnp_vio, ["--depth-stream-encoding", "disparity", *argv])
     assert nodes_of(created, dai.node.VideoEncoder) == [] and len(nodes_of(created, dai.node.Script)) == 1
     info = handles.depth_stream_info
     assert info["variant"] == "host_jpeg" and info["encoding"] == "gray8-depth-linear"
-    assert info["variant_reason"] == depth_stream.SUBPIXEL_PROBLEM and "Subpixel off" in info["variant_reason"]
+    assert info["source"] == "stereo.depth"
+    assert reason in info["variant_reason"] and info["variant_reason"].endswith("or use mono_features")
 
 
 def test_build_pipeline_encodes_the_depth_stream_on_the_camera(pnp_vio):
@@ -627,6 +663,25 @@ def test_run_streams_depth_only_while_a_client_watches(pnp_vio, monkeypatch, tmp
     assert events["depth_stream"]["enabled"] is True and events["depth_stream"]["fps_target"] == 5.0
     # VIO output unchanged
     assert [line["status"] for line in lines if line["type"] == "step"][1:] == ["ok"] * 5
+
+
+def test_run_publishes_the_features_of_the_mono_image_s_own_frame(pnp_vio, monkeypatch, tmp_path):
+    """mono_features: each camera image published also publishes the features of the frame it shows."""
+    telemetry_dir = tmp_path / "snapshots" / "telemetry"
+    depth_stream.touch_lease(telemetry_dir)
+    feature_stream.touch_lease(telemetry_dir)
+    encoded = FakeQueue([SimpleNamespace(getData=lambda: np.frombuffer(b"\xff\xd8mono\xff\xd9", np.uint8),
+                                         getSequenceNum=lambda: 0)])
+    info = {"fps_target": 5.0, "quality": 70, "depth_range_mm": [300, 4000], "variant": "mono_features",
+            "requested_variant": "mono_features"}
+    run_fake(pnp_vio, monkeypatch, tmp_path, scenario(n_good=1, n_lost=0, n_back=0), [],
+             depth_stream_control_queue=FakeQueue(), depth_stream_queue=encoded,
+             depth_stream_status_queue=FakeQueue(), depth_stream_info=info)
+    features = json.loads((telemetry_dir / feature_stream.FEATURES_FILE).read_text())
+    assert (features["sequence"], features["image_sequence"], features["synced"]) == (0, 0, True)
+    assert len(features["points"]) == len(GOOD_UV)
+    meta = depth_stream.read_meta(telemetry_dir)
+    assert meta["source"] == "stereo.rectifiedLeft" and meta["encoding"] == "gray8-mono-rectified-left"
 
 
 def test_run_without_a_watcher_keeps_the_stream_off(pnp_vio, monkeypatch, tmp_path):

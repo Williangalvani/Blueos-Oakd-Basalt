@@ -94,6 +94,62 @@ def test_service_publishes_only_while_leased_and_at_most_every_interval(tmp_path
     assert not tick(svc) and svc.published == 2 and not svc.wanted
 
 
+def tick_frame(svc, sequence, n=4):
+    """A frame whose features are at u = sequence, so a written file shows which frame it came from."""
+    return svc.tick(np.array([[float(sequence), 5.0 * k] for k in range(n)]), (400, 640), sequence, True, None,
+                    depth_valid=np.ones(n, bool))
+
+
+def written(tmp_path):
+    return json.loads((tmp_path / feature_stream.FEATURES_FILE).read_text())
+
+
+def test_publish_for_writes_the_features_of_the_image_s_own_frame(tmp_path):
+    clock = Clock(time.time())
+    feature_stream.touch_lease(tmp_path)
+    svc = service(tmp_path, clock)
+    assert tick_frame(svc, 10)  # interval publishing, not tied to an image
+    data = written(tmp_path)
+    assert (data["sequence"], data["synced"], data["image_sequence"]) == (10, False, None)
+    for sequence in range(11, 16):
+        clock.t += 1 / 15
+        tick_frame(svc, sequence)
+    # The camera image of frame 13 arrives after frame 15 was processed: frame 13's features go out
+    assert svc.publish_for(13)
+    data = written(tmp_path)
+    assert (data["sequence"], data["synced"], data["image_sequence"]) == (13, True, 13)
+    assert {p[0] for p in data["points"]} == {13.0}
+    # While images arrive, the interval publishing waits for them
+    clock.t += 0.3
+    assert not tick_frame(svc, 16)
+    # An image ahead of the features: written as soon as its frame is processed
+    assert not svc.publish_for(18)
+    clock.t += 1 / 15
+    assert not tick_frame(svc, 17)
+    clock.t += 1 / 15
+    assert tick_frame(svc, 18) and written(tmp_path)["image_sequence"] == 18 and written(tmp_path)["synced"]
+    # A frame the host dropped (no features of 20): the nearest older one, not claimed as the same frame
+    for sequence in (19, 21):
+        clock.t += 1 / 15
+        tick_frame(svc, sequence)
+    assert svc.publish_for(20)
+    data = written(tmp_path)
+    assert (data["sequence"], data["synced"], data["image_sequence"]) == (19, False, 20)
+    # Older than every kept frame: nothing to draw it with
+    assert not svc.publish_for(1)
+    assert svc.synced == 2
+    # No image for SYNC_HOLD_S: back to interval publishing
+    clock.t += feature_stream.SYNC_HOLD_S + 0.1
+    assert tick_frame(svc, 22) and written(tmp_path)["image_sequence"] is None
+
+
+def test_publish_for_does_nothing_without_a_watcher(tmp_path):
+    clock = Clock(time.time())
+    svc = service(tmp_path, clock)
+    tick_frame(svc, 1)
+    assert not svc.publish_for(1) and not (tmp_path / feature_stream.FEATURES_FILE).exists()
+
+
 def test_service_idle_cost_is_one_comparison_per_frame(tmp_path, monkeypatch):
     clock = Clock(time.time())
     svc = service(tmp_path, clock)

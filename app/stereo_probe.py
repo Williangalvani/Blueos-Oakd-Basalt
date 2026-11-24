@@ -6,7 +6,8 @@ reports, per case, what StereoDepth outputs and whether the camera's MJPEG encod
 Takes pnp_vio.py's camera and stereo arguments (main.py builds both command lines from the saved config),
 configures StereoDepth with stereo_config.apply_stereo_config, then per case:
 - reads the applied config back from stereo.initialConfig (subpixel, extended, LR check, median, every
-  post-processing filter, filteringOrder, disparityWidth, companding, disparityShift) and getMaxDisparity();
+  post-processing filter, filteringOrder, disparityWidth, companding, disparityShift) and getMaxDisparity(),
+  and what stereo_config.disparity_format (the depth stream's disparity precondition) makes of it;
 - samples stereo.disparity, stereo.depth, rectifiedLeft and rectifiedRight on small non-blocking host
   queues: ImgFrame type, size, stride, bytes, and value statistics of a few frames;
 - encodes sources two ways, source -> ImageManip (NV12, own pool) -> VideoEncoder MJPEG and source ->
@@ -34,7 +35,9 @@ import numpy as np
 
 import depth_stream
 import snapshots
-from stereo_config import add_stereo_arguments, apply_stereo_config, resolve_stereo_settings
+from stereo_config import (FILTER_RUNS, FILTERING_ORDER_MEDIAN_LAST, add_stereo_arguments,  # noqa: F401
+                           apply_stereo_config, disparity_format, enum_name, executed_filters,
+                           predicted_max_disparity, read_back, resolve_stereo_settings)
 
 SAMPLE_SECONDS = 4.5
 WARMUP_S = 1.0
@@ -58,14 +61,6 @@ STREAMS = (DISPARITY, "depth", "rectifiedLeft", "rectifiedRight")
 RECTIFIED = ("rectifiedLeft", "rectifiedRight")
 ENCODE_PATHS = ("manip", "direct")
 BYTES_PER_PIXEL = {"RAW8": 1, "GRAY8": 1, "YUV400p": 1, "NV12": 1, "RAW16": 2, "GRAYF16": 2}
-# The order StereoDepthConfig::getMaxDisparity (depthai-core v3.3.0) checks the filters in, with their test
-FILTER_RUNS = {
-    "MEDIAN": lambda rb: rb.get("median") not in (None, "MEDIAN_OFF"),
-    "DECIMATION": lambda rb: (rb.get("decimationFactor") or 1) > 1,
-    "SPECKLE": lambda rb: bool(rb.get("speckleFilter")),
-    "SPATIAL": lambda rb: bool(rb.get("spatialFilter")),
-    "TEMPORAL": lambda rb: bool(rb.get("temporalFilter")),
-}
 MEDIAN_ON = "on"  # case override: the saved median, or 7x7 if the saved one is off
 NO_FILTERS = {"stereo_speckle_filter": False, "stereo_spatial_filter": False, "stereo_temporal_filter": False,
               "stereo_decimation": 1}
@@ -89,6 +84,10 @@ CASES = (
     Case("E", "saved settings, subpixel on", {"stereo_subpixel": True}, (DISPARITY, *RECTIFIED)),
     Case("F", "preset NONE, subpixel off, no filters",
          {"stereo_preset": "NONE", "stereo_subpixel": False, **NO_FILTERS, "stereo_median": "off"}),
+    Case("G", f"A with the speckle filter on and the median last (filteringOrder "
+              f"{', '.join(FILTERING_ORDER_MEDIAN_LAST)})",
+         {"stereo_subpixel": False, "stereo_speckle_filter": True, "stereo_median": MEDIAN_ON,
+          "stereo_median_last": True}),
 )
 CASES_BY_NAME = {case.name: case for case in CASES}
 
@@ -110,82 +109,6 @@ def case_settings(saved, case):
     if merged.get("stereo_median") == MEDIAN_ON:
         merged["stereo_median"] = saved.get("stereo_median") if saved.get("stereo_median") not in (None, "off") else "7x7"
     return resolve_stereo_settings(merged)
-
-
-def enum_name(value):
-    """'KERNEL_7x7' for dai.MedianFilter.KERNEL_7x7 (or its str), values without a name unchanged."""
-    name = getattr(value, "name", None)
-    if name is None and not isinstance(value, (bool, int, float)) and value is not None:
-        name = str(value)
-    return value if name is None else str(name).rsplit(".", 1)[-1]
-
-
-def read_back(config):
-    """What a dai.StereoDepthConfig (stereo.initialConfig) holds, as JSON values; unreadable fields say why."""
-    alg = lambda: config.algorithmControl  # noqa: E731
-    post = lambda: config.postProcessing  # noqa: E731
-    cost = lambda: config.costMatching  # noqa: E731
-    readers = {
-        "enableSubpixel": lambda: alg().enableSubpixel,
-        "subpixelFractionalBits": lambda: alg().subpixelFractionalBits,
-        "enableExtended": lambda: alg().enableExtended,
-        "enableLeftRightCheck": lambda: alg().enableLeftRightCheck,
-        "leftRightCheckThreshold": lambda: alg().leftRightCheckThreshold,
-        "disparityShift": lambda: alg().disparityShift,
-        "depthAlign": lambda: enum_name(alg().depthAlign),
-        "confidenceThreshold": lambda: cost().confidenceThreshold,
-        "disparityWidth": lambda: enum_name(cost().disparityWidth),
-        "enableCompanding": lambda: cost().enableCompanding,
-        "median": lambda: enum_name(post().median),
-        "speckleFilter": lambda: post().speckleFilter.enable,
-        "speckleRange": lambda: post().speckleFilter.speckleRange,
-        "spatialFilter": lambda: post().spatialFilter.enable,
-        "temporalFilter": lambda: post().temporalFilter.enable,
-        "decimationFactor": lambda: post().decimationFilter.decimationFactor,
-        "adaptiveMedianFilter": lambda: post().adaptiveMedianFilter.enable,
-        "holeFilling": lambda: post().holeFilling.enable,
-        "thresholdFilter": lambda: [post().thresholdFilter.minRange, post().thresholdFilter.maxRange],
-        "brightnessFilter": lambda: [post().brightnessFilter.minBrightness, post().brightnessFilter.maxBrightness],
-        "filteringOrder": lambda: [enum_name(f) for f in post().filteringOrder],
-        "maxDisparity": lambda: float(config.getMaxDisparity()),
-    }
-    result = {}
-    for name, read in readers.items():
-        try:
-            value = read()
-        except Exception as e:
-            value = f"unavailable ({e})"
-        result[name] = value if isinstance(value, (bool, int, float, str, list)) or value is None else str(value)
-    return result
-
-
-def executed_filters(rb):
-    """The filters of filteringOrder that run, in order, as getMaxDisparity decides it."""
-    order = rb.get("filteringOrder")
-    if not isinstance(order, list):
-        return None
-    return [name for name in order if name in FILTER_RUNS and FILTER_RUNS[name](rb)]
-
-
-def predicted_max_disparity(rb):
-    """StereoDepthConfig::getMaxDisparity (depthai-core v3.3.0) recomputed from a read-back; None if incomplete."""
-    try:
-        value = 63.0 if rb["disparityWidth"] == "DISPARITY_64" else 95.0
-        if rb["enableCompanding"] is True:
-            value = 175.0
-        value += float(rb["disparityShift"])
-        if rb["enableExtended"] is True:
-            value *= 2
-        if rb["enableSubpixel"] is True:
-            value *= 1 << int(rb["subpixelFractionalBits"])
-    except (KeyError, TypeError, ValueError):
-        return None
-    executed = executed_filters(rb)
-    if executed is None:
-        return None
-    if executed and executed[-1] != "MEDIAN":
-        value = value * ((1 << 13) / value)
-    return value
 
 
 def frame_array(data, type_name, width, height, stride):
@@ -368,6 +291,7 @@ def run_case(case, saved, args, dai, open_device, clock=time.monotonic, sleep=ti
             result["applied"] = read_back(stereo.initialConfig)
             result["executed_filters"] = executed_filters(result["applied"])
             result["predicted_max_disparity"] = predicted_max_disparity(result["applied"])
+            result["disparity_format"] = disparity_format(result["applied"], settings)
 
             outputs = {name: getattr(stereo, name) for name in STREAMS}
             streams = {name: outputs[name].createOutputQueue(maxSize=HOST_QUEUE_SIZE, blocking=False)
