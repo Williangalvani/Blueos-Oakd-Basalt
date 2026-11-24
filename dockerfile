@@ -58,7 +58,7 @@ COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 # Labels
-LABEL version="0.0.2"
+LABEL version="0.1.0"
 LABEL permissions='{\
   "ExposedPorts": {"8095/tcp": {}},\
   "HostConfig": {\
