@@ -92,6 +92,28 @@ def test_page_is_one_self_contained_offline_page(client):
         assert f'name="{field.key}"' in page, field.key
 
 
+ADVANCED = {"intrinsics_from", "intrinsics_override", "max_features", "lever_arm_enabled", "lever_arm_m",
+            "depth_stream_debug", "depth_transport", "max_reference_age", "tracking_recovery_frames", "quality_rate",
+            "stereo_lr_check_threshold", "stereo_brightness_min", "stereo_brightness_max", "stereo_p2",
+            "stereo_edge_fill_color", "stereo_alpha", "stereo_distortion_correction", "stereo_decimation",
+            "stereo_subpixel_bits"}
+
+
+def test_settings_for_experts_are_in_a_collapsed_advanced_group(client):
+    main, http = client
+    fields = http.get("/api/config/schema").json()["fields"]
+    assert {field["name"] for field in fields if field["group"] == "advanced"} == ADVANCED
+    page = http.get("/").text
+    advanced = page[page.index("<details><summary>Advanced</summary>"):]
+    advanced = advanced[:advanced.index("</details>")]
+    assert {name for name in re.findall(r'data-field="([^"]+)"', advanced)} == ADVANCED
+    # One renderer for every group: an optional stereo number shows "auto" when empty
+    assert '<input type="number" name="stereo_p2" value="" step="1" min="0" max="65535" placeholder="auto">' in advanced
+    stereo = page[page.index("<details><summary>Stereo depth (PnP)</summary>"):]
+    stereo = stereo[:stereo.index("</details>")]
+    assert 'name="stereo_subpixel"' in stereo and 'name="stereo_median"' in stereo
+
+
 @pytest.mark.parametrize("asset, kind", [("ui.css", "text/css"), ("ui.js", "javascript"), ("ui.html", "text/html"),
                                          ("features_overlay.js", "javascript"), ("link_panel.js", "javascript"),
                                          ("param_check.js", "javascript")])

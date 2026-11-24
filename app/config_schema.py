@@ -29,7 +29,12 @@ GROUPS = (
     ("camera", "Camera"),
     ("stereo", "Stereo depth (PnP)"),
     ("output", "MAVLink output"),
+    ("advanced", "Advanced"),
 )
+# Stereo settings shown under Advanced (collapsed) instead of Stereo depth
+ADVANCED_STEREO = ("stereo_lr_check_threshold", "stereo_brightness_min", "stereo_brightness_max", "stereo_p2",
+                   "stereo_edge_fill_color", "stereo_alpha", "stereo_distortion_correction", "stereo_decimation",
+                   "stereo_subpixel_bits")
 
 
 @dataclass(frozen=True)
@@ -59,7 +64,8 @@ def _stereo_field(setting):
         kind = "choice"
     else:
         kind = {bool: "bool", int: "int", float: "float"}.get(setting.kind, "text")
-    return ConfigField(setting.key, kind, setting.default, setting.label, setting.hint, "stereo",
+    group = "advanced" if setting.key in ADVANCED_STEREO else "stereo"
+    return ConfigField(setting.key, kind, setting.default, setting.label, setting.hint, group,
                        setting.minimum, setting.maximum, setting.choices, setting.optional,
                        step=0.01 if setting.kind is float else (1 if setting.kind is int else None),
                        placeholder="auto" if setting.optional else "")
@@ -78,36 +84,38 @@ CONFIG_FIELDS = (
                 "PnP only: RANSAC inliers a frame needs to be accepted (and sent)", minimum=6, maximum=500, step=1),
     ConfigField("max_reference_age", "float", 1.0, "PnP Max Reference Age (s)",
                 "PnP only: how long failed frames keep the last good frame as reference, so the next delta covers "
-                "the gap; 0 = no limit", minimum=0.0, maximum=10.0, step=0.1),
+                "the gap; 0 = no limit", minimum=0.0, maximum=10.0, step=0.1, group="advanced"),
     ConfigField("num_features", "int", 300, "PnP Features", "PnP only: features tracked on the camera",
                 minimum=50, maximum=1000, step=1),
     ConfigField("max_features", "int", 0, "PnP Max Features",
                 "PnP only: hard cap on the features the camera detects per frame (FeatureTracker numMaxFeatures); "
                 "0 = depthai's automatic maximum. Each feature costs about 64 B on the link at every frame (the "
-                "message has no smaller form) and one ROI in points mode", minimum=0, maximum=1000, step=1),
+                "message has no smaller form) and one ROI in points mode", minimum=0, maximum=1000, step=1,
+                group="advanced"),
     ConfigField("tracking_recovery_frames", "int", 20, "PnP Recovery After (frames)",
                 "PnP only: consecutive failed frames before the tracker is re-initialised; 0 disables",
-                minimum=0, maximum=1000, step=1),
+                minimum=0, maximum=1000, step=1, group="advanced"),
     ConfigField("lever_arm_enabled", "bool", False, "Lever arm diagnostics (log only)",
                 "PnP only. Does NOT change what is sent: the autopilot applies the camera offset itself from "
                 "VISO_POS_X/Y/Z. When on, the data log also gets each delta corrected to the IMU (lever_delta_* "
-                "fields), for comparison only"),
+                "fields), for comparison only", group="advanced"),
     ConfigField("lever_arm_m", "lever_arm", DEFAULT_LEVER_ARM_M, "Lever Arm x,y,z (m)",
                 "Camera relative to the IMU, body FRD (forward, right, down), as VISO_POS_X/Y/Z. Only used by the "
                 "diagnostics above", minimum=-LEVER_ARM_LIMIT_M, maximum=LEVER_ARM_LIMIT_M,
-                placeholder="0.1655,-0.0069,0.18"),
+                placeholder="0.1655,-0.0069,0.18", group="advanced"),
     ConfigField("intrinsics_from", "choice", "rectified", "PnP Intrinsics Source",
                 "PnP only: camera matrix of the rectified-left image. rectified is the matrix the camera rectifies "
                 "to; frame reads the depth frame matrix; cam_b/cam_c are the raw calibration",
-                choices=INTRINSICS_SOURCES),
+                choices=INTRINSICS_SOURCES, group="advanced"),
     ConfigField("intrinsics_override", "intrinsics", None, "PnP Intrinsics Override",
                 "PnP only: wins over the source; pixels on the width x height grid. Empty = off", nullable=True,
-                placeholder="fx,fy,cx,cy"),
+                placeholder="fx,fy,cx,cy", group="advanced"),
     ConfigField("depth_transport", "choice", "points", "PnP Depth Transport",
                 "PnP only: points = the camera computes the depth at the tracked features (a 5x5 average per "
                 "feature) and sends only those (~2 Mbps instead of ~40 at 640x400 10 fps); full depth frames cross "
                 "the link only while the depth probe runs or someone watches a host_jpeg stream. full_frame = every "
-                "depth frame goes to the Pi (the previous behaviour, for comparison)", choices=DEPTH_TRANSPORTS),
+                "depth frame goes to the Pi (the previous behaviour, for comparison)", choices=DEPTH_TRANSPORTS,
+                group="advanced"),
     ConfigField("snapshots", "bool", True, "Snapshots",
                 "PnP only: on-demand camera snapshots (live views); no bandwidth until requested"),
     ConfigField("depth_stream", "bool", True, "Live depth stream",
@@ -127,7 +135,8 @@ CONFIG_FIELDS = (
                 choices=DEPTH_STREAM_ENCODINGS),
     ConfigField("depth_stream_debug", "bool", False, "Depth stream camera debug log",
                 "PnP only: while the depth stream runs, the camera logs at DEBUG level and the stream nodes' log "
-                "lines appear under Live depth (and /api/status); back to normal when the stream stops"),
+                "lines appear under Live depth (and /api/status); back to normal when the stream stops",
+                group="advanced"),
 
     ConfigField("fps", "int", 30, "FPS", "Camera frame rate; lower = less camera and Pi CPU", "camera", 1, 60, step=1),
     ConfigField("camera_angle", "float", 0.0, "Camera Angle (°)", "0 = forward, 90 = down", "camera", -180.0, 180.0,
@@ -142,7 +151,7 @@ CONFIG_FIELDS = (
     ConfigField("vehicle_ip", "text", "127.0.0.1", "Vehicle IP",
                 "Host (and optional :port) of BlueOS's mavlink2rest", "output", placeholder="127.0.0.1"),
     ConfigField("quality_rate", "float", 1.0, "Quality Rate (Hz)", "NAMED_VALUE_FLOAT quality messages per second",
-                "output", 0.1, 10.0, step=0.1),
+                "advanced", 0.1, 10.0, step=0.1),
     ConfigField("log_only", "bool", False, "Log only: do not send anything to the autopilot",
                 "No MAVLink output and no autopilot parameter changes; poses only go to the data log", "output"),
     ConfigField("dvl_source", "choice", "auto", "DVL overlay source",
@@ -305,8 +314,9 @@ def render_field(field, value) -> str:
     """One settings row; input markup as the page has always rendered it (name before value)."""
     name = escape(field.key)
     hint = f'<div class="hint" title="{escape(field.help)}">{escape(field.help)}</div>' if field.help else ""
+    placeholder = f' placeholder="{escape(field.placeholder)}"' if field.placeholder else ""
     if field.kind == "bool":
-        control = (f'<label class="checkbox"><input type="checkbox" name="{name}" {"checked" if value else ""}> '
+        control = (f'<label class="checkbox"><input type="checkbox" name="{name}"{" checked" if value else ""}> '
                    f'{escape(field.label)}</label>')
     else:
         label = f'<label>{escape(field.label)}</label>'
@@ -321,9 +331,8 @@ def render_field(field, value) -> str:
                              if bound is not None)
             step = "any" if field.kind == "float" else "1"
             control = (f'{label}<input type="number" name="{name}" value="{escape(form_value(field, value))}" '
-                       f'step="{step}"{bounds}>')
+                       f'step="{step}"{bounds}{placeholder}>')
         else:
-            placeholder = f' placeholder="{escape(field.placeholder)}"' if field.placeholder else ""
             control = (f'{label}<input type="text" name="{name}" value="{escape(form_value(field, value))}"'
                        f'{placeholder}>')
     return f'<div class="field" data-field="{name}">{control}{hint}</div>'

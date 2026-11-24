@@ -11,7 +11,6 @@ import math
 import subprocess
 import threading
 import time
-from html import escape
 from pathlib import Path
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
@@ -35,8 +34,8 @@ import viewers
 import vio_log
 import vio_telemetry
 from autopilot_params import AutopilotParams
-from stereo_config import (DEFAULT_LEVER_ARM_M, DEFAULT_REFRACTIVE_INDEX, STEREO_SETTINGS, clamp_refractive_index,
-                           format_lever_arm, parse_lever_arm, stereo_command_args)
+from stereo_config import (DEFAULT_LEVER_ARM_M, DEFAULT_REFRACTIVE_INDEX, clamp_refractive_index, format_lever_arm,
+                           parse_lever_arm, stereo_command_args)
 from vio_supervisor import VIOSupervisor
 
 WEB_PORT = 8095
@@ -305,31 +304,6 @@ def stop_vio():
     supervisor.stop()
 
 
-def stereo_form_fields(config: dict) -> str:
-    """Web form fields for the stereo settings; an empty number field means auto/preset (null)."""
-    fields = []
-    for setting in STEREO_SETTINGS:
-        value = config.get(setting.key, setting.default)
-        name = escape(setting.key)
-        if setting.kind is bool:
-            control = (f'<label class="checkbox"><input type="checkbox" name="{name}"{" checked" if value else ""}> '
-                       f'{escape(setting.label)}</label>')
-        else:
-            label = f'<label>{escape(setting.label)}</label>'
-            if setting.choices:
-                options = "".join(
-                    f'<option value="{escape(str(choice))}"{" selected" if str(choice) == str(value) else ""}>'
-                    f'{escape(str(choice))}</option>' for choice in setting.choices)
-                control = f'{label}<select name="{name}">{options}</select>'
-            else:
-                step = "any" if setting.kind is float else "1"
-                shown = "" if value is None else escape(str(value))
-                control = f'{label}<input type="number" name="{name}" value="{shown}" step="{step}" placeholder="auto">'
-        hint = f'<div class="hint" title="{escape(setting.hint)}">{escape(setting.hint)}</div>' if setting.hint else ""
-        fields.append(f'                <div class="field" data-field="{name}">{control}{hint}</div>')
-    return "\n".join(fields)
-
-
 def render_page(config: dict) -> str:
     """ui.html with ui.css and ui.js inlined (one self-contained page, works offline) and the settings form."""
     html = (STATIC_DIR / "ui.html").read_text()
@@ -337,11 +311,9 @@ def render_page(config: dict) -> str:
         "<!--UI_CSS-->": f"<style>\n{(STATIC_DIR / 'ui.css').read_text()}\n</style>",
         "<!--UI_JS-->": "\n".join(f"<script>\n{(STATIC_DIR / name).read_text()}\n</script>"
                                   for name in ("features_overlay.js", "link_panel.js", "param_check.js", "ui.js")),
-        "<!--FIELDS_STEREO-->": stereo_form_fields(config),
     }
     for group, _ in config_schema.GROUPS:
-        if group != "stereo":
-            parts[f"<!--FIELDS_{group.upper()}-->"] = config_schema.render_group(group, config)
+        parts[f"<!--FIELDS_{group.upper()}-->"] = config_schema.render_group(group, config)
     for marker, content in parts.items():
         html = html.replace(marker, content)
     return html

@@ -360,7 +360,7 @@ def test_config_api_and_form_for_the_lever_arm(client):
         assert http.post("/api/config", json={**body, "lever_arm_m": bad}).status_code == 422, bad
     main.save_config({**main.DEFAULT_CONFIG})
     page = http.get("/").text
-    assert 'name="lever_arm_enabled" >' in page and 'name="lever_arm_m" value="0.1655,-0.0069,0.18"' in page
+    assert 'name="lever_arm_enabled">' in page and 'name="lever_arm_m" value="0.1655,-0.0069,0.18"' in page
 
 
 def test_status_reports_the_refractive_index_and_effective_matrix(client, monkeypatch, tmp_path):
