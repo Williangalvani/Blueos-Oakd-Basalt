@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="OAK-D VIO">
+  <!--
+    Extension logo for the BlueOS store (square, so it stays readable in the
+    65 px store avatar). A front-facing stereo camera and a separate odometry
+    track underneath. Blue Robotics blue #2286C5. No third-party marks.
+  -->
+  <defs>
+    <radialGradient id="glass" cx="36%" cy="32%" r="70%">
+      <stop offset="0%" stop-color="#1A5F8F"/>
+      <stop offset="60%" stop-color="#0A334F"/>
+      <stop offset="100%" stop-color="#061C2C"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Camera housing, sitting in the upper half with a clear gap above the path -->
+  <rect x="76" y="64" width="360" height="232" rx="36" fill="#2286C5"/>
+  <!-- Recessed stereo window -->
+  <rect x="100" y="100" width="312" height="160" rx="20" fill="#1B6EA8"/>
+
+  <!-- Left lens: concentric rings so it reads as glass, not an eye -->
+  <g transform="translate(186, 180)">
+    <circle r="62" fill="#0E3A58"/>
+    <circle r="54" fill="none" stroke="#8FCBE8" stroke-width="4"/>
+    <circle r="44" fill="url(#glass)"/>
+    <circle r="16" fill="none" stroke="#5AA9D6" stroke-width="3"/>
+    <circle cx="-14" cy="-16" r="7" fill="#D7ECF8" opacity="0.55"/>
+  </g>
+  <!-- Right lens -->
+  <g transform="translate(326, 180)">
+    <circle r="62" fill="#0E3A58"/>
+    <circle r="54" fill="none" stroke="#8FCBE8" stroke-width="4"/>
+    <circle r="44" fill="url(#glass)"/>
+    <circle r="16" fill="none" stroke="#5AA9D6" stroke-width="3"/>
+    <circle cx="-14" cy="-16" r="7" fill="#D7ECF8" opacity="0.55"/>
+  </g>
+
+  <!-- Small mount / status mark on the bezel, breaks a "face" reading -->
+  <rect x="244" y="80" width="24" height="10" rx="2" fill="#0E3A58"/>
+  <circle cx="256" cy="268" r="6" fill="#7DFFB3"/>
+
+  <!-- Odometry track, clearly below the housing -->
+  <path d="M64 400 L 150 400 L 210 348 L 300 430 L 390 372 L 448 372"
+        fill="none" stroke="#2286C5" stroke-width="16" stroke-linecap="round"
+        stroke-linejoin="round"/>
+  <circle cx="64" cy="400" r="12" fill="#2286C5"/>
+  <circle cx="150" cy="400" r="10" fill="#2286C5"/>
+  <circle cx="210" cy="348" r="10" fill="#2286C5"/>
+  <circle cx="300" cy="430" r="10" fill="#2286C5"/>
+  <circle cx="390" cy="372" r="10" fill="#2286C5"/>
+  <polygon points="448,354 492,372 448,390" fill="#2286C5"/>
+</svg>
