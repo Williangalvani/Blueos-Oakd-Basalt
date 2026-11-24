@@ -11,8 +11,9 @@ publishes at a low rate, and only while main.py has asked recently (a "lease" fi
 - history.npy (the ring buffer, oldest row first) every HISTORY_INTERVAL_S while the history lease is fresh.
 
 Memory bound: HISTORY_SECONDS of frames at min(fps, MAX_HISTORY_FPS), +10 %, len(HISTORY_COLUMNS) float64
-each: at most 19800 rows x 12 x 8 B = 1.9 MB (10 fps: 6600 rows, 0.63 MB). The failure window holds
-FAILURE_WINDOW_S of (time, reason) tuples, at most 300 s x 30 fps.
+each: at most 39600 rows x 12 x 8 B = 3.8 MB (10 fps: 6600 rows, 0.63 MB; 30 fps: 1.9 MB). The failure window
+holds FAILURE_WINDOW_S of (time, reason) tuples, at most 300 s x 60 fps (+10 %). MAX_HISTORY_FPS is the
+configuration's fps maximum; the recent stats and the send rate are selected by time, not by row counts.
 
 The camera chip temperature is sampled on the publisher thread at most every TEMPERATURE_INTERVAL_S
 (an RPC to the device), never on the VIO loop. So is the camera link (link_stats.LinkMonitor, the XLink
@@ -46,7 +47,7 @@ HISTORY_LEASE = "history.lease"
 HISTORY_COLUMNS = ("t", "ok", "inliers", "vx", "vy", "vz", "x", "y", "yaw", "proc_ms", "features", "valid_depth")
 COLUMN = {name: index for index, name in enumerate(HISTORY_COLUMNS)}
 HISTORY_SECONDS = 600.0
-MAX_HISTORY_FPS = 30.0
+MAX_HISTORY_FPS = 60.0
 FAILURE_WINDOW_S = 300.0
 RECENT_WINDOW_S = 10.0
 FPS_WINDOW_S = 5.0
@@ -119,6 +120,15 @@ class RingBuffer:
             return self.data[start:start + n].copy()
         return np.concatenate((self.data[start:], self.data[:self.next]))
 
+    def since(self, t_min, column=0):
+        """Copy of the rows whose `column` (appended in increasing order, e.g. time) is >= t_min, oldest first."""
+        if self.count < self.capacity:
+            segments = (self.data[:self.count],)
+        else:
+            segments = (self.data[self.next:], self.data[:self.next])
+        parts = [segment[int(np.searchsorted(segment[:, column], t_min, side="left")):] for segment in segments]
+        return np.concatenate(parts) if len(parts) > 1 else parts[0].copy()
+
     @property
     def nbytes(self):
         return self.data.nbytes
@@ -127,7 +137,7 @@ class RingBuffer:
 class FailureWindow:
     """Frames and failure reasons over the last window_s seconds, counted incrementally."""
 
-    def __init__(self, window_s=FAILURE_WINDOW_S, max_frames=int(FAILURE_WINDOW_S * MAX_HISTORY_FPS)):
+    def __init__(self, window_s=FAILURE_WINDOW_S, max_frames=int(FAILURE_WINDOW_S * MAX_HISTORY_FPS * 1.1)):
         self.window_s = window_s
         self.frames = deque()
         self.max_frames = max_frames
@@ -230,7 +240,7 @@ class Telemetry:
         self.history = RingBuffer(history_capacity(fps), len(HISTORY_COLUMNS))
         self.failures = FailureWindow()
         self.trajectory = TrajectoryIntegrator()
-        self.sent_times = deque(maxlen=int(SEND_RATE_WINDOW_S * MAX_HISTORY_FPS) + 1)
+        self.sent_times = deque()  # pruned to SEND_RATE_WINDOW_S by time
         self.frames_total = self.ok_total = self.sent_total = 0
         self.reference_resets = self.bridged = self.gap_frames_total = self.recoveries = 0
         self.last = None
@@ -279,6 +289,8 @@ class Telemetry:
             if sent:
                 self.sent_total += 1
                 self.sent_times.append(t)
+                while t - self.sent_times[0] > SEND_RATE_WINDOW_S:
+                    self.sent_times.popleft()
             self.last = (t, ok, reason, features, valid_depth, matches, inliers, proc_ms, gap_frames)
 
     def record_recovery(self):
@@ -352,7 +364,7 @@ class Telemetry:
     def status(self, now=None):
         now = self.clock() if now is None else now
         with self._lock:
-            recent = self.history.ordered(last=int(RECENT_WINDOW_S * MAX_HISTORY_FPS) + 1)
+            recent = self.history.since(now - RECENT_WINDOW_S, COLUMN["t"])
             failures = self.failures.summary()
             sent_recent = [t for t in self.sent_times if now - t <= SEND_RATE_WINDOW_S]
             last, last_failure = self.last, self.last_failure
@@ -361,6 +373,7 @@ class Telemetry:
                         "gap_frames_total": self.gap_frames_total, "recoveries": self.recoveries}
             phase, extra = self.phase, dict(self.extra)
             position = (self.trajectory.x, self.trajectory.y, self.trajectory.yaw)
+        send_rate = send_rate_hz(sent_recent, now)
         try:
             output_error = self.output_error() if self.output_error is not None else None
         except Exception as e:
@@ -395,7 +408,7 @@ class Telemetry:
             "recent": recent_summary(recent, now),
             "failures": failures,
             "output": {"mode": self.mode, "messages_sent": counters["sent_total"],
-                       "rate_hz": len(sent_recent) / SEND_RATE_WINDOW_S, "last_error": output_error},
+                       "rate_hz": send_rate, "last_error": output_error},
             "chip_temperature_c": self.chip_temperature,
             "chip_temperature_at": self.chip_temperature_at,
             "trajectory": {"x": position[0], "y": position[1], "yaw": position[2]},
@@ -416,6 +429,20 @@ class Telemetry:
         buffer = io.BytesIO()
         np.save(buffer, rows, allow_pickle=False)
         snapshots.atomic_write(self.directory / HISTORY_FILE, buffer.getvalue())
+
+
+def send_rate_hz(times, now):
+    """
+    Messages per second from the send times (oldest first) of the last SEND_RATE_WINDOW_S: intervals over their
+    span, which grows with the time since the last message once that exceeds the mean interval (so it decays
+    when sending stops). 0 with fewer than two.
+    """
+    if len(times) < 2:
+        return 0.0
+    intervals = len(times) - 1
+    span = times[-1] - times[0]
+    span = max(span, now - times[0] - span / intervals)
+    return intervals / span if span > 0 else 0.0
 
 
 def recent_summary(rows, now, window_s=RECENT_WINDOW_S, fps_window_s=FPS_WINDOW_S):

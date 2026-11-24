@@ -42,11 +42,55 @@ def test_ring_buffer_keeps_newest_rows_in_order():
     assert RingBuffer(3, 2).ordered().shape == (0, 2)
 
 
+def test_ring_buffer_since_selects_by_time_across_the_wrap():
+    ring = RingBuffer(5, 2)
+    assert ring.since(0.0).shape == (0, 2)
+    for i in range(3):
+        ring.append((float(i), -i))
+    assert ring.since(1.0)[:, 0].tolist() == [1.0, 2.0]
+    for i in range(3, 8):
+        ring.append((float(i), -i))
+    assert ring.ordered()[:, 0].tolist() == [3.0, 4.0, 5.0, 6.0, 7.0]
+    assert ring.since(4.5)[:, 0].tolist() == [5.0, 6.0, 7.0]
+    assert ring.since(0.0)[:, 0].tolist() == [3.0, 4.0, 5.0, 6.0, 7.0]
+    assert ring.since(9.0).shape == (0, 2)
+    selected = ring.since(6.0)
+    selected[:] = 0
+    assert ring.ordered()[-1, 0] == 7.0  # a copy
+
+
 def test_history_memory_is_bounded():
-    # Documented bound: 10 min at <= 30 fps (+10 %), 12 float64 columns, < 2 MB
+    # Documented bound: 10 min at <= 60 fps (the configuration's maximum, +10 %), 12 float64 columns, < 4 MB
     assert vio_telemetry.history_capacity(10) == 6600
-    assert vio_telemetry.history_capacity(1000) == vio_telemetry.history_capacity(30) == 19800
-    assert RingBuffer(vio_telemetry.history_capacity(1000), len(vio_telemetry.HISTORY_COLUMNS)).nbytes < 2e6
+    assert vio_telemetry.history_capacity(30) == 19800 and vio_telemetry.history_capacity(45) == 29700
+    assert vio_telemetry.history_capacity(1000) == vio_telemetry.history_capacity(60) == 39600
+    assert RingBuffer(vio_telemetry.history_capacity(1000), len(vio_telemetry.HISTORY_COLUMNS)).nbytes < 4e6
+
+
+def test_45_fps_is_measured_as_45_fps_not_capped_at_30(tmp_path):
+    """Task 22 #3: MAX_HISTORY_FPS = 30 capped the send rate at 30.2 Hz and the recent window at 301 rows."""
+    telemetry, clock = make(tmp_path, fps=45)
+    start = 1000.0
+    n = int(320 * 45)  # longer than the failure window
+    for i in range(n):
+        frame(telemetry, start + i / 45, ok=i % 10 != 0, reason="too_few_matches", sent=i % 10 != 0)
+    clock.now = start + (n - 1) / 45 + 0.01
+    status = telemetry.status()
+    assert status["output"]["rate_hz"] == pytest.approx(45 * 0.9, rel=0.03)
+    assert status["recent"]["fps"] == pytest.approx(45, rel=0.03)
+    assert status["recent"]["frames"] == pytest.approx(10 * 45, abs=2)
+    assert status["recent"]["ok_percent"] == pytest.approx(90, abs=1)
+    # The whole 5-minute failure window, not 200 s of it
+    assert status["failures"]["frames"] == pytest.approx(300 * 45, abs=2)
+    assert status["failures"]["failed"] == pytest.approx(300 * 45 / 10, abs=2)
+    assert len(telemetry.sent_times) <= 5 * 45 + 1
+
+
+def test_send_rate_decays_when_sending_stops():
+    times = [100.0 + i / 45 for i in range(45 * 5)]
+    assert vio_telemetry.send_rate_hz(times, times[-1] + 0.01) == pytest.approx(45)
+    assert vio_telemetry.send_rate_hz(times, times[-1] + 1.0) < 40
+    assert vio_telemetry.send_rate_hz(times[:1], 101.0) == 0.0 and vio_telemetry.send_rate_hz([], 101.0) == 0.0
 
 
 def test_failure_window_counts_reasons_in_the_last_five_minutes():
@@ -102,7 +146,8 @@ def test_record_frame_builds_history_and_status(tmp_path):
     assert status["failures"]["failed"] == 2
     assert sorted(r["reason"] for r in status["failures"]["by_reason"]) == ["pnp_error", "too_few_matches"]
     assert status["output"]["mode"] == "log-only" and status["output"]["messages_sent"] == 30
-    assert status["output"]["rate_hz"] == pytest.approx(30 / 5)
+    # 30 messages at 10 Hz up to 1002.9, none since: 29 intervals over 3.25 s minus one mean interval
+    assert status["output"]["rate_hz"] == pytest.approx(29 / (3.25 - 0.1))
     assert status["min_inliers"] == 15
     rows = telemetry.history.ordered()
     assert rows.shape == (33, len(vio_telemetry.HISTORY_COLUMNS))
