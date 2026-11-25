@@ -12,7 +12,7 @@ USB and Ethernet (PoE) OAK-D cameras. Tested on an OAK-D (USB) and an OAK-D-W-Po
 
 ## Install
 
-Install **OAK-D VIO** (`williangalvani.oakd-basalt`) from the BlueOS Extensions page, or from the image `williangalvani/blueos-oakd-basalt:v0.1.1`.
+Install **OAK-D VIO** (`williangalvani.oakd-basalt`) from the BlueOS Extensions page, or from the image `williangalvani/blueos-oakd-basalt:v0.1.2`.
 
 The page is at port **8095** on the vehicle (8080 is used by mavlink-server on BlueOS 1.4.x). The extension uses host networking, so a PoE camera on the same vehicle network is reachable without extra setup.
 
