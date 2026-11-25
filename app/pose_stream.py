@@ -221,9 +221,10 @@ class PoseStreamService:
 
     def __init__(self, directory, camera_angle_deg=0.0, rate_hz=RATE_HZ, lease_s=LEASE_S, poll_interval=0.5,
                  trail_points=TRAIL_POINTS, trail_step_m=TRAIL_STEP_M, trail_step_s=TRAIL_STEP_S,
-                 trail_interval=TRAIL_INTERVAL_S, clock=time.time, log=print, attitude=None):
+                 trail_interval=TRAIL_INTERVAL_S, clock=time.time, log=print, attitude=None, camera_roll_deg=0.0):
         self.directory = Path(directory)
         self.camera_angle_deg = float(camera_angle_deg)
+        self.camera_roll_deg = float(camera_roll_deg)
         self.interval = 1.0 / rate_hz
         self.lease_s = lease_s
         self.poll_interval = poll_interval
@@ -333,7 +334,8 @@ class PoseStreamService:
         return {"pid": os.getpid(), "epoch": self.epoch, "unix_time": now,
                 **_rounded(self.integrator.pose()), "ok": self.last_ok, "frames": self.frames,
                 "ok_frames": self.ok_frames, "rate_hz": round(1.0 / self.interval, 2),
-                "camera_angle_deg": self.camera_angle_deg, **self.status(now), "units": UNITS}
+                "camera_angle_deg": self.camera_angle_deg, "camera_roll_deg": self.camera_roll_deg,
+                **self.status(now), "units": UNITS}
 
     def trail_payload(self, now):
         return {"pid": os.getpid(), "epoch": self.epoch, "unix_time": now, "frame": self.integrator.frame,

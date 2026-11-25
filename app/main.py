@@ -194,10 +194,15 @@ def saved_choice(config: dict, key: str) -> str:
 
 def build_vio_command(config: dict) -> list:
     """PnP VIO command line for a configuration"""
+    mount = saved_choice(config, "camera_mount")
+    camera_angle = config_schema.effective_camera_angle(
+        {"camera_mount": mount, "camera_angle": saved_number(config, "camera_angle")})
     cmd = [
         "python", "-u", "/app/pnp_vio.py",
         "--fps", str(config["fps"]),
-        "--camera-angle", str(config["camera_angle"]),
+        "--camera-mount", mount,
+        "--camera-angle", str(camera_angle),
+        "--camera-roll", str(saved_number(config, "camera_roll")),
         "--vehicle-ip", config["vehicle_ip"],
         "--quality-rate", str(config["quality_rate"]),
         "--width", str(config["resolution_width"]),

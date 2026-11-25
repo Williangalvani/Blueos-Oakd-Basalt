@@ -1079,6 +1079,12 @@ function setField(f, value) {
   else input.value = formValue(f, value);
 }
 
+// Camera Angle only applies to the custom mount. A disabled input keeps its value, which collectConfig still posts
+function syncCameraAngle() {
+  const mount = fieldInput('camera_mount'), angle = fieldInput('camera_angle');
+  if (mount && angle) angle.disabled = mount.value !== 'custom';
+}
+
 function currentKey(f) {
   const raw = rawValue(f);
   return f.type === 'bool' ? !!raw : String(raw).trim();
@@ -1110,7 +1116,12 @@ async function initSettings() {
     reset.className = 'reset-one';
     reset.textContent = '↺';
     reset.title = 'Reset to default (' + (formValue(f, f.default) === '' ? 'empty' : formValue(f, f.default)) + ')';
-    reset.addEventListener('click', () => { setField(f, f.default); showFieldError(f.name, parseField(f)[1]); markChanged(); });
+    reset.addEventListener('click', () => {
+      setField(f, f.default);
+      showFieldError(f.name, parseField(f)[1]);
+      markChanged();
+      if (f.name === 'camera_mount') syncCameraAngle();
+    });
     container.appendChild(reset);
     const error = document.createElement('div');
     error.className = 'error';
@@ -1122,8 +1133,13 @@ async function initSettings() {
     }
     input.addEventListener('input', () => { showFieldError(f.name, parseField(f)[1]); markChanged(); });
     input.addEventListener('change', () => { showFieldError(f.name, parseField(f)[1]); markChanged(); });
+    if (f.name === 'camera_mount') {
+      input.addEventListener('input', syncCameraAngle);
+      input.addEventListener('change', syncCameraAngle);
+    }
     ui.initial[f.name] = currentKey(f);
   }
+  syncCameraAngle();
   markChanged();
 }
 

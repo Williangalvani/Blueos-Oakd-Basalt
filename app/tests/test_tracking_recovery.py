@@ -1179,14 +1179,14 @@ def yaw_frd(angle):
     return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
 
 
-def spin_scenario(frames=8, lever_arm=LEVER_ARM, rate=SPIN_RATE):
+def spin_scenario(frames=8, lever_arm=LEVER_ARM, rate=SPIN_RATE, camera_roll=0.0):
     """
     A level vehicle spinning in place about its IMU, camera looking straight down (--camera-angle 90) at a
-    floor 2 m below it, at lever_arm from the IMU. The floor stays at 2 m, so the depth is uniform; the camera
-    swings around the IMU, so the feature motion includes a translation. Returns (sync groups, gyro message):
-    the gyro in the camera frame (R_cam_imu = I).
+    floor 2 m below it, at lever_arm from the IMU, turned by camera_roll about its optical axis. The floor stays
+    at 2 m, so the depth is uniform; the camera swings around the IMU, so the feature motion includes a
+    translation. Returns (sync groups, gyro message): the gyro in the camera frame (R_cam_imu = I).
     """
-    M = camera_to_body_matrix(90.0)  # optical -> body
+    M = camera_to_body_matrix(90.0, camera_roll)  # optical -> body
     floor = M @ back_project(GOOD_UV, np.full(len(GOOD_UV), 2.0), K).T + lever_arm[:, None]  # world = body at t0
     groups = []
     for n in range(frames):
@@ -1231,6 +1231,49 @@ def test_run_lever_arm_diagnostics_cancel_a_pure_spin(pnp_vio, monkeypatch, tmp_
         np.testing.assert_allclose(step["lever_delta_correction"], expected_spin_delta(), atol=1e-4)
         np.testing.assert_allclose(step["lever_delta_position"], 0.0, atol=1e-3)
     assert np.linalg.norm(expected_spin_delta()) > 0.005
+
+
+@pytest.mark.parametrize("camera_roll", [90.0, 180.0, -90.0])
+def test_run_downward_mount_with_roll_sends_the_same_body_deltas(pnp_vio, monkeypatch, tmp_path, camera_roll):
+    """--camera-mount downward wins over --camera-angle; the roll is undone before anything is sent or logged."""
+    monkeypatch.setattr(pnp_vio, "load_calibration", lambda device, args: fake_calibration(np.eye(3)))
+    groups, gyro = spin_scenario(camera_roll=camera_roll)
+    lines, _ = run_fake(pnp_vio, monkeypatch, tmp_path, groups,
+                        [*SPIN_ARGS, "--camera-mount", "downward", "--camera-angle", "0",
+                         "--camera-roll", str(camera_roll), "--lever-arm"], imu=[gyro])
+    start = {line["event"]: line for line in lines if line["type"] == "event"}["start"]
+    assert (start["camera_mount"], start["camera_angle"], start["camera_roll"]) == ("downward", 90.0, camera_roll)
+    steps = [line for line in lines if line["type"] == "step"]
+    assert len(steps) == 8
+    for step in steps[1:]:
+        assert step["status"] == "ok", step["reason"]
+        np.testing.assert_allclose(step["position_delta"], expected_spin_delta(), atol=1e-3)
+        np.testing.assert_allclose(step["angle_delta"], [0.0, 0.0, SPIN_RATE * SPIN_DT], atol=np.radians(0.05))
+        assert step["gyro_disagreement_deg"] < 0.1
+        np.testing.assert_allclose(step["lever_delta_position"], 0.0, atol=1e-3)
+
+
+def test_camera_mount_arguments(pnp_vio):
+    def angles(*argv):
+        args = pnp_vio.parse_args(argv)
+        return args.camera_mount, args.camera_angle, args.camera_roll
+
+    assert angles() == (None, 0.0, 0.0)
+    assert angles("--camera-angle", "90") == (None, 90.0, 0.0)  # older command lines keep working
+    assert angles("--camera-mount", "downward", "--camera-angle", "45") == ("downward", 90.0, 0.0)
+    assert angles("--camera-mount", "forward", "--camera-angle", "90", "--camera-roll", "180") == \
+        ("forward", 0.0, 180.0)
+    assert angles("--camera-mount", "custom", "--camera-angle", "45", "--camera-roll", "-90") == \
+        ("custom", 45.0, -90.0)
+    with pytest.raises(SystemExit):
+        pnp_vio.parse_args(["--camera-mount", "sideways"])
+    # body_yaw: a yaw of the vehicle, seen by the gyro of a rolled downward camera, is still that yaw
+    for roll in (0.0, 90.0, 180.0, -90.0):
+        M = camera_to_body_matrix(90.0, roll)
+        R_cam = M.T @ yaw_frd(0.1) @ M
+        assert pnp_vio.body_yaw(R_cam, 90.0, roll) == pytest.approx(0.1)
+    assert pnp_vio.body_yaw(camera_to_body_matrix(90.0).T @ yaw_frd(0.1) @ camera_to_body_matrix(90.0), 90.0) == \
+        pytest.approx(0.1)
 
 
 def test_run_without_gyro_uses_the_pnp_rotation_and_lever_arm_off_logs_nothing(pnp_vio, monkeypatch, tmp_path):

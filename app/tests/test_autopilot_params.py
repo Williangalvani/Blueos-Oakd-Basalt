@@ -38,6 +38,8 @@ def test_suggested_optical_hold_params():
     assert "None" in SUGGESTED["EK3_SRC1_POSXY"].rationale and "GPS" in SUGGESTED["EK3_SRC1_POSXY"].rationale
     assert "ExternalNav" in SUGGESTED["EK3_SRC1_POSXY"].rationale
     assert "unverified" in SUGGESTED["VISO_DELAY_MS"].rationale
+    assert "Camera Mount / Camera Angle / Camera Roll" in SUGGESTED["VISO_ORIENT"].rationale
+    assert "VISO_ORIENT = 0" in SUGGESTED["VISO_ORIENT"].rationale
     # Every recommended parameter can be written from the page, within ArduPilot's values
     assert set(autopilot_params.PARAM_LIMITS) == set(SUGGESTED)
     for param in SUGGESTED_OPTICAL_HOLD_PARAMS:

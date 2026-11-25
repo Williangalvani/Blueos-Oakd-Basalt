@@ -134,10 +134,21 @@ function axisLines(length) {
   return new THREE.LineSegments(geometry, new THREE.LineBasicMaterial({ vertexColors: true }));
 }
 
-function frustumPositions(cameraAngleDeg) {
-  // The camera looks along body x pitched down by camera_angle (0 forward, 90 down)
-  const a = (cameraAngleDeg || 0) / DEG;
-  const dir = [Math.cos(a), 0, Math.sin(a)], up = [Math.sin(a), 0, -Math.cos(a)], right = [0, 1, 0];
+/**
+ * The camera's axes in body FRD (as pnp_odometry.camera_to_body_matrix): dir (optical +z), right (image +x) and
+ * up (image top, optical -y). The camera looks along body x pitched down by camera_angle (0 forward, 90 down),
+ * then is turned by camera_roll about its optical axis, clockwise looking out through the lens.
+ */
+export function cameraAxes(cameraAngleDeg, cameraRollDeg) {
+  const a = (cameraAngleDeg || 0) / DEG, r = (cameraRollDeg || 0) / DEG;
+  const dir = [Math.cos(a), 0, Math.sin(a)], up0 = [Math.sin(a), 0, -Math.cos(a)], right0 = [0, 1, 0];
+  const right = right0.map((v, i) => Math.cos(r) * v - Math.sin(r) * up0[i]);
+  const up = right0.map((v, i) => Math.sin(r) * v + Math.cos(r) * up0[i]);
+  return { dir, right, up };
+}
+
+function frustumPositions(cameraAngleDeg, cameraRollDeg) {
+  const { dir, right, up } = cameraAxes(cameraAngleDeg, cameraRollDeg);
   const hw = FRUSTUM_M * Math.tan(HFOV / 2), hh = FRUSTUM_M * Math.tan(VFOV / 2);
   const corner = (sx, sy) => toThree(...[0, 1, 2].map(i => FRUSTUM_M * dir[i] + sx * hw * right[i] + sy * hh * up[i]));
   const c = [corner(-1, 1), corner(1, 1), corner(1, -1), corner(-1, -1)];
@@ -237,14 +248,16 @@ export function mountPoseViewer(root, options = {}) {
   scene.add(new THREE.Line(trailGeometry, new THREE.LineBasicMaterial({ color: COLORS.trail })));
 
   const state = { es: null, active: false, inView: true, frame: null, epoch: null, clearedAt: 0, trail: [],
-                  pose: null, poseAt: 0, problem: null, cameraAngle: null, mock: false, shownFrame: 'start-FRD' };
+                  pose: null, poseAt: 0, problem: null, cameraAngle: null, cameraRoll: null, mock: false,
+                  shownFrame: 'start-FRD' };
 
-  function setFrustum(angle) {
-    if (angle === state.cameraAngle) return;
+  function setFrustum(angle, roll) {
+    if (angle === state.cameraAngle && roll === state.cameraRoll) return;
     state.cameraAngle = angle;
-    frustumGeometry.setAttribute('position', new THREE.Float32BufferAttribute(frustumPositions(angle), 3));
+    state.cameraRoll = roll;
+    frustumGeometry.setAttribute('position', new THREE.Float32BufferAttribute(frustumPositions(angle, roll), 3));
   }
-  setFrustum(0);
+  setFrustum(0, 0);
 
   // --- trail ---
 
@@ -315,7 +328,7 @@ export function mountPoseViewer(root, options = {}) {
     }
     vehicle.position.copy(position);
     vehicle.quaternion.copy(quaternionToThree(p.q));
-    setFrustum(p.camera_angle_deg || 0);
+    setFrustum(p.camera_angle_deg || 0, p.camera_roll_deg || 0);
     const drop = dropGeometry.attributes.position;
     drop.setXYZ(0, position.x, position.y, position.z);
     drop.setXYZ(1, position.x, 0, position.z);

@@ -111,6 +111,7 @@ def test_service_publishes_only_while_leased_at_its_rate(tmp_path):
     assert written == 10 and logs == ["Pose stream started: a viewer is open"]
     pose = json.loads((tmp_path / pose_stream.POSE_FILE).read_text())
     assert pose["frame"] == "start-FRD" and pose["camera_angle_deg"] == 30.0 and pose["rate_hz"] == 10.0
+    assert pose["camera_roll_deg"] == 0.0
     # The last write was the 20th frame's (the unleased first one, then 19 of 0.05 m)
     assert pose["frames"] == 20 and pose["ok_frames"] == 20 and pose["ok"] is True
     assert pose["x"] == pytest.approx(0.1 + 19 * 0.05, abs=1e-3) and pose["q"] == [1.0, 0.0, 0.0, 0.0]
@@ -269,6 +270,47 @@ def test_pose_viewer_module_is_relative_and_vendored(client):
         assert vendored.status_code == 200 and "javascript" in vendored.headers["content-type"]
         # Nothing fetched from elsewhere (three.js only mentions a namespace URI and a forum post in strings)
         assert not re.search(r"""(\bimport\s*\(?\s*|\bfrom\s*)['"]https?:""", vendored.text)
+
+
+def test_pose_json_carries_the_camera_roll(tmp_path):
+    clock = Clock()
+    service = pose_stream.PoseStreamService(tmp_path, 90.0, clock=clock, log=lambda m: None, poll_interval=0.0,
+                                            camera_roll_deg=-90)
+    pose_stream.touch_lease(tmp_path)
+    os.utime(tmp_path / pose_stream.LEASE_FILE, (clock.t, clock.t))
+    clock.t += 0.2
+    assert service.record(clock.t, True, [0.1, 0.0, 0.0], [0.0, 0.0, 0.0])
+    pose = json.loads((tmp_path / pose_stream.POSE_FILE).read_text())
+    assert (pose["camera_angle_deg"], pose["camera_roll_deg"]) == (90.0, -90.0)
+
+
+# The viewer's frustum axes (pose3d.js cameraAxes) for each (camera_angle_deg, camera_roll_deg)
+AXES_RUNNER = r"""
+const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+import(input.module).then(m => process.stdout.write(JSON.stringify(input.mounts.map(([a, r]) => m.cameraAxes(a, r)))));
+"""
+
+
+def test_the_viewer_frustum_follows_the_camera_mount(client):
+    import shutil
+    import subprocess
+    from pnp_odometry import camera_to_body_matrix
+    main, http = client
+    js = http.get("/static/pose3d.js").text
+    assert "setFrustum(p.camera_angle_deg || 0, p.camera_roll_deg || 0)" in js
+    assert "frustumPositions(angle, roll)" in js
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    mounts = [[0, 0], [90, 0], [90, 90], [90, 180], [90, -90], [30, 45], [-45, 90]]
+    result = subprocess.run([node, "-e", AXES_RUNNER], capture_output=True, text=True,
+                            timeout=30, check=True,
+                            input=json.dumps({"module": (STATIC / "pose3d.js").as_uri(), "mounts": mounts}))
+    for (angle, roll), axes in zip(mounts, json.loads(result.stdout)):
+        M = camera_to_body_matrix(angle, roll)
+        np.testing.assert_allclose(axes["dir"], M @ [0, 0, 1], atol=1e-12)
+        np.testing.assert_allclose(axes["right"], M @ [1, 0, 0], atol=1e-12)
+        np.testing.assert_allclose(axes["up"], M @ [0, -1, 0], atol=1e-12)
 
 
 def test_vendored_three_is_pinned_and_licensed():

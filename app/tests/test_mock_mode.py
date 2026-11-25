@@ -154,6 +154,12 @@ def test_the_mock_vio_takes_the_real_command_line(tmp_path):
     assert args.log_only and args.snapshot_dir == tmp_path / "snapshots" and args.log_dir == tmp_path / "logs"
     assert (args.stereo_depth_min_mm, args.stereo_depth_max_mm) == (400, 3500)
     assert args.telemetry_dir == main.telemetry_dir()
+    # The default mount is forward: its angle, whatever camera_angle says
+    assert (args.camera_mount, args.camera_angle, args.camera_roll) == ("forward", 0.0, 0.0)
+    config = {**config, "camera_mount": "downward", "camera_angle": 0.0, "camera_roll": 180.0}
+    args = mock_vio.parse_args(mock_mode.vio_command(main.build_vio_command(config), tmp_path, tmp_path)[3:])
+    assert (args.camera_mount, args.camera_angle, args.camera_roll) == ("downward", 90.0, 180.0)
+    assert mock_vio.parse_args(["--camera-angle", "45"]).camera_angle == 45.0
 
 
 MOCK_MISMATCHES = ["VISO_POS_X", "VISO_POS_Y", "VISO_POS_Z", "EK3_SRC1_POSXY"]

@@ -263,6 +263,146 @@ def test_the_defaults_are_the_production_setup(client):
     assert config["depth_transport"] == "points"
 
 
+# --- camera mount ---------------------------------------------------------------------------------
+
+def test_camera_mount_defaults_and_schema(client):
+    main, http = client
+    config = main.DEFAULT_CONFIG
+    assert (config["camera_mount"], config["camera_angle"], config["camera_roll"]) == ("forward", 0.0, 0.0)
+    fields = {f["name"]: f for f in http.get("/api/config/schema").json()["fields"]}
+    assert fields["camera_mount"]["choices"] == ["forward", "downward", "custom"]
+    assert fields["camera_mount"]["group"] == fields["camera_roll"]["group"] == "camera"
+    roll = fields["camera_roll"]
+    assert (roll["type"], roll["min"], roll["max"], roll["step"]) == ("float", -180.0, 180.0, 1.0)
+    assert "custom" in fields["camera_angle"]["help"] and "90 = down" in fields["camera_angle"]["help"]
+    for where in ("0 = up", "0 = forward", "90 = right", "180 = back", "-90 = left"):
+        assert where in roll["help"]
+    page = http.get("/").text
+    assert page.index('name="camera_mount"') < page.index('name="camera_angle"') < page.index('name="camera_roll"')
+
+
+@pytest.mark.parametrize("saved, mount", [
+    ({}, "forward"),
+    ({"camera_angle": 0.0}, "forward"),
+    ({"camera_angle": 0}, "forward"),
+    ({"camera_angle": 90.0}, "downward"),
+    ({"camera_angle": 45.0}, "custom"),
+    ({"camera_angle": -30}, "custom"),
+    ({"camera_angle": "bogus"}, "forward"),
+    ({"camera_angle": float("nan")}, "forward"),
+    ({"camera_angle": 90.0, "camera_mount": "forward"}, "forward"),  # a saved mount always wins
+    ({"camera_angle": 0.0, "camera_mount": "custom"}, "custom"),
+])
+def test_older_configs_get_the_mount_their_camera_angle_meant(saved, mount):
+    config = config_schema.migrate_saved(saved)
+    assert config["camera_mount"] == mount and config["camera_roll"] == 0.0
+
+
+def test_effective_camera_angle():
+    assert config_schema.effective_camera_angle({"camera_mount": "forward", "camera_angle": 45.0}) == 0.0
+    assert config_schema.effective_camera_angle({"camera_mount": "downward", "camera_angle": 45.0}) == 90.0
+    assert config_schema.effective_camera_angle({"camera_mount": "custom", "camera_angle": 45}) == 45.0
+    assert config_schema.effective_camera_angle({"camera_angle": 45.0}) == 0.0  # default mount: forward
+    assert config_schema.effective_camera_angle({"camera_mount": None, "camera_angle": 90.0}) == 90.0  # bare angle
+
+
+def command_value(command, option):
+    return command[command.index(option) + 1]
+
+
+@pytest.mark.parametrize("angle", [0.0, 45.0])
+def test_command_line_sends_the_mount_s_effective_angle_and_roll(client, angle):
+    main, http = client
+    command = main.build_vio_command({**main.DEFAULT_CONFIG, "camera_mount": "downward", "camera_angle": angle,
+                                      "camera_roll": 90.0})
+    assert command_value(command, "--camera-mount") == "downward"
+    assert command_value(command, "--camera-angle") == "90.0" and command_value(command, "--camera-roll") == "90.0"
+    command = main.build_vio_command({**main.DEFAULT_CONFIG, "camera_mount": "forward", "camera_angle": 30.0})
+    assert command_value(command, "--camera-angle") == "0.0" and command_value(command, "--camera-roll") == "0.0"
+    command = main.build_vio_command({**main.DEFAULT_CONFIG, "camera_mount": "custom", "camera_angle": 30.0,
+                                      "camera_roll": -90.0})
+    assert command_value(command, "--camera-angle") == "30.0" and command_value(command, "--camera-roll") == "-90.0"
+    # A hand-edited config.json cannot put a bad mount or roll on the command line
+    command = main.build_vio_command({**main.DEFAULT_CONFIG, "camera_mount": "sideways", "camera_roll": "bad"})
+    assert command_value(command, "--camera-mount") == "forward" and command_value(command, "--camera-roll") == "0.0"
+
+
+def test_config_api_accepts_each_mount_and_validates_the_roll(client, tmp_path):
+    main, http = client
+    for mount, roll in (("downward", 90.0), ("forward", 180.0), ("custom", -90.0)):
+        body = {**main.DEFAULT_CONFIG, "camera_mount": mount, "camera_angle": 45.0, "camera_roll": roll}
+        assert http.post("/api/config", json=body).status_code == 200, mount
+        saved = json.loads((tmp_path / "config.json").read_text())
+        assert (saved["camera_mount"], saved["camera_angle"], saved["camera_roll"]) == (mount, 45.0, roll)
+    for bad, field in (({"camera_mount": "sideways"}, "camera_mount"), ({"camera_roll": 181.0}, "camera_roll"),
+                       ({"camera_roll": -200}, "camera_roll"), ({"camera_roll": "abc"}, "camera_roll")):
+        response = http.post("/api/config", json={**main.DEFAULT_CONFIG, **bad})
+        assert response.status_code == 422, bad
+        assert [error["field"] for error in response.json()["detail"]] == [field]
+    message = http.post("/api/config", json={**main.DEFAULT_CONFIG, "camera_mount": "up"}).json()["detail"][0]["msg"]
+    assert message == "Camera Mount (camera_mount): must be one of forward, downward, custom (got 'up')"
+    _, errors = config_schema.validate_config({**main.DEFAULT_CONFIG, "camera_roll": float("inf")})
+    assert [error["field"] for error in errors] == ["camera_roll"]
+
+
+UI_JS = os.path.join(os.path.dirname(__file__), "..", "static", "ui.js")
+
+# The settings functions of ui.js on a fake form: each input has a value and a disabled flag, as in the DOM,
+# where a disabled input's value still reads back
+SETTINGS_RUNNER = r"""
+const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+const inputs = Object.fromEntries(input.fields.map(f => [f.name, { value: String(f.value), disabled: false }]));
+const $ = id => ({ elements: inputs });
+const ui = { schema: { fields: input.fields } };
+const isNum = v => typeof v === 'number' && isFinite(v);
+const VEHICLE_IP = /^$/;
+eval(input.source);
+const out = input.steps.map(([name, value]) => {
+  if (name) inputs[name].value = value;
+  syncCameraAngle();
+  return { disabled: inputs.camera_angle.disabled, config: collectConfig().config };
+});
+process.stdout.write(JSON.stringify(out));
+"""
+
+
+def test_the_camera_angle_input_is_disabled_unless_the_mount_is_custom(client):
+    main, http = client
+    js = http.get("/static/ui.js").text
+    sync = function_body(js, "syncCameraAngle")
+    assert "angle.disabled = mount.value !== 'custom'" in sync
+    init = function_body(js, "initSettings")
+    # On load, on the mount's input / change, and when its reset button sets the default
+    assert init.count("syncCameraAngle") == 4 and "if (f.name === 'camera_mount') syncCameraAngle();" in init
+    assert init.index("syncCameraAngle();\n  markChanged();") > init.index("for (const f of ui.schema.fields)")
+    # collectConfig reads every input's value (FormData would drop the disabled ones)
+    assert "FormData" not in js and "input.value" in function_body(js, "rawValue")
+    css = http.get("/static/ui.css").text
+    assert "input:disabled, select:disabled { opacity: .45;" in css
+
+    import shutil
+    import subprocess
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    source = "\n".join(function_body(js, name) + "\n}" for name in
+                       ("fieldInput", "rawValue", "numbers", "parseField", "crossFieldErrors", "collectConfig",
+                        "syncCameraAngle"))
+    fields = [{"name": "camera_mount", "type": "choice", "choices": ["forward", "downward", "custom"],
+               "value": "downward", "min": None, "max": None, "nullable": False},
+              {"name": "camera_angle", "type": "float", "choices": [], "value": "45", "min": -180, "max": 180,
+               "nullable": False}]
+    steps = [[None, None], ["camera_mount", "custom"], ["camera_angle", "60"], ["camera_mount", "forward"]]
+    result = subprocess.run([node, "-e", SETTINGS_RUNNER], capture_output=True, text=True, timeout=30, check=True,
+                            input=json.dumps({"source": source, "fields": fields, "steps": steps}))
+    out = json.loads(result.stdout)
+    assert [step["disabled"] for step in out] == [True, False, False, True]
+    assert [step["config"] for step in out] == [{"camera_mount": "downward", "camera_angle": 45},
+                                                {"camera_mount": "custom", "camera_angle": 45},
+                                                {"camera_mount": "custom", "camera_angle": 60},
+                                                {"camera_mount": "forward", "camera_angle": 60}]
+
+
 def test_log_only_toggle_persists_and_restarts(client, tmp_path):
     main, http = client
     response = http.post("/api/log_only", json={"log_only": True})

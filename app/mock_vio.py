@@ -69,6 +69,7 @@ import pose_stream
 import snapshots
 import vio_log
 import vio_telemetry
+from config_schema import CAMERA_MOUNTS, effective_camera_angle
 from stereo_config import add_stereo_arguments, resolve_stereo_settings
 
 BASELINE_M = 0.075
@@ -107,7 +108,9 @@ def parse_args(argv=None):
     parser.add_argument("--depth-transport", choices=depth_points.TRANSPORTS, default=depth_points.DEFAULT_TRANSPORT)
     parser.add_argument("--min-depth", type=float, default=0.2)
     parser.add_argument("--max-depth", type=float, default=15.0)
+    parser.add_argument("--camera-mount", choices=CAMERA_MOUNTS, default=None)
     parser.add_argument("--camera-angle", type=float, default=0.0)
+    parser.add_argument("--camera-roll", type=float, default=0.0)
     parser.add_argument("--depth-scale", type=float, default=1.0)
     parser.add_argument("--refractive-index", type=float, default=1.333)
     parser.add_argument("--log-only", action="store_true")
@@ -117,6 +120,7 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=None)
     add_stereo_arguments(parser)
     args, _ = parser.parse_known_args(argv)
+    args.camera_angle = effective_camera_angle({"camera_mount": args.camera_mount, "camera_angle": args.camera_angle})
     return args
 
 
@@ -780,7 +784,7 @@ class FakeVio:
                 mock_mode.attitude_fetch(self.started, clock=self.clock), clock=self.clock, log=print,
                 description=f"mock autopilot ATTITUDE ({mock_mode.attitude_mode()})").start()
             self.pose_out = pose_stream.PoseStreamService(self.telemetry_dir, args.camera_angle, log=print,
-                                                          attitude=attitude)
+                                                          attitude=attitude, camera_roll_deg=args.camera_roll)
             self.telemetry.pose_status = self.pose_out.status
             snapshots.write_camera_status(self.camera_status(), args.snapshot_dir)
             stop.wait(STARTUP_PHASE_S)

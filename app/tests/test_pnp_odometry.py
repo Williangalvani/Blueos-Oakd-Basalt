@@ -21,6 +21,7 @@ from pnp_odometry import (  # noqa: E402
     lever_arm_correction,
     lookup_depth,
     matrix_to_rotvec,
+    optical_roll_matrix,
     refracted_intrinsics,
     rotation_angle,
     rotvec_to_matrix,
@@ -642,50 +643,154 @@ def yaw_frd(angle):
     return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
 
 
-def camera_observation(R_wb1, p_b1, camera_angle, lever_arm=LEVER_ARM):
+def camera_observation(R_wb1, p_b1, camera_angle, lever_arm=LEVER_ARM, camera_roll=0.0):
     """
     The vehicle body (IMU) goes from the world origin (R_wb0 = I) to (R_wb1, p_b1); the camera sits at
-    lever_arm in body FRD, pitched by camera_angle. Returns what PnP and the gyro report: the camera
-    displacement expressed in its current optical frame, and R_01 in the optical frame.
+    lever_arm in body FRD, pitched by camera_angle and rolled by camera_roll. Returns what PnP and the gyro
+    report: the camera displacement expressed in its current optical frame, and R_01 in the optical frame.
     """
-    M = camera_to_body_matrix(camera_angle)  # optical -> body
+    M = camera_to_body_matrix(camera_angle, camera_roll)  # optical -> body
     R_wc0, R_wc1 = M, R_wb1 @ M
     p_c0, p_c1 = lever_arm, p_b1 + R_wb1 @ lever_arm
     return R_wc1.T @ (p_c1 - p_c0), R_wc0.T @ R_wc1
 
 
-def test_camera_to_body_matrix_matches_the_vector_mapping():
-    for angle in (0.0, 30.0, 90.0):
-        M = camera_to_body_matrix(angle)
-        np.testing.assert_allclose(M @ M.T, np.eye(3), atol=1e-12)
-        assert np.linalg.det(M) == pytest.approx(1.0)
-        v = np.array([0.3, -0.2, 0.9])
-        np.testing.assert_allclose(M @ v, camera_to_body_frd(v, angle), atol=1e-12)
-        # A rotation mapped to body has the mapped rotation vector
-        rotvec = np.radians([3.0, -1.0, 7.0])
-        np.testing.assert_allclose(matrix_to_rotvec(camera_to_body_rotation(rotvec_to_matrix(rotvec), angle)),
-                                   camera_to_body_frd(rotvec, angle), atol=1e-12)
+@pytest.mark.parametrize("roll", [0.0, 90.0, 180.0, -90.0, 45.0])
+@pytest.mark.parametrize("angle", [0.0, 30.0, 90.0, -45.0])
+def test_camera_to_body_matrix_matches_the_vector_mapping(angle, roll):
+    M = camera_to_body_matrix(angle, roll)
+    np.testing.assert_allclose(M @ M.T, np.eye(3), atol=1e-12)
+    assert np.linalg.det(M) == pytest.approx(1.0)
+    v = np.array([0.3, -0.2, 0.9])
+    np.testing.assert_allclose(M @ v, camera_to_body_frd(v, angle, roll), atol=1e-12)
+    # A rotation mapped to body has the mapped rotation vector
+    rotvec = np.radians([3.0, -1.0, 7.0])
+    np.testing.assert_allclose(matrix_to_rotvec(camera_to_body_rotation(rotvec_to_matrix(rotvec), angle, roll)),
+                               camera_to_body_frd(rotvec, angle, roll), atol=1e-12)
+    # The roll is about the optical axis: it never moves where the camera looks
+    np.testing.assert_allclose(M @ [0, 0, 1], camera_to_body_frd([0, 0, 1], angle), atol=1e-12)
 
 
+def test_roll_defaults_keep_the_unrolled_mapping():
+    np.testing.assert_allclose(optical_roll_matrix(), np.eye(3), atol=1e-15)
+    for angle in (0.0, 90.0, 30.0):
+        np.testing.assert_allclose(camera_to_body_matrix(angle, 0.0), camera_to_body_matrix(angle), atol=1e-15)
+    np.testing.assert_allclose(optical_roll_matrix(360.0), np.eye(3), atol=1e-12)
+    np.testing.assert_allclose(optical_roll_matrix(180.0), optical_roll_matrix(-180.0), atol=1e-12)
+    # +90: physical image right is unrolled down, physical image top (-y) is unrolled right
+    np.testing.assert_allclose(optical_roll_matrix(90.0) @ [1, 0, 0], [0, 1, 0], atol=1e-12)
+    np.testing.assert_allclose(optical_roll_matrix(90.0) @ [0, -1, 0], [1, 0, 0], atol=1e-12)
+
+
+# (camera_angle, camera_roll) -> where each optical axis points in body FRD
+OPT_X, OPT_Y, OPT_Z = np.eye(3)
+MOUNT_AXES = {
+    # Forward: image right is body right, image down is body down
+    (0.0, 0.0): {"+x": [0, 1, 0], "+y": [0, 0, 1], "+z": [1, 0, 0]},
+    # Downward: looks down, image top (-y) forward, image right right
+    (90.0, 0.0): {"+x": [0, 1, 0], "+y": [-1, 0, 0], "+z": [0, 0, 1]},
+    # Downward rolled 90: image top right, image left (-x) forward
+    (90.0, 90.0): {"+x": [-1, 0, 0], "+y": [0, -1, 0], "+z": [0, 0, 1]},
+    # Downward rolled 180: image top back, image bottom (+y) forward
+    (90.0, 180.0): {"+x": [0, -1, 0], "+y": [1, 0, 0], "+z": [0, 0, 1]},
+    # Downward rolled -90: image top left, image right forward
+    (90.0, -90.0): {"+x": [1, 0, 0], "+y": [0, 1, 0], "+z": [0, 0, 1]},
+    # Forward rolled 90: image top right, image right down
+    (0.0, 90.0): {"+x": [0, 0, 1], "+y": [0, -1, 0], "+z": [1, 0, 0]},
+}
+
+
+@pytest.mark.parametrize("mount", list(MOUNT_AXES), ids=[f"angle{a:g}-roll{r:g}" for a, r in MOUNT_AXES])
+def test_mount_maps_each_optical_axis_to_its_body_axis(mount):
+    angle, roll = mount
+    axes = MOUNT_AXES[mount]
+    for name, optical in (("+x", OPT_X), ("+y", OPT_Y), ("+z", OPT_Z)):
+        expected = np.asarray(axes[name], dtype=float)
+        # Translations along +-x_opt, +-y_opt, +z_opt
+        np.testing.assert_allclose(camera_to_body_frd(0.1 * optical, angle, roll), 0.1 * expected, atol=1e-12)
+        np.testing.assert_allclose(camera_to_body_frd(-0.1 * optical, angle, roll), -0.1 * expected, atol=1e-12)
+        # A rotation about an optical axis is the same rotation about its body axis
+        R_body = camera_to_body_rotation(rotvec_to_matrix(0.05 * optical), angle, roll)
+        np.testing.assert_allclose(matrix_to_rotvec(R_body), 0.05 * expected, atol=1e-12)
+
+
+def test_downward_forward_motion_and_yaw_are_body_forward_and_yaw():
+    d, psi = 0.07, math.radians(4.0)
+    # Moving forward the scene below slides towards the image bottom: the camera moves towards the image top
+    np.testing.assert_allclose(camera_to_body_frd([0, -d, 0], 90.0), [d, 0, 0], atol=1e-12)
+    # Yawing right turns a downward camera about its optical axis
+    np.testing.assert_allclose(camera_to_body_frd([0, 0, psi], 90.0), [0, 0, psi], atol=1e-12)
+    np.testing.assert_allclose(camera_to_body_rotation(rotvec_to_matrix([0, 0, psi]), 90.0), yaw_frd(psi),
+                               atol=1e-12)
+
+
+BODY_MOTIONS = {
+    "forward": (np.zeros(3), np.array([0.06, 0.0, 0.0])),
+    "strafe_and_descend": (np.zeros(3), np.array([0.0, 0.04, 0.03])),
+    "yaw_right": (np.array([0.0, 0.0, math.radians(3.0)]), np.array([0.02, 0.0, 0.0])),
+    "pitch_and_roll": (np.radians([1.5, -2.0, 0.5]), np.array([0.03, -0.02, 0.01])),
+}
+
+
+def mounted_frames(rng, R_wb1, p_b1, angle, roll, lever_arm=LEVER_ARM):
+    """
+    A scene in front of the camera mounted at (angle, roll) and lever_arm, seen before and after the body moves
+    from the origin to (R_wb1, p_b1): (points in C0, points in C1).
+    """
+    M = camera_to_body_matrix(angle, roll)
+    P0 = random_scene(rng)
+    world = P0 @ M.T + lever_arm  # body at t0 = world
+    R_wc1, p_c1 = R_wb1 @ M, p_b1 + R_wb1 @ lever_arm
+    return P0, (world - p_c1) @ R_wc1
+
+
+@pytest.mark.parametrize("motion", list(BODY_MOTIONS))
+@pytest.mark.parametrize("angle, roll", [(0.0, 0.0), (90.0, 0.0), (90.0, 90.0), (90.0, -90.0), (30.0, 180.0)])
+def test_pnp_odometry_recovers_the_body_motion_for_each_mount(angle, roll, motion):
+    rotvec, p_b1 = BODY_MOTIONS[motion]
+    R_wb1 = rotvec_to_matrix(rotvec)
+    rng = np.random.default_rng(11)
+    P0, P1 = mounted_frames(rng, R_wb1, p_b1, angle, roll)
+    assert np.all(P1[:, 2] > 0.5)
+    ids = np.arange(len(P0))
+    M = camera_to_body_matrix(angle, roll)
+    odometry = PnPOdometry(K, PnPParams(refractive_index=1.0))
+    odometry.process_depths(ids, project(P0), P0[:, 2], 1.0)
+    # The camera's gyro (R_cam_imu = I) reports the body rotation in the optical frame
+    prior = M.T @ R_wb1 @ M
+    frame = odometry.process_depths(ids, project(P1) + rng.normal(0, 0.2, (len(P1), 2)), P1[:, 2], 1.1, prior)
+    assert frame.pose.ok, frame.pose.reason
+    R_body = camera_to_body_rotation(frame.pose.rotation, angle, roll)
+    np.testing.assert_allclose(R_body, R_wb1, atol=math.radians(0.15))
+    np.testing.assert_allclose(camera_to_body_frd(frame.pose.angle_delta, angle, roll), rotvec,
+                               atol=math.radians(0.15))
+    np.testing.assert_allclose(camera_to_body_rotation(prior, angle, roll), R_wb1, atol=1e-12)
+    # The camera's delta in body FRD, corrected to the IMU, is the body's displacement in its current frame
+    camera_delta = camera_to_body_frd(frame.pose.position_delta, angle, roll)
+    np.testing.assert_allclose(lever_arm_body_delta(camera_delta, R_wb1, LEVER_ARM), R_wb1.T @ p_b1, atol=4e-3)
+
+
+@pytest.mark.parametrize("camera_roll", [0.0, 90.0, 180.0, -90.0])
 @pytest.mark.parametrize("camera_angle", [0.0, 90.0])
-def test_lever_arm_pure_yaw_about_the_imu_gives_no_body_translation(camera_angle):
+def test_lever_arm_pure_yaw_about_the_imu_gives_no_body_translation(camera_angle, camera_roll):
     psi = math.radians(8.0)
-    delta_optical, R_01 = camera_observation(yaw_frd(psi), np.zeros(3), camera_angle)
-    camera_delta = camera_to_body_frd(delta_optical, camera_angle)
+    delta_optical, R_01 = camera_observation(yaw_frd(psi), np.zeros(3), camera_angle, camera_roll=camera_roll)
+    camera_delta = camera_to_body_frd(delta_optical, camera_angle, camera_roll)
     # The camera itself moved: it swings on the lever arm
     assert np.linalg.norm(camera_delta) > 0.02
-    R_body = camera_to_body_rotation(R_01, camera_angle)
+    R_body = camera_to_body_rotation(R_01, camera_angle, camera_roll)
     np.testing.assert_allclose(R_body, yaw_frd(psi), atol=1e-12)
     np.testing.assert_allclose(lever_arm_correction(R_body, LEVER_ARM), camera_delta, atol=1e-12)
     np.testing.assert_allclose(lever_arm_body_delta(camera_delta, R_body, LEVER_ARM), 0.0, atol=1e-12)
 
 
-def test_lever_arm_recovers_the_imu_motion_with_rotation_and_translation():
+@pytest.mark.parametrize("camera_roll", [0.0, 90.0, 180.0, -90.0])
+def test_lever_arm_recovers_the_imu_motion_with_rotation_and_translation(camera_roll):
     R_wb1 = rotvec_to_matrix([0.05, -0.03, 0.2])
     p_b1 = np.array([0.04, -0.02, 0.01])
-    delta_optical, R_01 = camera_observation(R_wb1, p_b1, 90.0)
-    camera_delta = camera_to_body_frd(delta_optical, 90.0)
-    body = lever_arm_body_delta(camera_delta, camera_to_body_rotation(R_01, 90.0), LEVER_ARM)
+    delta_optical, R_01 = camera_observation(R_wb1, p_b1, 90.0, camera_roll=camera_roll)
+    camera_delta = camera_to_body_frd(delta_optical, 90.0, camera_roll)
+    body = lever_arm_body_delta(camera_delta, camera_to_body_rotation(R_01, 90.0, camera_roll), LEVER_ARM)
     # Body displacement expressed in the current body frame, like position_delta
     np.testing.assert_allclose(body, R_wb1.T @ p_b1, atol=1e-12)
     assert np.linalg.norm(camera_delta - body) > 0.02

@@ -18,6 +18,9 @@ from stereo_config import (DEFAULT_LEVER_ARM_M, DEFAULT_REFRACTIVE_INDEX, DEPTH_
                            parse_intrinsics_override, parse_lever_arm)
 
 DVL_SOURCES = ("auto", "off")
+CAMERA_MOUNTS = ("forward", "downward", "custom")
+# Pitch down from forward (deg) of the fixed mounts; custom uses camera_angle
+MOUNT_ANGLES = {"forward": 0.0, "downward": 90.0}
 # depth_stream.VARIANTS (kept here so the schema does not import the stream code)
 DEPTH_STREAM_ENCODINGS = ("auto", "mono_features", "host_jpeg")
 # depth_points.TRANSPORTS
@@ -139,8 +142,17 @@ CONFIG_FIELDS = (
                 group="advanced"),
 
     ConfigField("fps", "int", 30, "FPS", "Camera frame rate; lower = less camera and Pi CPU", "camera", 1, 60, step=1),
-    ConfigField("camera_angle", "float", 0.0, "Camera Angle (°)", "0 = forward, 90 = down", "camera", -180.0, 180.0,
-                step=0.1),
+    ConfigField("camera_mount", "choice", "forward", "Camera Mount",
+                "Which way the camera looks on the vehicle: forward, downward (at the seafloor), or custom (the "
+                "Camera Angle below). The extension rotates every delta into body FRD itself, so VISO_ORIENT stays 0",
+                "camera", choices=CAMERA_MOUNTS),
+    ConfigField("camera_angle", "float", 0.0, "Camera Angle (°)",
+                "Pitch of the optical axis down from forward when Camera Mount is custom: 0 = forward, 90 = down "
+                "(ignored for forward / downward)", "camera", -180.0, 180.0, step=0.1),
+    ConfigField("camera_roll", "float", 0.0, "Camera Roll (°)",
+                "Camera turned about its optical axis, clockwise looking out through the lens; says where the top of "
+                "the image points. Forward mount: 0 = up, 90 = right, 180 = down (upside down), -90 = left. Downward "
+                "mount: 0 = forward, 90 = right, 180 = back, -90 = left", "camera", -180.0, 180.0, step=1.0),
     ConfigField("resolution_width", "int", 640, "Width", "Rectified-left image width (px)", "camera", 160, 1280,
                 step=1),
     ConfigField("resolution_height", "int", 400, "Height", "Rectified-left image height (px)", "camera", 100, 800,
@@ -168,10 +180,29 @@ def default_config() -> dict:
             for field in CONFIG_FIELDS}
 
 
+def effective_camera_angle(config: dict) -> float:
+    """Pitch of the optical axis down from forward (deg) for the config's camera_mount."""
+    mount = config.get("camera_mount", FIELDS_BY_KEY["camera_mount"].default)
+    if mount in MOUNT_ANGLES:
+        return MOUNT_ANGLES[mount]
+    return float(config.get("camera_angle", FIELDS_BY_KEY["camera_angle"].default))
+
+
+def _mount_for_angle(angle):
+    """The camera_mount a config saved before camera_mount existed meant with its camera_angle (None if invalid)."""
+    if isinstance(angle, bool) or not isinstance(angle, (int, float)) or not math.isfinite(angle):
+        return None
+    for mount, mount_angle in MOUNT_ANGLES.items():
+        if abs(angle - mount_angle) < 1e-6:
+            return mount
+    return "custom"
+
+
 def migrate_saved(saved: dict) -> dict:
     """
     A config.json from any earlier version as a full config: keys of removed settings (e.g. algorithm, the Basalt
     tuning) are dropped, missing ones get their default, and a choice that no longer exists gets the default.
+    A config without camera_mount gets the mount its camera_angle meant (0 forward, 90 downward, else custom).
     """
     config = default_config()
     for key, value in saved.items():
@@ -180,6 +211,8 @@ def migrate_saved(saved: dict) -> dict:
             continue
         removed_choice = field.kind == "choice" and value not in field.choices and not (value is None and field.nullable)
         config[key] = field.default if removed_choice else value
+    if "camera_mount" not in saved and "camera_angle" in saved:
+        config["camera_mount"] = _mount_for_angle(saved["camera_angle"]) or config["camera_mount"]
     return config
 
 
@@ -278,8 +311,8 @@ def _cross_field_errors(config):
     if isinstance(low, int) and isinstance(high, int) and low >= high:
         errors.append({"loc": ["body", "stereo_depth_max_mm"], "field": "stereo_depth_max_mm", "type": "value_error",
                        "msg": f"Max depth (mm) (stereo_depth_max_mm): must be above Min depth (mm) ({low})"})
-    for key in ("refractive_index", "depth_scale", "max_reference_age", "camera_angle", "quality_rate",
-                "depth_stream_fps"):
+    for key in ("refractive_index", "depth_scale", "max_reference_age", "camera_angle", "camera_roll",
+                "quality_rate", "depth_stream_fps"):
         value = config.get(key)
         if isinstance(value, float) and not math.isfinite(value):
             errors.append({"loc": ["body", key], "field": key, "type": "finite_number",

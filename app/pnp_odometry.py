@@ -17,6 +17,9 @@ Conventions
     (Rodrigues of R_01 = R_10.T).
   * position_delta: displacement of the camera from C0 to C1, expressed in the current frame C1
     (that is R_10 @ (-R_10.T @ t_10) = -t_10).
+- The gyro prior is in the same optical frame: R_cam_imu (the device's IMU -> CAM_B extrinsics) is fixed inside
+  the camera housing, so it does not depend on how the camera is mounted. camera_to_body_* then take the
+  deltas and the prior into body FRD with the mount's pitch (camera_angle) and optical-axis roll (camera_roll).
 """
 
 import math
@@ -288,22 +291,46 @@ def camera_rotation_matrix(camera_angle_deg):
     ])
 
 
-def camera_to_body_matrix(camera_angle_deg=0.0):
-    """Rotation taking optical camera-frame vectors to body FRD (camera_to_body_frd as a matrix)."""
-    return FLU_TO_FRD @ camera_rotation_matrix(camera_angle_deg) @ OPTICAL_TO_FLU
-
-
-def camera_to_body_frd(vector, camera_angle_deg=0.0):
+def optical_roll_matrix(camera_roll_deg=0.0):
     """
-    Optical camera-frame vector -> vehicle body FRD, matching MavlinkNode: convert to FLU, apply the
-    camera_angle pitch rotation, then flip FLU -> FRD. Works for translations and rotation vectors.
+    The camera turned about its optical axis (+z) by camera_roll_deg, clockwise looking out through the lens:
+    takes vectors in the rolled (physical) optical frame to the unrolled one. At +90 the physical image right
+    (+x) is the unrolled down (+y) and the physical image top (-y) is the unrolled right (+x).
     """
-    return camera_to_body_matrix(camera_angle_deg) @ np.asarray(vector, dtype=np.float64)
+    r = math.radians(camera_roll_deg)
+    c, s = math.cos(r), math.sin(r)
+    return np.array([
+        [c, -s, 0.0],
+        [s, c, 0.0],
+        [0.0, 0.0, 1.0],
+    ])
 
 
-def camera_to_body_rotation(R, camera_angle_deg=0.0):
-    """A rotation matrix in the optical camera frame (e.g. R_01) -> the same rotation in body FRD."""
-    M = camera_to_body_matrix(camera_angle_deg)
+def camera_to_body_matrix(camera_angle_deg=0.0, camera_roll_deg=0.0):
+    """
+    Rotation taking optical camera-frame vectors to body FRD (camera_to_body_frd as a matrix). camera_angle_deg
+    pitches the optical axis down from forward (0 forward, 90 down); camera_roll_deg turns the camera about its
+    optical axis first (optical_roll_matrix). Downward with roll 0: the image top points forward, the image
+    right points right.
+    """
+    return (FLU_TO_FRD @ camera_rotation_matrix(camera_angle_deg) @ OPTICAL_TO_FLU
+            @ optical_roll_matrix(camera_roll_deg))
+
+
+def camera_to_body_frd(vector, camera_angle_deg=0.0, camera_roll_deg=0.0):
+    """
+    Optical camera-frame vector -> vehicle body FRD, matching MavlinkNode: undo the optical-axis roll, convert to
+    FLU, apply the camera_angle pitch rotation, then flip FLU -> FRD. Works for translations and rotation vectors.
+    """
+    return camera_to_body_matrix(camera_angle_deg, camera_roll_deg) @ np.asarray(vector, dtype=np.float64)
+
+
+def camera_to_body_rotation(R, camera_angle_deg=0.0, camera_roll_deg=0.0):
+    """
+    A rotation matrix in the optical camera frame (e.g. R_01, or the gyro prior: integrate_gyro with R_cam_imu
+    is already in the optical frame whatever the mount) -> the same rotation in body FRD.
+    """
+    M = camera_to_body_matrix(camera_angle_deg, camera_roll_deg)
     return M @ np.asarray(R, dtype=np.float64) @ M.T
 
 

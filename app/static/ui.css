@@ -55,6 +55,7 @@ input, select { background: #0e1218; color: #dde3ea; border: 1px solid #34425a; 
 input:focus, select:focus { outline: none; border-color: #2d6cdf; }
 input.invalid, select.invalid { border-color: #e74c3c; background: #2a1414; }
 input.changed, select.changed { border-color: #f1c40f; }
+input:disabled, select:disabled { opacity: .45; cursor: not-allowed; }
 label.inline { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: #b8c7da; }
 label.inline input[type=checkbox] { margin: 0; }
 .controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }

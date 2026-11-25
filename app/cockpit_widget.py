@@ -19,7 +19,7 @@ and behind the proxy.
 """
 
 SERVICE_NAME = "OAK-D VIO"
-VERSION = "0.1.0"  # the dockerfile's version LABEL
+VERSION = "0.1.1"  # the dockerfile's version LABEL
 EXTRAS_PATH = "/cockpit_extras.json"
 WIDGET_PATH = "/widget/depth"
 WIDGET_ICON_PATH = "/static/widget_icon.svg"

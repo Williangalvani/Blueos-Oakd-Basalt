@@ -43,8 +43,9 @@ SUGGESTED_OPTICAL_HOLD_PARAMS = (
     SuggestedParam("VISO_POS_Y", DEFAULT_LEVER_ARM_M[1], False, "Camera right of the IMU (m, FRD, from the CAD)."),
     SuggestedParam("VISO_POS_Z", DEFAULT_LEVER_ARM_M[2], False, "Camera below the IMU (m, FRD, from the CAD)."),
     SuggestedParam("VISO_ORIENT", 0, False,
-                   "Forward: the extension already rotates the deltas into body FRD with its Camera Angle, so "
-                   "any other orientation would rotate them twice."),
+                   "Forward: the extension already rotates the deltas into body FRD with its Camera Mount / Camera "
+                   "Angle / Camera Roll settings (any pitch and optical-axis roll, which VISO_ORIENT's six values "
+                   "cannot express), so keep VISO_ORIENT = 0; any other value would rotate them twice."),
     SuggestedParam("VISO_DELAY_MS", None, False,
                    "Keep the current value (default 10 ms); unverified. The EKF stamps each delta on arrival minus "
                    "this delay. A delta averages its interval, so its true delay is about half a frame interval "

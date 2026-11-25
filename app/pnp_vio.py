@@ -33,6 +33,7 @@ import link_stats
 import pose_stream
 import snapshots
 import vio_telemetry
+from config_schema import CAMERA_MOUNTS, effective_camera_angle
 from device_open import DEFAULT_TIMEOUT, DeviceOpenTimeout, DeviceRestartWatch, open_oak_device
 from mavlink_sender import MavlinkSender
 from pnp_odometry import (Intrinsics, PnPOdometry, PnPParams, camera_to_body_frd, camera_to_body_rotation,
@@ -94,7 +95,14 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description='BlueOS OAK-D PnP VIO')
 
     parser.add_argument('--fps', type=int, default=30)
-    parser.add_argument('--camera-angle', type=float, default=0.0)
+    parser.add_argument('--camera-mount', choices=CAMERA_MOUNTS, default=None,
+                        help='forward or downward fix --camera-angle at 0 or 90; custom (or none) uses --camera-angle')
+    parser.add_argument('--camera-angle', type=float, default=0.0,
+                        help='Optical axis pitched down from forward (deg): 0 forward, 90 down')
+    parser.add_argument('--camera-roll', type=float, default=0.0,
+                        help='Camera turned about its optical axis, clockwise looking out through the lens (deg): '
+                             'where the image top points, 0 up (forward mount) or forward (downward mount), 90 right, '
+                             '180 down / back, -90 left')
     parser.add_argument('--width', type=int, default=640)
     parser.add_argument('--height', type=int, default=400)
 
@@ -176,7 +184,9 @@ def parse_args(argv=None):
                              '(also forced by OAKD_LOG_ONLY=1)')
 
     add_stereo_arguments(parser)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    args.camera_angle = effective_camera_angle({"camera_mount": args.camera_mount, "camera_angle": args.camera_angle})
+    return args
 
 
 def timestamp_seconds(msg, exposure_middle=False):
@@ -340,6 +350,9 @@ def load_calibration(device, args):
         logger.warning(f"No stereo baseline ({e})")
 
     if args.gyro_gate > 0:
+        # IMU -> CAM_B optical frame, both inside the camera housing: the same for any mount. The gyro prior is
+        # therefore in the optical frame, and camera_to_body_rotation(..., camera_angle, camera_roll) takes it to
+        # body FRD like the PnP deltas. Only the gyro is used; the autopilot's own IMU gives EKF3 gravity/attitude.
         try:
             extrinsics = np.array(calib.getImuToCameraExtrinsics(left, True))
             calibration.R_cam_imu = extrinsics[:3, :3]
@@ -416,7 +429,8 @@ def lever_arm_fields(position_delta, R_gyro, R_pnp, args):
     if position_delta is None:
         return {"lever_delta_position": None, "lever_delta_correction": None, "lever_delta_rotation": None}
     source, R = ("gyro", R_gyro) if R_gyro is not None else ("pnp", R_pnp)
-    correction = lever_arm_correction(camera_to_body_rotation(R, args.camera_angle), args.lever_arm_m)
+    correction = lever_arm_correction(camera_to_body_rotation(R, args.camera_angle, args.camera_roll),
+                                      args.lever_arm_m)
     return {"lever_delta_position": np.asarray(position_delta) - correction, "lever_delta_correction": correction,
             "lever_delta_rotation": source}
 
@@ -739,9 +753,9 @@ def snapshot_frame(msg, stream):
     return msg.getCvFrame() if stream == "rgb" else msg.getFrame()
 
 
-def body_yaw(R_cam, camera_angle):
+def body_yaw(R_cam, camera_angle, camera_roll=0.0):
     """Yaw (rad, about body z down) of a camera-frame rotation R_01."""
-    R = camera_to_body_rotation(R_cam, camera_angle)
+    R = camera_to_body_rotation(R_cam, camera_angle, camera_roll)
     return math.atan2(R[1, 0], R[0, 0])
 
 
@@ -958,7 +972,8 @@ def main(argv=None):
 
     print("🚀 Starting OAK-D PnP VIO")
     print(f"📷 Camera: {args.width}x{args.height} @ {args.fps} FPS")
-    print(f"📐 Camera Angle: {args.camera_angle}°")
+    print(f"📐 Camera Mount: {args.camera_mount or 'angle'}, pitch {args.camera_angle}° down from forward, "
+          f"roll {args.camera_roll}° about the optical axis")
     print(f"🔧 Features on camera: {args.num_features} ({args.corner_detector}), "
           f"min inliers {args.min_inliers}, gyro gate {args.gyro_gate}°, max reference age {args.max_reference_age} s, "
           f"recovery after {args.recovery_frames} failures")
@@ -977,7 +992,8 @@ def main(argv=None):
                    log_only_forced_by_env=env_forces_log_only(), depth_scale=args.depth_scale,
                    refractive_index=args.refractive_index, intrinsics_from=args.intrinsics_from,
                    intrinsics_override=args.intrinsics_override, lever_arm=args.lever_arm,
-                   lever_arm_m=list(args.lever_arm_m))
+                   lever_arm_m=list(args.lever_arm_m), camera_mount=args.camera_mount,
+                   camera_angle=args.camera_angle, camera_roll=args.camera_roll)
     exit_code = 0
     try:
         run(args, log_only, data_log, stereo_settings)
@@ -1036,7 +1052,7 @@ def run_pipeline(args, log_only, data_log, stereo_settings, telemetry):
 
     attitude = autopilot_attitude.from_mavlink2rest(args.vehicle_ip, log=logger.info)
     pose_out = pose_stream.PoseStreamService(telemetry.directory, args.camera_angle, log=logger.info,
-                                             attitude=attitude)
+                                             attitude=attitude, camera_roll_deg=args.camera_roll)
     telemetry.pose_status = pose_out.status
     reconnects = 0
     try:
@@ -1288,11 +1304,13 @@ def run_session(device, args, log_only, data_log, stereo_settings, telemetry, ma
                 sent = False
                 if pose.ok:
                     # Exactly what goes (or would go) into VISION_POSITION_DELTA
-                    angle_delta = camera_to_body_frd(pose.angle_delta, args.camera_angle)
-                    position_delta = camera_to_body_frd(pose.position_delta, args.camera_angle)
+                    angle_delta = camera_to_body_frd(pose.angle_delta, args.camera_angle, args.camera_roll)
+                    position_delta = camera_to_body_frd(pose.position_delta, args.camera_angle, args.camera_roll)
                     time_delta_us = frame.dt * 1e6
-                    yaw_delta = body_yaw(R_prior, args.camera_angle) if R_prior is not None else angle_delta[2]
-                    rotation_delta = (matrix_to_rotvec(camera_to_body_rotation(R_prior, args.camera_angle))
+                    yaw_delta = (body_yaw(R_prior, args.camera_angle, args.camera_roll) if R_prior is not None
+                                 else angle_delta[2])
+                    rotation_delta = (matrix_to_rotvec(camera_to_body_rotation(R_prior, args.camera_angle,
+                                                                               args.camera_roll))
                                       if R_prior is not None else angle_delta)
                     if mavlink:
                         sent = mavlink.send_vision_position_delta(
